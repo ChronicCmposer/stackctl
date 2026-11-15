@@ -227,11 +227,44 @@ static void test_timeout(void) {
     }
 }
 
+static int g_abort;
+static int test_abort_check(void *user) {
+    (void)user;
+    return g_abort;
+}
+
+static void test_abort_hook(void) {
+    sshc_sentinel_spec spec = {.prefix = "STACKCTL_RC="};
+    int remote_rc = -1;
+    char *slow[] = {"/bin/sh", "-c", "sleep 30", NULL};
+
+    /* Unset hook: the child is allowed to finish normally. */
+    g_abort = 0;
+    sshc_set_abort_hook(NULL, NULL);
+    {
+        char *quick[] = {"/bin/sh", "-c", "printf 'STACKCTL_RC=0\\n'", NULL};
+
+        CHECK(sshc_exec(quick, 10, &spec, &remote_rc) == 0,
+              "no abort hook: exec completes");
+    }
+
+    /*
+     * A set hook aborts the running child: the process group is torn down and
+     * sshc_exec reports EINTR rather than the child's own status.
+     */
+    g_abort = 1;
+    sshc_set_abort_hook(test_abort_check, NULL);
+    CHECK(sshc_exec(slow, 30, &spec, &remote_rc) == EINTR,
+          "abort hook returns EINTR");
+    sshc_set_abort_hook(NULL, NULL);
+}
+
 int main(void) {
     test_golden_argv();
     test_sentinel();
     test_reconnect();
     test_timeout();
+    test_abort_hook();
 
     if (failures != 0) {
         fprintf(stderr, "ssh_test: %d failure(s)\n", failures);

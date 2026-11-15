@@ -31,6 +31,9 @@ extern "C" {
 typedef struct refresh_ami_ops {
     int (*resolve_parameter)(void *ud, const char *profile, const char *region,
                              const char *name, char **value_out);
+    /* Assert the caller is the project IAM user before the first SSM read
+     * (F3). Optional: NULL skips the guard (tests that do not exercise it). */
+    int (*assert_identity)(void *ud, const char *profile);
 } refresh_ami_ops;
 
 /* File seam; a NULL field selects the production implementation. */

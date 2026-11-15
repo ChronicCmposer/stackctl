@@ -162,6 +162,28 @@ static int resolve_ami(instance_runtime *rt, const cfn_stack *stack,
     }
 }
 
+/*
+ * Expand the validated ARCH snapshot into the same list `config_arch_list`
+ * derives ("amd64", "arm64", or both). The instance verbs keep a config
+ * snapshot rather than the opaque stackctl_config, so the expansion lives here.
+ */
+static const char *const *launch_arch_list(const instance_config *cfg) {
+    static const char *const amd64_only[] = {"amd64", NULL};
+    static const char *const arm64_only[] = {"arm64", NULL};
+    static const char *const both[] = {"amd64", "arm64", NULL};
+
+    if (cfg == NULL) {
+        return NULL;
+    }
+    if (strcmp(cfg->arch, "both") == 0) {
+        return both;
+    }
+    if (strcmp(cfg->arch, "arm64") == 0) {
+        return arm64_only;
+    }
+    return amd64_only;
+}
+
 /* Terminate `id` and wait; returns 0 or EIO/ETIMEDOUT-class failure. */
 static int terminate_and_wait(instance_runtime *rt, const char *const *ids,
                               size_t count, int *timed_out) {
@@ -181,6 +203,43 @@ static int terminate_and_wait(instance_runtime *rt, const char *const *ids,
     return rt->svc.ec2_wait_terminated(rt->svc.ec2, ids, count,
                                        rt->wait_attempts, rt->wait_interval,
                                        timed_out);
+}
+
+/*
+ * Every exit-7 diagnostic must carry the one remedy for an SSH transport
+ * failure: the operator's current public IP is probably outside the security
+ * group's SSH ingress. Append this hint line on all exit-7 paths.
+ */
+static void ssh_hint(instance_runtime *rt) {
+    instance_err(rt,
+                 "stackctl: check that OPERATOR_CIDR covers this machine and "
+                 "that the security group's SSH rule allows it\n");
+}
+
+/*
+ * Compose a human-readable list of instance ids and the exact per-id
+ * `stackctl terminate --instance-id <id>` commands for a cleanup diagnostic.
+ * Both buffers are always NUL-terminated; callers size them for the 64-id cap.
+ */
+static void describe_leftovers(const char *const *ids, size_t count, char *names,
+                               size_t names_cap, char *commands,
+                               size_t commands_cap) {
+    size_t names_used = 0;
+    size_t commands_used = 0;
+
+    names[0] = '\0';
+    commands[0] = '\0';
+    for (size_t i = 0; i < count; i++) {
+        const char *separator = i == 0 ? "" : ", ";
+
+        (void)append_text(names, names_cap, &names_used, separator);
+        (void)append_text(names, names_cap, &names_used, ids[i]);
+        (void)append_text(commands, commands_cap, &commands_used, separator);
+        (void)append_text(commands, commands_cap, &commands_used,
+                          "`stackctl terminate --instance-id ");
+        (void)append_text(commands, commands_cap, &commands_used, ids[i]);
+        (void)append_text(commands, commands_cap, &commands_used, "`");
+    }
 }
 
 /*
@@ -352,16 +411,110 @@ static int resolve_release(instance_runtime *rt, const cfn_stack *stack,
 }
 
 /*
+ * The setup environment contract is generated from ONE source (visit_setup_env)
+ * so the ssh prefix and the in-script `sudo env` re-injection cannot drift.
+ */
+typedef struct {
+    char *out;
+    size_t cap;
+    size_t *used;
+} env_sink;
+
+typedef int (*setup_env_visit)(void *ctx, const char *key, const char *value);
+
+static int visit_setup_env(instance_runtime *rt, const cfn_stack *stack,
+                           const char *arch, const char *variant,
+                           const char *member, const char *member_sha,
+                           const char *stage_dir, setup_env_visit visit,
+                           void *ctx) {
+    const char *bucket = cfn_stack_output(stack, "ArtifactBucketName");
+    const char *tag = cfn_stack_tag(stack, "stackctl:release-tag");
+    int rc = 0;
+
+    rc = visit(ctx, "STACKCTL_PROJECT", rt->cfg.project);
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_REGION", rt->cfg.region);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_RELEASE_TAG", tag);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_MANIFEST_SHA",
+                   cfn_stack_tag(stack, "stackctl:release-sha"));
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_MEMBER", member);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_MEMBER_SHA", member_sha);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_ARCH", arch);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_VARIANT", variant);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_STAGE_DIR", stage_dir);
+    }
+    if (rc == 0) {
+        rc = visit(ctx, "STACKCTL_BUCKET_ARTIFACT", bucket);
+    }
+    if (rc == 0) {
+        const char *cert_bucket = cfn_stack_output(stack, "CertBucketName");
+
+        /* An absent/empty output means the cert bucket module is disabled. */
+        if (cert_bucket != NULL && cert_bucket[0] != '\0') {
+            rc = visit(ctx, "STACKCTL_BUCKET_CERT", cert_bucket);
+        }
+    }
+    if (rc == 0 && rt->cfg.ddns_onbox) {
+        char path[INST_PATH_MAX];
+
+        snprintf(path, sizeof path, "/etc/%s-ddns/password", rt->cfg.project);
+        rc = visit(ctx, "STACKCTL_DDNS_PASSWORD_FILE", path);
+    }
+    return rc;
+}
+
+/* ssh prefix form: KEY='value' (shell-quoted literal). */
+static int emit_env_literal(void *ctx, const char *key, const char *value) {
+    env_sink *sink = ctx;
+
+    return append_env(sink->out, sink->cap, sink->used, key, value);
+}
+
+/* In-script re-injection form: KEY="$KEY" (reference this bash's environment). */
+static int emit_env_reference(void *ctx, const char *key, const char *value) {
+    env_sink *sink = ctx;
+    int rc;
+
+    (void)value;
+    rc = append_text(sink->out, sink->cap, sink->used, key);
+    if (rc == 0) {
+        rc = append_text(sink->out, sink->cap, sink->used, "=\"$");
+    }
+    if (rc == 0) {
+        rc = append_text(sink->out, sink->cap, sink->used, key);
+    }
+    if (rc == 0) {
+        rc = append_text(sink->out, sink->cap, sink->used, "\" ");
+    }
+    return rc;
+}
+
+/*
  * Build the remote wrapper: stage the selected member from S3 (bounded retry),
- * verify it against the operator-verified sha, run the entrypoint, then print
- * the STACKCTL_RC sentinel. On success the staging dir is removed; on failure
- * the real status is retained in /run/stackctl-setup.<nonce>/rc so the
+ * verify it against the operator-verified sha, extract it safely, check the
+ * entrypoint, run it from the bundle root with the env contract re-injected,
+ * then print the STACKCTL_RC sentinel. On success the staging dir is removed; on
+ * failure the real status is retained in /run/stackctl-setup.<nonce>/rc so the
  * reconnect-once reader can report it. Staging lives on tmpfs and is 0700.
  */
 static int build_setup_script(char *out, size_t cap, const char *stage_dir,
                               const char *bucket, const char *tag,
                               const char *member, const char *member_sha,
-                              const char *entrypoint) {
+                              const char *entrypoint, const char *env_refs) {
     char s3_url[1024];
     size_t used = 0;
     int rc = 0;
@@ -412,15 +565,64 @@ static int build_setup_script(char *out, size_t cap, const char *stage_dir,
     if (rc == 0) {
         rc = append_text(out, cap, &used,
                          " | sudo sha256sum --check - >/dev/null 2>&1; then "
-                         "rc=3\nelse\n  ");
+                         "rc=3\nelse\n"
+                         /* Path-safety precheck: tar runs as root into a
+                          * root-owned dir, so reject absolute or `..` members. */
+                         "  if ! sudo tar -tf \"$d\"/");
+    }
+    if (rc == 0) {
+        rc = append_quoted(out, cap, &used, member);
+    }
+    if (rc == 0) {
+        rc = append_text(out, cap, &used,
+                         " >\"$d/members.txt\" 2>/dev/null; then rc=3\n"
+                         "  elif grep -Eq '(^/|(^|/)\\.\\.(/|$))' "
+                         "\"$d/members.txt\"; then rc=3\n"
+                         /* Hardened extract into the staging dir. */
+                         "  elif ! sudo tar --no-same-owner --no-overwrite-dir "
+                         "-xf \"$d\"/");
+    }
+    if (rc == 0) {
+        rc = append_quoted(out, cap, &used, member);
+    }
+    if (rc == 0) {
+        rc = append_text(out, cap, &used,
+                         " -C \"$d\"; then rc=3\n"
+                         /* SETUP_ENTRYPOINT is bundle-root-relative. */
+                         "  elif [ ! -f \"$d\"/");
+    }
+    if (rc == 0) {
+        rc = append_quoted(out, cap, &used, entrypoint);
+    }
+    if (rc == 0) {
+        rc = append_text(out, cap, &used, " ] || [ ! -x \"$d\"/");
     }
     if (rc == 0) {
         rc = append_quoted(out, cap, &used, entrypoint);
     }
     if (rc == 0) {
         rc = append_text(out, cap, &used,
-                         " >\"$d/setup.log\" 2>&1\n"
-                         "  rc=$?\nfi\n"
+                         " ]; then\n"
+                         "    echo 'stackctl: SETUP_ENTRYPOINT is missing or "
+                         "not executable' >&2\n"
+                         "    rc=3\n"
+                         "  else\n"
+                         "    (cd \"$d\" && sudo env ");
+    }
+    if (rc == 0) {
+        rc = append_text(out, cap, &used, env_refs);
+    }
+    if (rc == 0) {
+        rc = append_text(out, cap, &used, "./");
+    }
+    if (rc == 0) {
+        rc = append_quoted(out, cap, &used, entrypoint);
+    }
+    if (rc == 0) {
+        rc = append_text(out, cap, &used,
+                         ") >\"$d/setup.log\" 2>&1\n"
+                         "    rc=$?\n"
+                         "  fi\nfi\n"
                          /* Surface the entrypoint's tail on the operator's
                           * stderr (the ssh child inherits it). */
                          "if [ -f \"$d/setup.log\" ]; then\n"
@@ -449,10 +651,12 @@ static int build_setup_command(instance_runtime *rt, const cfn_stack *stack,
                                const char *nonce, char *out, size_t cap) {
     char stage_dir[INST_PATH_MAX];
     char script[4096];
+    char env_refs[2048];
     char derived[INST_ARCH_MAX];
     const char *bucket = cfn_stack_output(stack, "ArtifactBucketName");
     const char *tag = cfn_stack_tag(stack, "stackctl:release-tag");
     size_t used = 0;
+    size_t env_used = 0;
     int rc = 0;
 
     if (snprintf(stage_dir, sizeof stage_dir, "/run/stackctl-setup.%s", nonce) >=
@@ -460,57 +664,26 @@ static int build_setup_command(instance_runtime *rt, const cfn_stack *stack,
         return ENAMETOOLONG;
     }
     derive_variant(member, variant, derived, sizeof derived);
-    rc = build_setup_script(script, sizeof script, stage_dir, bucket, tag,
-                            member, member_sha, rt->cfg.setup_entrypoint);
+    env_refs[0] = '\0';
+    {
+        env_sink sink = {env_refs, sizeof env_refs, &env_used};
 
+        rc = visit_setup_env(rt, stack, arch, derived, member, member_sha,
+                             stage_dir, emit_env_reference, &sink);
+    }
+    if (rc == 0) {
+        rc = build_setup_script(script, sizeof script, stage_dir, bucket, tag,
+                                member, member_sha, rt->cfg.setup_entrypoint,
+                                env_refs);
+    }
     if (rc == 0) {
         rc = append_text(out, cap, &used, "sudo env -u BASH_ENV ");
     }
     if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_PROJECT", rt->cfg.project);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_REGION", rt->cfg.region);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_RELEASE_TAG", tag);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_MANIFEST_SHA",
-                        cfn_stack_tag(stack, "stackctl:release-sha"));
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_MEMBER", member);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_MEMBER_SHA", member_sha);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_ARCH", arch);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_VARIANT", derived);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_STAGE_DIR", stage_dir);
-    }
-    if (rc == 0) {
-        rc = append_env(out, cap, &used, "STACKCTL_BUCKET_ARTIFACT", bucket);
-    }
-    if (rc == 0) {
-        const char *cert_bucket = cfn_stack_output(stack, "CertBucketName");
+        env_sink sink = {out, cap, &used};
 
-        /* An absent/empty output means the cert bucket module is disabled. */
-        if (cert_bucket != NULL && cert_bucket[0] != '\0') {
-            rc = append_env(out, cap, &used, "STACKCTL_BUCKET_CERT",
-                            cert_bucket);
-        }
-    }
-    if (rc == 0 && rt->cfg.ddns_onbox) {
-        char path[INST_PATH_MAX];
-
-        snprintf(path, sizeof path, "/etc/%s-ddns/password", rt->cfg.project);
-        rc = append_env(out, cap, &used, "STACKCTL_DDNS_PASSWORD_FILE", path);
+        rc = visit_setup_env(rt, stack, arch, derived, member, member_sha,
+                             stage_dir, emit_env_literal, &sink);
     }
     if (rc == 0) {
         rc = append_text(out, cap, &used, "bash -lc ");
@@ -629,11 +802,11 @@ static int deliver_ddns_password(instance_runtime *rt, const char *ip,
     sshc_argv_free(argv);
     (void)unlink(local_tmp);
     if (rc == ENOTCONN) {
-        return instance_fail(
-            rt, CLI_EXIT_SSH,
-            "SSH transport failure delivering the DDNS password; verify your "
-            "current public IP is within OPERATOR_CIDR (`stackctl status` "
-            "checks this)");
+        (void)instance_fail(rt, CLI_EXIT_SSH,
+                            "SSH transport failure delivering the DDNS "
+                            "password");
+        ssh_hint(rt);
+        return CLI_EXIT_SSH;
     }
     if (rc != 0 || remote_rc != 0) {
         return instance_fail(rt, CLI_EXIT_LAUNCH,
@@ -673,11 +846,11 @@ static int deliver_ddns_password(instance_runtime *rt, const char *ip,
     rc = rt->svc.ssh_exec(argv, timeout_sec, NULL, &remote_rc);
     sshc_argv_free(argv);
     if (rc == ENOTCONN) {
-        return instance_fail(
-            rt, CLI_EXIT_SSH,
-            "SSH transport failure installing the DDNS password; verify your "
-            "current public IP is within OPERATOR_CIDR (`stackctl status` "
-            "checks this)");
+        (void)instance_fail(rt, CLI_EXIT_SSH,
+                            "SSH transport failure installing the DDNS "
+                            "password");
+        ssh_hint(rt);
+        return CLI_EXIT_SSH;
     }
     if (rc != 0 || remote_rc != 0) {
         return instance_fail(rt, CLI_EXIT_LAUNCH,
@@ -778,44 +951,63 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                              "infra stack is missing required outputs");
     }
 
-    /* Arch + AMI preflight. */
+    /*
+     * Arch + AMI-region preflight. Every declared arch must resolve to a live
+     * AMI in this region before we spend on the selected one; mirror deploy's
+     * per-arch loop so a broken ARCH=both deploy is caught here, not mid-launch.
+     */
     if (instance_select_arch(rt->cfg.arch, opts->arch, arch, sizeof arch,
                              &why) != 0) {
         cfn_stack_list_free(&stacks);
         return instance_fail(rt, CLI_EXIT_USAGE, "%s",
                              why != NULL ? why : "invalid --arch");
     }
-    rc = resolve_ami(rt, stack, arch, ami, sizeof ami);
-    if (rc == ENOENT) {
-        cfn_stack_list_free(&stacks);
-        return instance_fail(rt, CLI_EXIT_USAGE,
-                             "no effective AMI for %s; run deploy first", arch);
-    }
-    if (rc != 0) {
-        cfn_stack_list_free(&stacks);
-        return instance_fail(rt, CLI_EXIT_AWS,
-                             "cannot resolve the AMI for %s", arch);
-    }
     {
-        const char *ami_ids[1] = {ami};
+        const char *const *arches = launch_arch_list(&rt->cfg);
 
-        rc = rt->svc.ec2_describe_images(rt->svc.ec2, ami_ids, 1, &images);
-        if (rc != 0) {
+        for (size_t i = 0; arches != NULL && arches[i] != NULL; i++) {
+            char candidate[INST_AMI_ID_MAX] = {0};
+            const char *ami_ids[1];
+            int is_selected = strcmp(arches[i], arch) == 0;
+
+            rc = resolve_ami(rt, stack, arches[i], candidate,
+                             sizeof candidate);
+            if (rc == ENOENT) {
+                cfn_stack_list_free(&stacks);
+                return instance_fail(
+                    rt, CLI_EXIT_USAGE,
+                    "no effective AMI for %s; run deploy first", arches[i]);
+            }
+            if (rc != 0) {
+                cfn_stack_list_free(&stacks);
+                return instance_fail(rt, CLI_EXIT_AWS,
+                                     "cannot resolve the %s AMI", arches[i]);
+            }
+            memset(&images, 0, sizeof images);
+            ami_ids[0] = candidate;
+            rc = rt->svc.ec2_describe_images(rt->svc.ec2, ami_ids, 1, &images);
+            if (rc != 0) {
+                ec2_image_list_free(&images);
+                cfn_stack_list_free(&stacks);
+                return instance_fail(rt, CLI_EXIT_AWS,
+                                     "cannot describe the %s AMI %s",
+                                     arches[i], candidate);
+            }
+            if (images.count == 0) {
+                ec2_image_list_free(&images);
+                cfn_stack_list_free(&stacks);
+                return instance_fail(
+                    rt, CLI_EXIT_USAGE,
+                    "AMI %s for %s does not exist in %s", candidate,
+                    arches[i], rt->cfg.region);
+            }
+            if (is_selected) {
+                snprintf(ami, sizeof ami, "%s", candidate);
+                snprintf(root_device, sizeof root_device, "%s",
+                         images.items[0].root_device_name);
+            }
             ec2_image_list_free(&images);
-            cfn_stack_list_free(&stacks);
-            return instance_fail(rt, CLI_EXIT_AWS,
-                                 "cannot describe AMI %s", ami);
         }
-        if (images.count == 0) {
-            ec2_image_list_free(&images);
-            cfn_stack_list_free(&stacks);
-            return instance_fail(rt, CLI_EXIT_USAGE,
-                                 "AMI %s does not exist in %s", ami,
-                                 rt->cfg.region);
-        }
-        snprintf(root_device, sizeof root_device, "%s",
-                 images.items[0].root_device_name);
-        ec2_image_list_free(&images);
     }
 
     if (instance_resolve_type(&rt->cfg, arch, opts->instance_type,
@@ -1049,6 +1241,9 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             if (key_line == NULL ||
                 instance_key_fingerprint(key_line, fingerprint,
                                          sizeof fingerprint) != 0) {
+                (void)instance_fail(rt, CLI_EXIT_SSH,
+                                    "cannot scan the host key at %s", new_ip);
+                ssh_hint(rt);
                 failure = CLI_EXIT_SSH;
             }
         }
@@ -1121,8 +1316,9 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
         /* Setup SSH session. */
         {
             char command[4096];
+            char stage_dir[INST_PATH_MAX];
             char rc_path[INST_PATH_MAX];
-            char rc_command[INST_PATH_MAX + 32];
+            char rc_command[INST_PATH_MAX + 128];
             sshc_options ssh_opts;
             const char *operands[2];
             const char *reconnect_operands[2];
@@ -1138,9 +1334,18 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                 return launch_fail(rt, opts, run_result.instance_id,
                                    snapshot_ip, CLI_EXIT_USAGE);
             }
-            snprintf(rc_path, sizeof rc_path, "/run/stackctl-setup.%s/rc",
+            snprintf(stage_dir, sizeof stage_dir, "/run/stackctl-setup.%s",
                      nonce);
-            snprintf(rc_command, sizeof rc_command, "sudo cat '%s'", rc_path);
+            snprintf(rc_path, sizeof rc_path, "%s/rc", stage_dir);
+            /*
+             * Reconnect-once reader: read the rc left by a failed setup, then
+             * remove the staging dir. Removal is best-effort and strictly
+             * after the read, so a cleanup failure can never change the rc
+             * reported on stdout.
+             */
+            snprintf(rc_command, sizeof rc_command,
+                     "d='%s'; sudo cat \"$d/rc\" && sudo rm -rf \"$d\" || true",
+                     stage_dir);
             memset(&ssh_opts, 0, sizeof ssh_opts);
             ssh_opts.identity = rt->cfg.ssh_identity;
             ssh_opts.known_hosts = known_hosts_path(rt);
@@ -1175,20 +1380,47 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                     .reconnect_argv = reconnect_argv,
                 };
 
+                /* Let the first signal abort the setup session (F9). */
+                sshc_set_abort_hook(cli_abort_check, NULL);
                 ssh_rc = rt->svc.ssh_exec(
                     argv, opts->setup_timeout > 0 ? opts->setup_timeout
                                                    : LAUNCH_DEFAULT_SETUP_TIMEOUT,
                     &sentinel, &remote_rc);
+                sshc_set_abort_hook(NULL, NULL);
             }
             sshc_argv_free(argv);
             sshc_argv_free(reconnect_argv);
+            /*
+             * An interrupt or a setup-budget expiry is a launch failure: stop
+             * the instance and restore DNS, then report exit 4. A consumed
+             * signal tells the dispatcher to honor that code rather than
+             * overriding it to the AWS class (F8/F9).
+             */
+            if (ssh_rc == EINTR) {
+                cli_signal_mark_consumed();
+                cfn_stack_list_free(&stacks);
+                return launch_fail(rt, opts, run_result.instance_id,
+                                   snapshot_ip, CLI_EXIT_LAUNCH);
+            }
+            if (ssh_rc == ETIMEDOUT) {
+                cfn_stack_list_free(&stacks);
+                return launch_fail(rt, opts, run_result.instance_id,
+                                   snapshot_ip, CLI_EXIT_LAUNCH);
+            }
             if (ssh_rc == ENOTCONN) {
+                (void)instance_fail(rt, CLI_EXIT_SSH,
+                                    "SSH transport failure during setup");
+                ssh_hint(rt);
                 cfn_stack_list_free(&stacks);
                 return launch_fail(
                     rt, opts, run_result.instance_id, snapshot_ip,
                     CLI_EXIT_SSH);
             }
             if (ssh_rc != 0) {
+                (void)instance_fail(rt, CLI_EXIT_SSH,
+                                    "SSH setup session failed: %s",
+                                    strerror(ssh_rc));
+                ssh_hint(rt);
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
                                    snapshot_ip, CLI_EXIT_SSH);
@@ -1271,12 +1503,19 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                     if (terminate_and_wait(rt, ids, id_count, &replace_timeout) !=
                             0 ||
                         replace_timeout != 0) {
+                        char leftovers[1600];
+                        char commands[4600];
+
+                        describe_leftovers(ids, id_count, leftovers,
+                                           sizeof leftovers, commands,
+                                           sizeof commands);
                         ec2_instance_list_free(&all);
                         cfn_stack_list_free(&stacks);
                         return instance_fail(
                             rt, CLI_EXIT_CLEANUP,
-                            "failed to terminate the previous instance(s); "
-                            "run `stackctl terminate`");
+                            "failed to terminate the previous instance(s) %s; "
+                            "run %s",
+                            leftovers, commands);
                     }
                     for (size_t i = 0; i < id_count; i++) {
                         const char *id = ids[i];

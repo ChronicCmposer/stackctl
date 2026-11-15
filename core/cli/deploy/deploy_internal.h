@@ -20,6 +20,7 @@
 #include "cfn.h"
 #include "cli.h"
 #include "deploy.h"
+#include "core/s3/s3.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,11 +47,19 @@ typedef struct deploy_ops {
     /* Verify the existing release by read-back; fills its manifest sha256. */
     int (*verify_release)(void *ud, const char *bucket, const char *tag,
                           char *sha_out, size_t cap);
+    /* Cheap verify for prune (F7): GET the manifest, HEAD every member; no
+     * payload re-hash. Same parameter list as verify_release. */
+    int (*verify_release_cheap)(void *ud, const char *bucket, const char *tag,
+                                char *sha_out, size_t cap);
     /* Publish a new release (sidecars, objects, manifest) and verify; fills the
      * manifest sha256. */
     int (*publish_release)(void *ud, const char *bucket, const char *tag,
                            const char *repo_root, const char *targets,
                            char *sha_out, size_t cap);
+    /* F15: list manifest-bearing release tags, comma-separated, from a single
+     * ListObjectsV2 page of releases/. Optional: NULL falls back to the
+     * `stackctl status` hint. */
+    int (*list_releases)(void *ud, const char *bucket, char *out, size_t cap);
 
     /* Count running/pending Project-tagged instances (best effort preview). */
     int (*count_live_instances)(void *ud, const char *region, int *count);
@@ -60,6 +69,9 @@ typedef struct deploy_ops {
 
     int (*aws_init)(void *ud, const char *profile, aws_ctx **out);
     void (*aws_free)(void *ud, aws_ctx *aws);
+    /* Verify the caller is the project IAM user (F3). Optional: when NULL the
+     * guard is skipped (tests that do not exercise it). */
+    int (*assert_identity)(void *ud, aws_ctx *aws, const char *project);
     int (*cfn_create)(void *ud, aws_ctx *aws, cfn_client **out);
     void (*cfn_destroy)(void *ud, cfn_client *client);
     int (*describe_stacks)(void *ud, cfn_client *client, const char *region,
@@ -142,6 +154,46 @@ size_t deploy_prune_mark(deploy_release_entry *entries, size_t count,
                          const char *pinned, const char *previous,
                          const char *just_uploaded, long long now_epoch);
 
+/* Maximum candidates cheap-verified per prune run (F7). */
+#define DEPLOY_PRUNE_VERIFY_CAP 20
+
+/* Outcome counters for deploy_prune_verify(). */
+typedef struct deploy_prune_result {
+    size_t candidates;         /* marked candidates considered */
+    size_t verified;           /* cheap-verified, still deletable */
+    size_t kept_unverifiable;  /* failed verify, kept */
+    size_t deferred;           /* over the cap, kept for the next run */
+} deploy_prune_result;
+
+/*
+ * Apply cheap verification to the entries already marked for deletion by
+ * deploy_prune_mark() (F7). At most `cap` marked candidates are verified; each
+ * one that fails `verify` is un-marked and kept, with a one-line stderr warning.
+ * Candidates over the cap are un-marked and counted as deferred. When any
+ * candidate is kept, a `N release(s) kept: unverifiable` summary is written.
+ * Returns the number of entries left marked for deletion.
+ */
+size_t deploy_prune_verify(deploy_release_entry *entries, size_t count,
+                           size_t cap,
+                           int (*verify)(void *ud, const char *tag), void *ud,
+                           deploy_prune_result *result, FILE *err);
+
+/*
+ * F14: scan `git tag --points-at HEAD` output and format the ambiguity
+ * diagnostic naming every vX.Y.Z tag. Returns the number of release tags
+ * found; writes to `out` only when more than one is present.
+ */
+size_t deploy_ambiguous_tag_error(const char *tags_output, char *out,
+                                  size_t cap);
+
+/*
+ * F15: collect the tags of manifest-bearing `releases/<tag>/` prefixes from a
+ * single ListObjectsV2 page. Writes them comma-separated to `out` and returns
+ * the count. Bounded to one page (S3 caps ListObjectsV2 at 1000 keys).
+ */
+size_t deploy_collect_release_tags(const s3_object_list *listing, char *out,
+                                   size_t cap);
+
 /* Format one manifest line: `<sha256>  <member>\n` (sha first, two spaces). */
 int deploy_manifest_line(const char *sha, const char *member, char *out,
                          size_t cap);
@@ -172,6 +224,17 @@ void deploy_set_ops_for_test(const deploy_ops *ops, void *ud);
 /* Test-only: the production aws_init seam, so tests can assert the signal
  * abort hook is installed on a real client. */
 int deploy_prod_aws_init_for_test(const char *profile, aws_ctx **out);
+
+/* Test-only: the production git-provenance seam, so tests drive the real
+ * tag scan and ambiguity diagnostic rather than an injected stub. */
+int deploy_prod_provenance_for_test(const char *repo_root, int allow_dirty,
+                                    char *tag, size_t cap);
+
+/* Test-only: parse a manifest and cheap-verify its members. A `manifest` with
+ * no member lines returns CLI_EXIT_VERIFY before any S3 call, so tests pass
+ * NULL for the client. */
+int deploy_cheap_verify_manifest_for_test(const char *bucket, const char *tag,
+                                          char *manifest);
 
 #ifdef __cplusplus
 }

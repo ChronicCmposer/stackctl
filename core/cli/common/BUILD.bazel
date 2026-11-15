@@ -23,6 +23,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//core/config",
+        "//core/iam",
         "//core/state",
         "@yyjson",
     ],
@@ -74,4 +75,22 @@ cc_test(
     linkopts = ["-static"],
     linkstatic = True,
     deps = [":cli"],
+)
+
+cc_test(
+    name = "cli_identity_test",
+    srcs = ["cli_identity_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":cli",
+        "//core/iam",
+    ],
 )

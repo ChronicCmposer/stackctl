@@ -279,8 +279,16 @@ int startstop_execute(instance_runtime *rt, const startstop_options *opts,
             sshc_argv_free(argv);
             return instance_fail(rt, CLI_EXIT_SSH, "ssh unavailable");
         }
+        /* First signal aborts the session; it takes the failure path (F9). */
+        sshc_set_abort_hook(cli_abort_check, NULL);
         rc = rt->svc.ssh_exec(argv, 300, NULL, &remote_rc);
+        sshc_set_abort_hook(NULL, NULL);
         sshc_argv_free(argv);
+        if (rc == EINTR) {
+            cli_signal_mark_consumed();
+            return instance_fail(rt, CLI_EXIT_SSH,
+                                 "SSH session interrupted by a signal");
+        }
         if (rc == ENOTCONN) {
             return instance_fail(
                 rt, CLI_EXIT_SSH,

@@ -1,6 +1,6 @@
 # Migrating from the shared `deploy/aws/` shell pipeline
 
-Tested against stackctl v0.1.0.
+Tested against stackctl v0.1.1.
 
 This guide is for maintainers moving an existing project off the shared
 predecessor pattern onto stackctl. The predecessor is the `deploy/aws/` shell
@@ -100,8 +100,8 @@ phase. Two dependencies are explicit:
 4. Create the new infra stack with `deploy`. The verb authenticates as the
    `[<project>]` profile. If the old operator user can call CloudFormation and S3,
    use it here; otherwise reorder Phase 4 before this step.
-5. Verify the rendered security group. The v0.1.0 ingress-slot limitation is
-   documented below.
+5. Verify the rendered security group. The shared pipeline created no stackctl
+   application ingress; the slot mapping is documented below.
 
 ### Phase 2 — Launch and terminate cutover
 
@@ -243,27 +243,75 @@ those values into a bundle member (for example `provenance.env`) and render it
 from `STACKCTL_*`. The member is sha-verified end to end, so the entrypoint no
 longer trusts a mutable stack parameter.
 
-## Known v0.1.0 wiring gaps
+## Upgrading to v0.1.1
 
-Read this before you promise a feature in a migration plan. These are source-level
-gaps in v0.1.0, not configuration mistakes:
+v0.1.1 adds config keys and changes deployed AWS state on the next
+`provision`/`deploy` of an existing stack. These land as ordinary change sets (no
+extra confirmation gate), but review the summary before applying:
 
-- **Ingress slots.** `deploy` passes `INGRESS_TCP`/`INGRESS_UDP` as the audit
-  list but does not populate `IngressTcp<N>`/`IngressUdp<N>`. Verify the security
-  group after the first deploy. An infra `TEMPLATE_OVERRIDE` can derive rules from
-  the comma lists; the canonical template cannot.
-- **Spot alerts.** `ENABLE_SPOT_ALERTS`/`SPOT_ALERT_EMAIL` are validated but not
-  passed to the infra stack, so the SNS module is not created by `deploy`.
-- **Image Builder parent image.** `ImageBuilderParentImage` is a template
-  parameter with an AL2023 x86_64 default; there is no `.env` key for it. Use an
-  infra `TEMPLATE_OVERRIDE` when the old parent image differs.
-- **IAM permissions boundary.** `PermissionsBoundaryArn` is a template parameter
-  but `provision` does not pass it.
+- **App ingress (F2).** `INGRESS_TCP`/`INGRESS_UDP` now create security-group
+  rules for the first time. Previously zero application rules were created; check
+  the source ranges before applying.
+- **Spot alerts (F10).** The spot-alert module and its SNS topic appear or
+  disappear according to `ENABLE_SPOT_ALERTS`; `SPOT_ALERT_EMAIL` is passed when
+  alerts are enabled.
+- **Certificate-bucket IAM (F6).** Operator-stack cert-bucket grants now shrink
+  when `BUCKET_MODULES` omits `cert`; previously they were over-granted.
+- **CI user deletion (F5).** **WARNING:** clearing `RELEASE_PREFIXES` to an empty
+  value makes the next `provision` pass `EnableCiUser=false`, which **deletes the
+  CI user and invalidates its access keys**. This is irreversible from the
+  operator's view. `provision` prints a one-line change-set-summary warning;
+  capture or rotate any CI credentials you still need first. `RELEASE_PREFIXES`
+  and `BUCKET_MODULES` are a union across all `.env.*` siblings: clearing the key
+  only in the active `.env` does not disable the CI user if a sibling still lists
+  prefixes, so clear it in every sibling.
+- **DDNS parameters (F4).** `DdnsHost`/`DdnsDomain` are now passed when DDNS is
+  configured, so the stack metadata and `DdnsHost` output stop rendering the `-`
+  default.
 
-Each gap has the same shape: the template exposes a parameter the CLI does not
-send. The safe migration practice is to verify the rendered stack outputs and
-security group after the first deploy, not to assume the config key alone took
-effect.
+The config allowlist grows from 34 to 36 keys: `IMAGE_BUILDER_PARENT_IMAGE` (valid
+only when `ENABLE_IMAGE_BUILDER=true`) and `PERMISSIONS_BOUNDARY_ARN` (an optional
+ARN-shaped value). `RELEASE_PREFIXES` stays a required key but now permits an
+empty value. `PERMISSIONS_BOUNDARY_ARN` applies to the instance role **only** —
+not the CI user, the Image Builder roles, or the infra stack.
+
+## Fixed in v0.1.1
+
+Earlier revisions documented source-level "wiring gaps" where the CloudFormation
+templates exposed parameters the CLI never sent. v0.1.1 closes them; this is the
+user-visible summary.
+
+- **Bundle setup.** The downloaded bundle is safety-checked and extracted in the
+  staging directory before `SETUP_ENTRYPOINT` runs, so a packaged release can
+  start. A missing or non-executable entrypoint, or an unsafe member path, is a
+  verification failure. The staging directory is removed after the setup status
+  is read.
+- **Ingress.** Each `INGRESS_TCP`/`INGRESS_UDP` rule populates its
+  `IngressTcpPort<i>`/`IngressTcpCidr<i>` (or UDP) slot, up to 8 per protocol.
+- **Identity.** `deploy` and `refresh-ami` re-assert the `:user/<project>` caller
+  identity before any mutation, including under `--dry-run`; an `assumed-role` ARN
+  is rejected with exit 3.
+- **Infra parameters.** `DdnsHost`/`DdnsDomain`, the spot-alert parameters, and
+  `ImageBuilderParentImage` are now passed from config.
+- **CI user.** `provision` sends `EnableCiUser` based on whether `RELEASE_PREFIXES`
+  is non-empty, so an empty list deletes the CI user (see the upgrade note above).
+- **Certificate IAM.** Operator-stack cert-bucket grants follow `BUCKET_MODULES`.
+- **Prune.** A release is deleted only after a cheap manifest and member check; an
+  unverifiable release is kept with a warning, and a deploy still succeeds when
+  every candidate is unverifiable.
+- **Launch.** A setup timeout is a launch failure (exit 4, terminate and DDNS
+  restore); the first signal interrupts the setup SSH session and takes the same
+  path; exit-7 messages carry the `OPERATOR_CIDR` hint; a failed
+  replacement-termination names the surviving instance ids and the
+  `terminate --instance-id` command; the AMI-region preflight checks every
+  declared architecture.
+- **Dry run.** `deploy --dry-run` performs no S3 writes and creates no change set.
+- **Template checker.** Under a pinned AMI policy, `AmiIdAmd64` and `AmiIdArm64`
+  must both be declared and referenced.
+- **Messages.** Ambiguous-tag errors name the tags; pruned-tag rollback lists
+  available releases; `refresh-ami --dry-run` prints `KEY: <old> -> <new>` per
+  changed key; an interrupted CloudFormation wait says the operation continues
+  server-side and suggests `stackctl status`.
 
 ## Appendix A — strimserver (pilot)
 
@@ -299,15 +347,15 @@ application slots start at `0`:
 
 | List order | TCP slot | UDP slot |
 |---|---|---|
-| first item | `IngressTcp0` | `IngressUdp0` |
-| second item | `IngressTcp1` | `IngressUdp1` |
+| first item | `IngressTcpPort0` / `IngressTcpCidr0` | `IngressUdpPort0` / `IngressUdpCidr0` |
+| second item | `IngressTcpPort1` / `IngressTcpCidr1` | `IngressUdpPort1` / `IngressUdpCidr1` |
 
-For example, `INGRESS_TCP=4000` puts the controller on `IngressTcp0`. If you also
-list `443` first, the controller becomes `IngressTcp1`. SRT media is UDP-based, so
-`9000` belongs in `INGRESS_UDP` unless the old security group explicitly opened
-TCP. Inspect the old security group before copying the protocol.
+For example, `INGRESS_TCP=4000` puts the controller on slot 0. If you also list
+`443` first, the controller becomes slot 1. SRT media is UDP-based, so `9000`
+belongs in `INGRESS_UDP` unless the old security group explicitly opened TCP.
+Inspect the old security group before copying the protocol.
 
-Remember the v0.1.0 ingress-slot gap: confirm the security group after the first
+The security group is rendered from these slots, so confirm it after the first
 deploy.
 
 ### Baked image
@@ -315,10 +363,10 @@ deploy.
 `ENABLE_IMAGE_BUILDER=true` turns on the `BakedImageComponent`,
 `BakedImageRecipe`, `BakedImageInfrastructure`, `BakedImageDistribution`,
 `BakedImagePipeline` and publish-role resources. `AMI_POLICY=baked` selects the
-pipeline output. The parent image is the template default
-(`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`) because
-v0.1.0 has no `.env` key for `ImageBuilderParentImage`. If the old pipeline used a
-different parent, supply an infra `TEMPLATE_OVERRIDE` with a changed default.
+pipeline output. The parent image defaults to
+`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`; set
+`IMAGE_BUILDER_PARENT_IMAGE` (valid only with `ENABLE_IMAGE_BUILDER=true`) when
+the old pipeline used a different parent.
 
 ### Release members
 

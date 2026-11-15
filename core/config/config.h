@@ -13,12 +13,29 @@
 #ifndef STACKCTL_CONFIG_H
 #define STACKCTL_CONFIG_H
 
+#include <stddef.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Opaque parsed+validated configuration. */
 typedef struct stackctl_config stackctl_config;
+
+/*
+ * One validated `INGRESS_TCP` / `INGRESS_UDP` entry (CONTRACT C3).
+ *
+ * `port` is 1..65535; `cidr` is a canonical NUL-terminated IPv4 CIDR such as
+ * "0.0.0.0/0" (an omitted CIDR defaults to that value). Parsing and validation
+ * happen at config load, so downstream code consumes trusted rules.
+ */
+typedef struct config_ingress_rule {
+    unsigned port;
+    char cidr[19];
+} config_ingress_rule;
+
+/* Maximum rules per protocol; the infra template has 8 indexed slots. */
+#define CONFIG_INGRESS_MAX 8
 
 /*
  * Load and validate the project configuration.
@@ -67,6 +84,24 @@ const char *config_project(const stackctl_config *cfg);
  * cfg and remain valid until config_free().
  */
 const char *const *config_arch_list(const stackctl_config *cfg);
+
+/*
+ * Optional wave-2 keys (CONTRACT C3): the ImageBuilder parent image (valid
+ * only with ENABLE_IMAGE_BUILDER=true) and the IAM permissions boundary ARN.
+ * Each returns NULL when the key is unset; the string is owned by cfg.
+ */
+const char *config_image_builder_parent_image(const stackctl_config *cfg);
+const char *config_permissions_boundary_arn(const stackctl_config *cfg);
+
+/*
+ * Parsed ingress rules (CONTRACT C3). Each getter returns the rule count and,
+ * when `rules_out` is non-NULL, points it at the cfg-owned array (NULL when the
+ * count is zero). The array is valid until config_free().
+ */
+size_t config_ingress_tcp(const stackctl_config *cfg,
+                          const config_ingress_rule **rules_out);
+size_t config_ingress_udp(const stackctl_config *cfg,
+                          const config_ingress_rule **rules_out);
 
 /*
  * The real path of the config directory this config was loaded from. Every

@@ -65,6 +65,16 @@ static int called_before(const char *a, const char *b) {
     int ib = call_index(b);
     return ia >= 0 && ib >= 0 && ia < ib;
 }
+static int calls_named(const char *name) {
+    int count = 0;
+
+    for (size_t i = 0; i < call_count; i++) {
+        if (strcmp(calls[i], name) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
 
 /* --- scenario ------------------------------------------------------------ */
 
@@ -82,6 +92,9 @@ static char g_console_override[1024];
 static const char *g_manifest = DEFAULT_MANIFEST;
 static char manifest_sha_override[65];
 static int stack_has_ami = 1;
+static int stack_has_arm_ami;
+static char missing_ami[32];
+static int terminate_timeout;
 static int console_calls;
 static int console_empty_calls;
 static int keyscan_calls;
@@ -91,7 +104,11 @@ static int s3_get_calls;
 static char captured_rc_path[256];
 static int captured_reconnect;
 static int ssh_transport_fail;
+static int ssh_eintr;
+static int ssh_etimedout;
+static int ssh_error_code;
 static int remote_rc;
+static char captured_reconnect_cmd[1024];
 static char last_ssh_argv[64][4096];
 static size_t last_ssh_argc;
 static char last_terminated[8][24];
@@ -146,7 +163,7 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
              "demo-infra");
     out->items[0].status = CFN_STACK_STATUS_CREATE_COMPLETE;
     out->items[0].tags = calloc(2, sizeof(cfn_tag));
-    out->items[0].parameters = calloc(1, sizeof(cfn_parameter));
+    out->items[0].parameters = calloc(2, sizeof(cfn_parameter));
     out->items[0].outputs = calloc(6, sizeof(cfn_output));
     if (out->items[0].tags == NULL || out->items[0].parameters == NULL ||
         out->items[0].outputs == NULL) {
@@ -178,6 +195,15 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
                  sizeof out->items[0].parameters[0].key, "%s", "AmiIdAmd64");
         snprintf(out->items[0].parameters[0].value,
                  sizeof out->items[0].parameters[0].value, "%s", "ami-123");
+    }
+    if (stack_has_arm_ami) {
+        size_t slot = out->items[0].parameter_count;
+
+        snprintf(out->items[0].parameters[slot].key,
+                 sizeof out->items[0].parameters[slot].key, "%s", "AmiIdArm64");
+        snprintf(out->items[0].parameters[slot].value,
+                 sizeof out->items[0].parameters[slot].value, "%s", "ami-arm");
+        out->items[0].parameter_count++;
     }
     out->items[0].output_count = cert_bucket_enabled ? 6 : 5;
     snprintf(out->items[0].outputs[0].key, sizeof out->items[0].outputs[0].key,
@@ -232,6 +258,10 @@ static int fake_describe_images(ec2_client *client, const char *const *ids,
                                 size_t count, ec2_image_list *out) {
     (void)client;
     memset(out, 0, sizeof *out);
+    if (count > 0 && missing_ami[0] != '\0' &&
+        strcmp(ids[0], missing_ami) == 0) {
+        return 0;
+    }
     out->items = calloc(1, sizeof(ec2_image));
     if (out->items == NULL) {
         return ENOMEM;
@@ -320,7 +350,7 @@ static int fake_wait_terminated(ec2_client *client, const char *const *ids,
     (void)attempts;
     (void)interval;
     log_call("wait_terminated");
-    *timed_out = 0;
+    *timed_out = terminate_timeout;
     return 0;
 }
 
@@ -408,6 +438,15 @@ static int fake_ssh(char *const argv[], int timeout,
                                                   : "");
         captured_reconnect = sentinel->reconnect_argv != NULL &&
                              sentinel->reconnect_argv[0] != NULL;
+        captured_reconnect_cmd[0] = '\0';
+        if (sentinel->reconnect_argv != NULL) {
+            for (size_t i = 0; sentinel->reconnect_argv[i] != NULL && i < 64;
+                 i++) {
+                snprintf(captured_reconnect_cmd,
+                         sizeof captured_reconnect_cmd, "%s",
+                         sentinel->reconnect_argv[i]);
+            }
+        }
     }
     last_ssh_argc = 0;
     for (size_t i = 0; argv[i] != NULL && i < 64; i++) {
@@ -417,8 +456,17 @@ static int fake_ssh(char *const argv[], int timeout,
             ssh_install_seen = 1;
         }
     }
+    if (ssh_eintr) {
+        return EINTR;
+    }
+    if (ssh_etimedout) {
+        return ETIMEDOUT;
+    }
     if (ssh_transport_fail) {
         return ENOTCONN;
+    }
+    if (ssh_error_code != 0) {
+        return ssh_error_code;
     }
     *remote_status = remote_rc;
     return 0;
@@ -545,7 +593,11 @@ static void reset_all(void) {
     ddns_fail = 0;
     pin_fail = 0;
     ssh_transport_fail = 0;
+    ssh_eintr = 0;
+    ssh_etimedout = 0;
+    ssh_error_code = 0;
     remote_rc = 0;
+    captured_reconnect_cmd[0] = '\0';
     memset(last_ssh_argv, 0, sizeof last_ssh_argv);
     last_ssh_argc = 0;
     memset(last_terminated, 0, sizeof last_terminated);
@@ -555,6 +607,9 @@ static void reset_all(void) {
     g_manifest = DEFAULT_MANIFEST;
     memset(manifest_sha_override, 0, sizeof manifest_sha_override);
     stack_has_ami = 1;
+    stack_has_arm_ami = 0;
+    missing_ami[0] = '\0';
+    terminate_timeout = 0;
     console_calls = 0;
     console_empty_calls = 0;
     keyscan_calls = 0;
@@ -1007,6 +1062,28 @@ static void test_ssh_transport_failure_is_exit7_and_terminates(void) {
 
     CHECK(rc == CLI_EXIT_SSH, "SSH transport failure is exit 7");
     CHECK(terminated("i-new"), "failed instance terminated");
+    CHECK(stream_contains(rt.err, "OPERATOR_CIDR"),
+          "exit-7 diagnostic carries the OPERATOR_CIDR hint");
+    free_runtime(&rt);
+}
+
+static void test_ssh_error_is_exit7_with_hint(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    ssh_error_code = EIO;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_SSH, "non-connect SSH error is exit 7");
+    CHECK(terminated("i-new"), "SSH error terminates the instance");
+    CHECK(stream_contains(rt.err, "OPERATOR_CIDR"),
+          "non-connect exit-7 diagnostic carries the hint");
     free_runtime(&rt);
 }
 
@@ -1049,6 +1126,117 @@ static void test_entrypoint_output_is_surfaced(void) {
     free_runtime(&rt);
 }
 
+static void test_setup_script_extracts_and_reinjects_env(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    const char *script;
+    const char *precheck;
+    const char *extract;
+    const char *entry_check;
+    const char *reinject;
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    script = last_ssh_argc > 0 ? last_ssh_argv[last_ssh_argc - 1] : "";
+    precheck = strstr(script, "tar -tf");
+    extract = strstr(script, "tar --no-same-owner");
+    entry_check = strstr(script, "SETUP_ENTRYPOINT");
+    reinject = strstr(script, "(cd \"$d\" && sudo env ");
+    CHECK(rc == CLI_EXIT_OK, "launch with extracted bundle exits 0");
+    CHECK(precheck != NULL, "setup script prechecks tar member paths");
+    CHECK(extract != NULL && strstr(extract, "--no-overwrite-dir") != NULL &&
+              strstr(extract, "-xf") != NULL,
+          "setup script extracts hardened (no-same-owner/no-overwrite-dir)");
+    CHECK(extract != NULL && strstr(extract, "-C \"$d\"") != NULL,
+          "setup script extracts into the staging dir");
+    CHECK(entry_check != NULL && strstr(script, "! -x") != NULL,
+          "setup script checks the entrypoint exists and is executable");
+    CHECK(reinject != NULL,
+          "entrypoint runs from the bundle root with re-injected env");
+    CHECK(precheck != NULL && extract != NULL && reinject != NULL &&
+              precheck < extract && extract < reinject,
+          "precheck, extract, and run happen in order");
+    CHECK(strstr(script, "STACKCTL_PROJECT=\"$STACKCTL_PROJECT\"") != NULL,
+          "env re-injection references STACKCTL_PROJECT");
+    CHECK(strstr(script, "STACKCTL_BUCKET_ARTIFACT=\"$STACKCTL_BUCKET_ARTIFACT\"") !=
+              NULL,
+          "env re-injection carries the full contract var set");
+    free_runtime(&rt);
+}
+
+static void test_setup_script_failure_classes_are_exit3(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    /* A staged bundle that fails the sha/extract/entrypoint class (rc=3). */
+    remote_rc = 3;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_VERIFY, "setup rc=3 maps to exit 3");
+    CHECK(terminated("i-new"), "failed instance terminated");
+    /* The generated script routes the same class to rc=3. */
+    CHECK(any_ssh_contains("tar -tf") &&
+              any_ssh_contains("sudo tar --no-same-owner"),
+          "precheck extract before entrypoint");
+    CHECK(any_ssh_contains("SETUP_ENTRYPOINT"), "entrypoint check names the key");
+    CHECK(any_ssh_contains("rc=3"), "bundle failures map to rc=3");
+    free_runtime(&rt);
+}
+
+static void test_interrupt_exits_4_and_consumes_signal(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    cli_signal_test_reset();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    ssh_eintr = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_LAUNCH, "interrupted setup is exit 4");
+    CHECK(terminated("i-new"), "interrupted launch terminates the instance");
+    CHECK(cli_signal_consumed() != 0,
+          "launch marks the signal consumed so dispatch honors exit 4");
+    cli_signal_test_reset();
+    free_runtime(&rt);
+}
+
+static void test_setup_timeout_is_exit4(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    ssh_etimedout = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_LAUNCH, "setup timeout is exit 4");
+    CHECK(terminated("i-new"), "setup timeout terminates the instance");
+    CHECK(calls_named("ddns_update") >= 2,
+          "setup timeout restores DDNS after the ssh attempt");
+    free_runtime(&rt);
+}
+
 static void test_keep_on_failure_keeps_instance(void) {
     instance_runtime rt;
     instance_services svc;
@@ -1065,6 +1253,11 @@ static void test_keep_on_failure_keeps_instance(void) {
 
     CHECK(rc == CLI_EXIT_SSH, "--keep-on-failure still exits 7");
     CHECK(!terminated("i-new"), "--keep-on-failure leaves the new instance");
+    CHECK(stream_contains(
+              rt.err,
+              "stackctl: check that OPERATOR_CIDR covers this machine and "
+              "that the security group's SSH rule allows it\n"),
+          "exit-7 keep-on-failure diagnostic carries the full retry hint");
     free_runtime(&rt);
 }
 
@@ -1247,6 +1440,8 @@ static void test_keyscan_timeout_is_exit7(void) {
     CHECK(rc == CLI_EXIT_SSH, "keyscan timeout is exit 7");
     CHECK(keyscan_calls == 2, "keyscan polling is bounded by the timeout");
     CHECK(terminated("i-new"), "keyscan timeout terminates the instance");
+    CHECK(stream_contains(rt.err, "OPERATOR_CIDR"),
+          "keyscan exit-7 diagnostic carries the hint");
     free_runtime(&rt);
 }
 
@@ -1482,6 +1677,8 @@ static void test_ddns_onbox_delivery_failure_is_exit7(void) {
 
     CHECK(rc == CLI_EXIT_SSH, "scp transport failure is exit 7");
     CHECK(terminated("i-new"), "delivery failure terminates the instance");
+    CHECK(stream_contains(rt.err, "OPERATOR_CIDR"),
+          "delivery exit-7 diagnostic carries the hint");
     free_runtime(&rt);
 }
 
@@ -1502,6 +1699,105 @@ static void test_no_ddns_delivery_when_off(void) {
     free_runtime(&rt);
 }
 
+static void test_replacement_termination_failure_names_leftovers(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    add_instance("i-old-a", "running", "198.51.100.7", "old-nonce");
+    add_instance("i-old-b", "running", "198.51.100.8", "old-nonce");
+    snprintf(record_ip, sizeof record_ip, "%s", "198.51.100.7");
+    terminate_timeout = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_CLEANUP, "unconfirmed replacement is exit 5");
+    CHECK(stream_contains(rt.err, "i-old-a") &&
+              stream_contains(rt.err, "i-old-b"),
+          "replacement failure names every leftover instance id");
+    CHECK(stream_contains(rt.err, "terminate --instance-id"),
+          "replacement failure names the exact terminate command");
+    free_runtime(&rt);
+}
+
+static void test_ami_preflight_checks_every_declared_arch(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(rt.cfg.arch, sizeof rt.cfg.arch, "%s", "both");
+    opts.arch = "amd64";
+    stack_has_ami = 1;
+    stack_has_arm_ami = 0;
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_USAGE,
+          "a declared arch with no AMI parameter is exit 1");
+    CHECK(stream_contains(rt.err, "arm64"),
+          "the failing arch is named in the diagnostic");
+    CHECK(!run_called, "no spend when a declared arch has no AMI");
+    free_runtime(&rt);
+}
+
+static void test_ami_preflight_names_arch_missing_from_region(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(rt.cfg.arch, sizeof rt.cfg.arch, "%s", "both");
+    opts.arch = "amd64";
+    stack_has_ami = 1;
+    stack_has_arm_ami = 1;
+    snprintf(missing_ami, sizeof missing_ami, "%s", "ami-arm");
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_USAGE,
+          "a declared arch whose AMI is absent from the region is exit 1");
+    CHECK(stream_contains(rt.err, "arm64"),
+          "the region preflight names the failing arch");
+    CHECK(!run_called, "no spend when a declared arch AMI is absent");
+    free_runtime(&rt);
+}
+
+static void test_reconnect_reader_removes_staging_after_rc(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    const char *read;
+    const char *remove;
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    read = strstr(captured_reconnect_cmd, "cat \"$d/rc\"");
+    remove = strstr(captured_reconnect_cmd, "rm -rf \"$d\"");
+    CHECK(rc == CLI_EXIT_OK, "happy path exits 0");
+    CHECK(read != NULL, "reconnect reader reads $d/rc");
+    CHECK(remove != NULL, "reconnect reader removes the staging dir");
+    CHECK(read != NULL && remove != NULL && read < remove,
+          "staging removal happens only after the rc read");
+    CHECK(strstr(captured_reconnect_cmd, "|| true") != NULL,
+          "cleanup is best-effort so it cannot change the reported rc");
+    free_runtime(&rt);
+}
+
 int main(void) {
     test_missing_stack_is_exit1();
     test_empty_operator_cidr_is_exit1();
@@ -1515,8 +1811,13 @@ int main(void) {
     test_keep_old_skips_replacement();
     test_run_instances_error_is_exit2();
     test_ssh_transport_failure_is_exit7_and_terminates();
+    test_ssh_error_is_exit7_with_hint();
     test_setup_failure_is_exit4();
     test_entrypoint_output_is_surfaced();
+    test_setup_script_extracts_and_reinjects_env();
+    test_setup_script_failure_classes_are_exit3();
+    test_interrupt_exits_4_and_consumes_signal();
+    test_setup_timeout_is_exit4();
     test_keep_on_failure_keeps_instance();
     test_hostkey_mismatch_is_exit3();
     test_pin_failure_is_exit3();
@@ -1538,6 +1839,10 @@ int main(void) {
     test_ddns_onbox_delivers_password();
     test_ddns_onbox_delivery_failure_is_exit7();
     test_no_ddns_delivery_when_off();
+    test_replacement_termination_failure_names_leftovers();
+    test_ami_preflight_checks_every_declared_arch();
+    test_ami_preflight_names_arch_missing_from_region();
+    test_reconnect_reader_removes_staging_after_rc();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

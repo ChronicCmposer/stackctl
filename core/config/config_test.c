@@ -230,6 +230,41 @@ static void expect_invalid(const char *label, const kv *overrides,
     free(dir);
 }
 
+/* Like expect_invalid(), but also asserts the diagnostic mentions `needle`. */
+static void expect_invalid_msg(const char *label, const kv *overrides,
+                               size_t count, const char *needle) {
+    char *root = NULL;
+    char *dir = NULL;
+    char *err_path;
+    stackctl_config *cfg = NULL;
+    char buffer[4096];
+    FILE *file;
+    size_t got;
+    int rc;
+
+    repo_with_env(overrides, count, &root, &dir);
+    err_path = join_path(root, "stderr.txt");
+    stderr_to(err_path);
+    rc = config_load(dir, 0, NULL, &cfg);
+    stderr_restore();
+    CHECK(rc != 0, label);
+    CHECK(cfg == NULL, label);
+    config_free(cfg);
+
+    file = fopen(err_path, "r");
+    CHECK(file != NULL, label);
+    if (file != NULL) {
+        got = fread(buffer, 1, sizeof buffer - 1, file);
+        buffer[got] = '\0';
+        fclose(file);
+        CHECK(strstr(buffer, needle) != NULL, label);
+    }
+
+    free(err_path);
+    free(root);
+    free(dir);
+}
+
 static stackctl_config *load_valid_repo(const char *label, const kv *overrides,
                                         size_t count, char **root_out,
                                         char **dir_out) {
@@ -795,6 +830,258 @@ static void test_cross_keys(void) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Ingress rules (F2 / CONTRACT C3)                                          */
+/* ------------------------------------------------------------------------- */
+
+static void test_ingress_rules(void) {
+    static const kv trailing_comma[] = {{"INGRESS_TCP", "443,"}};
+    static const kv inner_empty[] = {{"INGRESS_TCP", "443,,80"}};
+    static const kv whitespace_only[] = {{"INGRESS_TCP", "443,   ,80"}};
+    static const kv duplicate[] = {{"INGRESS_TCP", "443,443"}};
+    static const kv duplicate_padded[] = {{"INGRESS_TCP", "443:0.0.0.0/0, 443:0.0.0.0/0"}};
+    static const kv ipv6[] = {{"INGRESS_TCP", "443:[::1]"}};
+    static const kv port_range[] = {{"INGRESS_TCP", "8000-8001"}};
+    static const kv host_bits[] = {{"INGRESS_TCP", "443:10.0.0.1/24"}};
+    static const kv bad_prefix[] = {{"INGRESS_TCP", "443:10.0.0.0/33"}};
+    static const kv bad_octet[] = {{"INGRESS_TCP", "443:300.0.0.0/8"}};
+    static const kv too_many_tcp[] = {
+        {"INGRESS_TCP", "1,2,3,4,5,6,7,8,9"}};
+    static const kv too_many_udp[] = {
+        {"INGRESS_UDP", "1,2,3,4,5,6,7,8,9"}};
+
+    expect_invalid_msg("trailing comma rejected", trailing_comma,
+                       ARRAY_LEN(trailing_comma), "empty");
+    expect_invalid_msg("inner empty item rejected", inner_empty,
+                       ARRAY_LEN(inner_empty), "empty");
+    expect_invalid_msg("whitespace-only item rejected", whitespace_only,
+                       ARRAY_LEN(whitespace_only), "empty");
+    expect_invalid_msg("exact duplicate rejected", duplicate,
+                       ARRAY_LEN(duplicate), "duplicate");
+    expect_invalid_msg("padded exact duplicate rejected", duplicate_padded,
+                       ARRAY_LEN(duplicate_padded), "duplicate");
+    expect_invalid_msg("IPv6 rejected", ipv6, ARRAY_LEN(ipv6), "IPv6");
+    expect_invalid_msg("port range rejected", port_range, ARRAY_LEN(port_range),
+                       "port");
+    expect_invalid_msg("host bits rejected", host_bits, ARRAY_LEN(host_bits),
+                       "host bits");
+    expect_invalid_msg("prefix > 32 rejected", bad_prefix, ARRAY_LEN(bad_prefix),
+                       "prefix");
+    expect_invalid_msg("octet > 255 rejected", bad_octet, ARRAY_LEN(bad_octet),
+                       "octet");
+    expect_invalid_msg("more than 8 TCP rules rejected", too_many_tcp,
+                       ARRAY_LEN(too_many_tcp), "9 rules");
+    expect_invalid_msg("more than 8 UDP rules rejected", too_many_udp,
+                       ARRAY_LEN(too_many_udp), "9 rules");
+
+    /* Mixed explicit/default CIDRs, surrounding whitespace and same port with
+     * different CIDRs all load and parse. */
+    static const kv good[] = {
+        {"INGRESS_TCP", " 4000 , 443:10.0.0.0/8 ,8443:0.0.0.0/0 "},
+        {"INGRESS_UDP", "9000"}};
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg =
+            load_valid_repo("mixed ingress lists load", good, ARRAY_LEN(good),
+                            &root, &dir);
+        const config_ingress_rule *rule = NULL;
+        size_t count;
+
+        CHECK(cfg != NULL, "mixed ingress lists load");
+        if (cfg != NULL) {
+            count = config_ingress_tcp(cfg, &rule);
+            CHECK(count == 3, "three TCP rules parsed");
+            if (count == 3 && rule != NULL) {
+                CHECK(rule[0].port == 4000, "TCP rule 0 port");
+                CHECK(strcmp(rule[0].cidr, "0.0.0.0/0") == 0,
+                      "TCP rule 0 default cidr");
+                CHECK(rule[1].port == 443, "TCP rule 1 port");
+                CHECK(strcmp(rule[1].cidr, "10.0.0.0/8") == 0,
+                      "TCP rule 1 explicit cidr");
+                CHECK(rule[2].port == 8443, "TCP rule 2 port");
+                CHECK(strcmp(rule[2].cidr, "0.0.0.0/0") == 0,
+                      "TCP rule 2 explicit default cidr");
+            }
+            count = config_ingress_udp(cfg, &rule);
+            CHECK(count == 1, "one UDP rule parsed");
+            if (count == 1 && rule != NULL) {
+                CHECK(rule[0].port == 9000, "UDP rule 0 port");
+                CHECK(strcmp(rule[0].cidr, "0.0.0.0/0") == 0,
+                      "UDP rule 0 default cidr");
+            }
+            config_free(cfg);
+        }
+        free(root);
+        free(dir);
+    }
+
+    /* Same port with different CIDRs is allowed (two slots). */
+    static const kv same_port[] = {
+        {"INGRESS_TCP", "443:10.0.0.0/8,443:192.168.0.0/16"}};
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg =
+            load_valid_repo("same port different cidr", same_port,
+                            ARRAY_LEN(same_port), &root, &dir);
+        const config_ingress_rule *rule = NULL;
+        size_t count;
+
+        CHECK(cfg != NULL, "same port different cidr loads");
+        if (cfg != NULL) {
+            count = config_ingress_tcp(cfg, &rule);
+            CHECK(count == 2, "both same-port rules kept");
+            if (count == 2 && rule != NULL) {
+                CHECK(strcmp(rule[0].cidr, "10.0.0.0/8") == 0,
+                      "first cidr kept");
+                CHECK(strcmp(rule[1].cidr, "192.168.0.0/16") == 0,
+                      "second cidr kept");
+            }
+            config_free(cfg);
+        }
+        free(root);
+        free(dir);
+    }
+
+    /* An empty list means no rules. */
+    static const kv empty[] = {{"INGRESS_TCP", ""}, {"INGRESS_UDP", ""}};
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg = load_valid_repo("empty ingress lists load",
+                                                empty, ARRAY_LEN(empty), &root,
+                                                &dir);
+        const config_ingress_rule *rule = NULL;
+
+        CHECK(cfg != NULL, "empty ingress loads");
+        if (cfg != NULL) {
+            CHECK(config_ingress_tcp(cfg, &rule) == 0, "no TCP rules");
+            CHECK(config_ingress_udp(cfg, &rule) == 0, "no UDP rules");
+            config_free(cfg);
+        }
+        free(root);
+        free(dir);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Optional keys: F5 empty prefixes, F11 builder parent, F13 boundary        */
+/* ------------------------------------------------------------------------- */
+
+static void test_optional_keys(void) {
+    static const kv empty_prefixes[] = {{"RELEASE_PREFIXES", ""}};
+    static const kv bad_prefixes[] = {{"RELEASE_PREFIXES", "releases/,"}};
+    static const kv missing_prefixes[] = {{"RELEASE_PREFIXES", NULL}};
+    static const kv parent_on[] = {
+        {"ENABLE_IMAGE_BUILDER", "true"},
+        {"IMAGE_BUILDER_PARENT_IMAGE",
+         "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"}};
+    static const kv parent_off[] = {
+        {"IMAGE_BUILDER_PARENT_IMAGE",
+         "/aws/service/ami-amazon-linux-latest/x"}};
+    static const kv parent_empty[] = {
+        {"ENABLE_IMAGE_BUILDER", "true"},
+        {"IMAGE_BUILDER_PARENT_IMAGE", ""}};
+    static const kv boundary_ok[] = {
+        {"PERMISSIONS_BOUNDARY_ARN",
+         "arn:aws:iam::123456789012:policy/stackctl-boundary"}};
+    static const kv boundary_bad[] = {
+        {"PERMISSIONS_BOUNDARY_ARN", "not-an-arn"}};
+    static const kv boundary_empty[] = {
+        {"PERMISSIONS_BOUNDARY_ARN", ""}};
+
+    /* F5: RELEASE_PREFIXES stays required but an empty value is permitted. */
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg =
+            load_valid_repo("empty RELEASE_PREFIXES loads", empty_prefixes,
+                            ARRAY_LEN(empty_prefixes), &root, &dir);
+
+        CHECK(cfg != NULL, "empty RELEASE_PREFIXES loads");
+        if (cfg != NULL) {
+            CHECK(strcmp(config_get(cfg, "RELEASE_PREFIXES"), "") == 0,
+                  "empty RELEASE_PREFIXES preserved");
+        }
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
+    expect_invalid_msg("non-empty RELEASE_PREFIXES keeps comma validation",
+                       bad_prefixes, ARRAY_LEN(bad_prefixes),
+                       "RELEASE_PREFIXES");
+    expect_invalid("missing RELEASE_PREFIXES rejected", missing_prefixes,
+                   ARRAY_LEN(missing_prefixes));
+
+    /* F11: IMAGE_BUILDER_PARENT_IMAGE is valid only with the builder on. */
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg = load_valid_repo(
+            "builder parent under builder-on", parent_on, ARRAY_LEN(parent_on),
+            &root, &dir);
+        const char *parent = cfg != NULL
+                                 ? config_image_builder_parent_image(cfg)
+                                 : NULL;
+
+        CHECK(cfg != NULL, "builder parent under builder-on loads");
+        CHECK(parent != NULL &&
+                  strcmp(parent, "/aws/service/ami-amazon-linux-latest/"
+                                  "al2023-ami-kernel-default-x86_64") == 0,
+              "builder parent preserved");
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
+    expect_invalid_msg("builder parent rejected when builder off", parent_off,
+                       ARRAY_LEN(parent_off), "ENABLE_IMAGE_BUILDER");
+    expect_invalid_msg("empty builder parent rejected", parent_empty,
+                       ARRAY_LEN(parent_empty), "IMAGE_BUILDER_PARENT_IMAGE");
+
+    /* F13: PERMISSIONS_BOUNDARY_ARN is optional but ARN-shaped. */
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg =
+            load_valid_repo("boundary arn loads", boundary_ok,
+                            ARRAY_LEN(boundary_ok), &root, &dir);
+        const char *arn =
+            cfg != NULL ? config_permissions_boundary_arn(cfg) : NULL;
+
+        CHECK(cfg != NULL, "boundary arn loads");
+        CHECK(arn != NULL &&
+                  strcmp(arn, "arn:aws:iam::123456789012:policy/"
+                              "stackctl-boundary") == 0,
+              "boundary arn preserved");
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg =
+            load_valid_repo("optional keys unset are NULL", NULL, 0, &root,
+                            &dir);
+
+        CHECK(cfg != NULL, "base config loads");
+        if (cfg != NULL) {
+            CHECK(config_permissions_boundary_arn(cfg) == NULL,
+                  "unset boundary is NULL");
+            CHECK(config_image_builder_parent_image(cfg) == NULL,
+                  "unset builder parent is NULL");
+        }
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
+    expect_invalid_msg("non-arn boundary rejected", boundary_bad,
+                       ARRAY_LEN(boundary_bad), "ARN");
+    expect_invalid_msg("empty boundary rejected", boundary_empty,
+                       ARRAY_LEN(boundary_empty), "PERMISSIONS_BOUNDARY_ARN");
+}
+
+/* ------------------------------------------------------------------------- */
 /* Architecture list variants                                                */
 /* ------------------------------------------------------------------------- */
 
@@ -934,6 +1221,8 @@ int main(void) {
     test_relative_resolution();
     test_unknown_and_required();
     test_cross_keys();
+    test_ingress_rules();
+    test_optional_keys();
     test_arch_list_variants();
     test_build_working_directory();
     test_config_dir_accessor();

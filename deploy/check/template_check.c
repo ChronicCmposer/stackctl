@@ -1514,6 +1514,129 @@ static void check_image_builder_references(checker *c, const node *root) {
     }
 }
 
+static const char *skip_spaces(const char *text) {
+    while (*text == ' ' || *text == '\t') {
+        text++;
+    }
+    return text;
+}
+
+/* The parser keeps short-form intrinsics as opaque scalars, so a pinned binding
+ * is recognised textually: the parameter reference must follow an
+ * `!If [AmiPinned, ...]` condition within the same binding. */
+static int scalar_refs_under_pinned(const char *text, const char *name) {
+    char reference[256];
+    int written = snprintf(reference, sizeof(reference), "!Ref %s", name);
+    if (written < 0 || (size_t)written >= sizeof(reference)) {
+        return 0;
+    }
+    const char *ref_at = strstr(text, reference);
+    if (ref_at == NULL) {
+        return 0;
+    }
+    for (const char *if_at = text; (if_at = strstr(if_at, "!If")) != NULL; if_at++) {
+        if (if_at > ref_at) {
+            break;
+        }
+        const char *probe = skip_spaces(if_at + 3);
+        if (*probe != '[') {
+            continue;
+        }
+        probe = skip_spaces(probe + 1);
+        if (strncmp(probe, "AmiPinned", 9) != 0) {
+            continue;
+        }
+        probe = skip_spaces(probe + 9);
+        if (*probe == ',' && probe < ref_at) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Long-form `Fn::If: [AmiPinned, ...]` is structural in the parser, so match it
+ * directly rather than through the scalar text. */
+static int fn_if_refs_under_pinned(const node *map, const char *name) {
+    const node *fn_if = map_get(map, "Fn::If");
+    if (fn_if == NULL || fn_if->kind != NODE_SEQ || fn_if->nitems < 2) {
+        return 0;
+    }
+    if (!node_scalar_equals(fn_if->items[0], "AmiPinned")) {
+        return 0;
+    }
+    for (size_t i = 1; i < fn_if->nitems; i++) {
+        if (node_references(fn_if->items[i], name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int node_refs_under_pinned(const node *n, const char *name) {
+    if (n == NULL) {
+        return 0;
+    }
+    if (n->kind == NODE_SCALAR) {
+        return scalar_refs_under_pinned(n->text, name);
+    }
+    if (n->kind == NODE_MAP) {
+        if (fn_if_refs_under_pinned(n, name)) {
+            return 1;
+        }
+        for (size_t i = 0; i < n->npairs; i++) {
+            if (node_refs_under_pinned(n->pairs[i].value, name)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    for (size_t i = 0; i < n->nitems; i++) {
+        if (node_refs_under_pinned(n->items[i], name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A pinned AMI override is all-or-nothing at the template level: the arch
+ * parameters are either both absent or both declared and both bound under the
+ * AmiPinned condition. Per-declared-arch requiredness stays with the runtime
+ * config matrix. */
+static void check_ami_id_arch_symmetry(checker *c, const node *root) {
+    static const char *const arch_parameters[] = {
+        "AmiIdAmd64",
+        "AmiIdArm64",
+    };
+    const size_t arch_count = sizeof(arch_parameters) / sizeof(arch_parameters[0]);
+
+    const node *parameters = template_parameters(root);
+    if (parameters == NULL || parameters->kind != NODE_MAP) {
+        return;
+    }
+
+    int declared = 0;
+    for (size_t i = 0; i < arch_count; i++) {
+        if (map_get(parameters, arch_parameters[i]) != NULL) {
+            declared++;
+        }
+    }
+    if (declared == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < arch_count; i++) {
+        const char *name = arch_parameters[i];
+        if (map_get(parameters, name) == NULL) {
+            violation(c, "pinned AMI override must declare parameter %s", name);
+            continue;
+        }
+        if (!node_refs_under_pinned(root, name)) {
+            violation(c, "AMI parameter %s must be referenced under the AmiPinned condition",
+                      name);
+        }
+    }
+}
+
 #define INGRESS_SLOTS 8
 
 static void check_app_ingress_rule(checker *c, const node *root, const char *resource_name,
@@ -1601,6 +1724,7 @@ static void check_infra(checker *c, const node *root) {
     check_no_exports(c, root);
     check_stack_name_contract(c, root);
     check_image_builder_references(c, root);
+    check_ami_id_arch_symmetry(c, root);
 
     const node *resources = template_resources(root);
     check_iam_node(c, resources);

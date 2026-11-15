@@ -69,6 +69,16 @@ typedef struct sshc_sentinel_spec {
 } sshc_sentinel_spec;
 
 /*
+ * Optional abort hook, checked every SSHC_POLL_MS while a child runs. Returning
+ * non-zero tears the child's process group down (SIGTERM, 5 s, SIGKILL) and makes
+ * sshc_exec() return EINTR. Mirrors aws_set_abort_hook(); `user` is passed
+ * through unchanged. Module-level state is deliberate: ssh runs one session per
+ * verb.
+ */
+typedef int (*sshc_abort_fn)(void *user);
+void sshc_set_abort_hook(sshc_abort_fn fn, void *user);
+
+/*
  * Execute argv, capturing stdout for sentinel parsing.
  *
  *   argv        NULL-terminated command (e.g. from sshc_build_argv).

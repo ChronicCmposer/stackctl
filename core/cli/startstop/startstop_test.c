@@ -31,6 +31,7 @@ static char g_console[1024];
 static int g_console_present;
 static int g_keyscan_null;
 static int g_ssh_fail;
+static int g_ssh_eintr;
 static int g_remote_rc;
 static char g_argv[48][256];
 static size_t g_argv_count;
@@ -118,6 +119,9 @@ static int fake_ssh(char *const argv[], int timeout,
         snprintf(g_argv[i], sizeof g_argv[i], "%s", argv[i]);
         g_argv_count++;
     }
+    if (g_ssh_eintr) {
+        return EINTR;
+    }
     if (g_ssh_fail) {
         return ENOTCONN;
     }
@@ -136,6 +140,7 @@ static void reset_all(void) {
     g_console_present = 0;
     g_keyscan_null = 0;
     g_ssh_fail = 0;
+    g_ssh_eintr = 0;
     g_remote_rc = 0;
     memset(g_argv, 0, sizeof g_argv);
     g_argv_count = 0;
@@ -481,6 +486,28 @@ static void test_identity_api_error_is_exit2(void) {
     free_runtime(&rt);
 }
 
+static void test_interrupted_ssh_fails_and_consumes_signal(void) {
+    instance_runtime rt;
+    instance_services svc;
+    startstop_options opts = {0};
+    int rc;
+
+    reset_all();
+    cli_signal_test_reset();
+    make_runtime(&rt, &svc);
+    add_instance("i-1", "running", "203.0.113.9");
+    g_bound = 1;
+    g_ssh_eintr = 1;
+
+    rc = startstop_execute(&rt, &opts, STARTSTOP_STOP);
+
+    CHECK(rc == CLI_EXIT_SSH, "interrupted ssh takes the failure path");
+    CHECK(cli_signal_consumed() != 0,
+          "start/stop marks the signal consumed");
+    cli_signal_test_reset();
+    free_runtime(&rt);
+}
+
 int main(void) {
     test_start_bound();
     test_stop_command();
@@ -492,6 +519,7 @@ int main(void) {
     test_unbound_no_console_without_flag_is_exit7();
     test_unbound_topu_flag_pins();
     test_ssh_transport_failure_is_exit7();
+    test_interrupted_ssh_fails_and_consumes_signal();
     test_remote_failure_is_exit1();
     test_explicit_id_must_be_tagged();
     test_identity_mismatch_is_exit3();

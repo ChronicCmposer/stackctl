@@ -117,7 +117,13 @@ int cli_dispatch_normalize_rc(int rc) {
 int cli_dispatch_verb_exit(int verb_rc) {
     int exit_code = cli_dispatch_normalize_rc(verb_rc);
 
-    if (exit_code == CLI_EXIT_OK && cli_signal_received() != 0) {
+    /*
+     * A verb that handled the first signal on its standard failure path marks
+     * it consumed; honor its returned code verbatim. Otherwise a successful
+     * verb under a recorded signal keeps the frozen AWS mapping.
+     */
+    if (exit_code == CLI_EXIT_OK && cli_signal_received() != 0 &&
+        !cli_signal_consumed()) {
         return CLI_EXIT_AWS;
     }
     return exit_code;

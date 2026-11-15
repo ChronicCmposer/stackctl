@@ -24,6 +24,14 @@
 #define SSHC_KILL_GRACE_SEC 5
 #define SSHC_POLL_MS 50
 
+static sshc_abort_fn abort_hook;
+static void *abort_user;
+
+void sshc_set_abort_hook(sshc_abort_fn fn, void *user) {
+    abort_hook = fn;
+    abort_user = user;
+}
+
 /* ------------------------------------------------------------------------- */
 /* argv builder                                                              */
 /* ------------------------------------------------------------------------- */
@@ -429,6 +437,7 @@ static int run_once(char *const argv[], int timeout_sec, capture *out,
     struct timespec start;
     int status = 0;
     int finished = 0;
+    int aborted = 0;
 
     *timed_out = 0;
     *status_out = 0;
@@ -485,10 +494,21 @@ static int run_once(char *const argv[], int timeout_sec, capture *out,
             finished = 1;
             break;
         }
+        if (abort_hook != NULL && abort_hook(abort_user) != 0) {
+            terminate_group(child, &status);
+            aborted = 1;
+            finished = 1;
+            break;
+        }
         pfd.fd = pipe_fds[0];
         pfd.events = POLLIN;
         pfd.revents = 0;
         (void)poll(&pfd, 1, SSHC_POLL_MS);
+    }
+    if (aborted) {
+        close(pipe_fds[0]);
+        *status_out = status;
+        return EINTR;
     }
     if (!*timed_out) {
         int flags;

@@ -40,6 +40,9 @@
 /* Forward declaration: JSON emission takes a yyjson mutable document. */
 struct yyjson_mut_doc;
 
+/* Forward declaration: the identity guard operates on an AWS client. */
+struct aws_ctx;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -373,6 +376,23 @@ void cli_print_command_usage(FILE *out, const char *program,
                              size_t option_count);
 
 /* ------------------------------------------------------------------------- */
+/* Identity                                                                  */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Assert the caller is the project IAM user (`arn:...:user/<project>`), the
+ * shared guard the identity-mutating verbs re-run before acting.
+ *
+ * Returns CLI_EXIT_OK (0) on an exact `:user/<project>` suffix match;
+ * CLI_EXIT_AWS (2) when STS GetCallerIdentity fails; CLI_EXIT_VERIFY (3) when
+ * the ARN does not end in the expected suffix or is an assumed-role ARN
+ * (`arn:aws:sts::...:assumed-role/...`). Diagnostics go to stderr. Account-id
+ * verification is intentionally out of scope (there is no configured account
+ * key); this mirrors the existing per-verb guards.
+ */
+int cli_assert_operator_identity(struct aws_ctx *aws, const char *project);
+
+/* ------------------------------------------------------------------------- */
 /* Signals                                                                   */
 /* ------------------------------------------------------------------------- */
 
@@ -389,6 +409,17 @@ int cli_signal_received(void);
 
 /* The first observed signal number, or 0 when none. */
 int cli_signal_number(void);
+
+/*
+ * Record that the current verb handled the first signal itself (for example,
+ * mapping EINTR to its own failure path). The dispatcher then honors the verb's
+ * returned exit code verbatim instead of mapping any received signal to
+ * CLI_EXIT_AWS. Consumed state is cleared by cli_signal_test_reset().
+ */
+void cli_signal_mark_consumed(void);
+
+/* Non-zero once cli_signal_mark_consumed() was called for this run. */
+int cli_signal_consumed(void);
 
 /*
  * Abort callback for interruptible library waits (aws_abort_fn shape): returns

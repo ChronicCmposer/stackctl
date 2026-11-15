@@ -41,6 +41,7 @@ enum trace_tag {
     TRACE_VERIFY,
     TRACE_PUBLISH,
     TRACE_AWS_INIT,
+    TRACE_IDENTITY,
     TRACE_CFN_CREATE,
     TRACE_DESCRIBE,
     TRACE_CREATE_CS,
@@ -75,9 +76,17 @@ typedef struct fake {
     int live_rc;
     int prune_rc;
     int prune_calls;
+    int prune_all_unverifiable;
+    int prune_unverifiable_swept;
+    FILE *prune_err;
+    int identity_rc;
+    int identity_calls;
     char prune_pinned[128];
     char prune_previous[128];
     char prune_uploaded[128];
+    int list_releases_rc;
+    int list_releases_calls;
+    char available_releases[256];
 
     int stack_present;
     cfn_stack_status status;
@@ -103,8 +112,8 @@ typedef struct fake {
     char last_stack[128];
     char last_template[512];
     size_t last_param_count;
-    char params[16][128];
-    char param_values[16][256];
+    char params[48][128];
+    char param_values[48][256];
     size_t last_tag_count;
     char tag_keys[8][128];
     char tag_values[8][256];
@@ -150,6 +159,15 @@ static void check_release_tags(const fake *f, const char *tag,
           "stack tagged with stackctl:release-tag");
     CHECK(sha_tagged != NULL && strcmp(sha_tagged, sha) == 0,
           "stack tagged with stackctl:release-sha");
+}
+
+static const char *fake_param_value(const fake *f, const char *key) {
+    for (size_t i = 0; i < f->last_param_count; i++) {
+        if (strcmp(f->params[i], key) == 0) {
+            return f->param_values[i];
+        }
+    }
+    return NULL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -286,7 +304,33 @@ static int fake_prune(void *ud, const char *bucket, const char *pinned,
              previous != NULL ? previous : "");
     snprintf(f->prune_uploaded, sizeof(f->prune_uploaded), "%s",
              just_uploaded != NULL ? just_uploaded : "");
+    /* prune_all_unverifiable models a sweep where every candidate failed cheap
+     * verification: production keeps them all, warns per tag, prints a summary
+     * and returns success. */
+    if (f->prune_all_unverifiable != 0) {
+        f->prune_unverifiable_swept++;
+        if (f->prune_err != NULL) {
+            fprintf(f->prune_err,
+                    "warning: release %s kept: unverifiable (verification "
+                    "failed)\n",
+                    just_uploaded != NULL ? just_uploaded : "candidate");
+            fprintf(f->prune_err, "1 release(s) kept: unverifiable\n");
+        }
+    }
     return f->prune_rc;
+}
+
+static int fake_list_releases(void *ud, const char *bucket, char *out,
+                              size_t cap) {
+    fake *f = ud;
+
+    (void)bucket;
+    f->list_releases_calls++;
+    if (f->list_releases_rc != 0) {
+        return f->list_releases_rc;
+    }
+    snprintf(out, cap, "%s", f->available_releases);
+    return 0;
 }
 
 static int fake_read_template_path(void *ud, const char *path,
@@ -339,6 +383,16 @@ static int fake_aws_init(void *ud, const char *profile, aws_ctx **out) {
 static void fake_aws_free(void *ud, aws_ctx *aws) {
     (void)ud;
     (void)aws;
+}
+
+static int fake_assert_identity(void *ud, aws_ctx *aws, const char *project) {
+    fake *f = ud;
+
+    (void)aws;
+    (void)project;
+    trace(f, TRACE_IDENTITY);
+    f->identity_calls++;
+    return f->identity_rc;
 }
 
 static int fake_cfn_create(void *ud, aws_ctx *aws, cfn_client **out) {
@@ -545,8 +599,10 @@ static deploy_ops fake_ops = {
     .publish_release = fake_publish,
     .count_live_instances = fake_count_live,
     .prune_releases = fake_prune,
+    .list_releases = fake_list_releases,
     .aws_init = fake_aws_init,
     .aws_free = fake_aws_free,
+    .assert_identity = fake_assert_identity,
     .cfn_create = fake_cfn_create,
     .cfn_destroy = fake_cfn_destroy,
     .describe_stacks = fake_describe,
@@ -729,6 +785,44 @@ static void fixture_write_env(fixture *fx, const char *text) {
 
     snprintf(path, sizeof(path), "%s/.env", fx->config_dir);
     write_text(path, text);
+}
+
+/* Rewrite the fixture .env with custom ingress lists, builder flag, extras. */
+static void fixture_write_env_custom_builder(fixture *fx, const char *tcp,
+                                             const char *udp,
+                                             const char *builder,
+                                             const char *extra) {
+    char text[4096];
+
+    snprintf(text, sizeof(text),
+             "PROJECT=demo\n"
+             "REGION=us-east-1\n"
+             "ARCH=amd64\n"
+             "SPOT_DEFAULT=false\n"
+             "AMI_POLICY=pinned\n"
+             "AMI_ID_AMD64=ami-0123456789abcdef0\n"
+             "INSTANCE_TYPES_AMD64=g4dn.xlarge\n"
+             "ROOT_VOLUME_SIZE=100\n"
+             "KEY_NAME=demo-key\n"
+             "SSH_IDENTITY=/home/operator/.ssh/demo\n"
+             "BUCKET_MODULES=artifact,cert\n"
+             "ENABLE_IMAGE_BUILDER=%s\n"
+             "SETUP_ENTRYPOINT=deploy.sh\n"
+             "SSH_PORT=22\n"
+             "OPERATOR_CIDR=203.0.113.0/24\n"
+             "INGRESS_TCP=%s\n"
+             "INGRESS_UDP=%s\n"
+             "RELEASE_TARGETS=//app:deploy.tar.gz\n"
+             "RELEASE_PREFIXES=releases/\n"
+             "%s",
+             builder, tcp, udp, extra != NULL ? extra : "");
+    fixture_write_env(fx, text);
+}
+
+/* Rewrite the fixture .env with custom ingress lists and extra lines. */
+static void fixture_write_env_custom(fixture *fx, const char *tcp,
+                                     const char *udp, const char *extra) {
+    fixture_write_env_custom_builder(fx, tcp, udp, "false", extra);
 }
 
 static void fixture_init(fixture *fx) {
@@ -1108,7 +1202,7 @@ static void test_empty_change_set_skips_execute(void) {
     config_free(cfg);
 }
 
-static void test_dry_run_deletes_change_set(void) {
+static void test_dry_run_is_fully_dry(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
@@ -1120,8 +1214,255 @@ static void test_dry_run_deletes_change_set(void) {
     env.dry_run = 1;
     CHECK(deploy_run(&env) == CLI_EXIT_OK, "dry-run succeeds");
     CHECK(f.executed == 0, "dry-run never executes");
-    CHECK(f.deleted_change_sets == 1, "dry-run deletes its change set");
+    CHECK(f.published_count == 0, "dry-run performs no S3 writes");
+    CHECK(f.prune_calls == 0, "dry-run never prunes");
+    CHECK(f.deleted_change_sets == 0, "dry-run deletes no change set");
+    CHECK(trace_index(&f, TRACE_CREATE_CS) < 0,
+          "dry-run creates no change set");
+    CHECK(trace_index(&f, TRACE_IDENTITY) >= 0,
+          "dry-run asserts identity before bailing");
+    CHECK(f.identity_calls == 1, "identity asserted once");
     config_free(cfg);
+}
+
+/* F2: the strimserver draft maps to indexed TCP/UDP port+cidr parameters. */
+static void test_ingress_indexed_params(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    fixture_write_env_custom(&fx, "4000", "9000", NULL);
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "strimserver ingress config loads");
+    if (cfg == NULL) {
+        return;
+    }
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "ingress deploy succeeds");
+
+    CHECK(fake_param_value(&f, "IngressTcpPort0") != NULL &&
+              strcmp(fake_param_value(&f, "IngressTcpPort0"), "4000") == 0,
+          "IngressTcpPort0=4000");
+    CHECK(fake_param_value(&f, "IngressTcpCidr0") != NULL &&
+              strcmp(fake_param_value(&f, "IngressTcpCidr0"), "0.0.0.0/0") == 0,
+          "IngressTcpCidr0=0.0.0.0/0");
+    CHECK(fake_param_value(&f, "IngressUdpPort0") != NULL &&
+              strcmp(fake_param_value(&f, "IngressUdpPort0"), "9000") == 0,
+          "IngressUdpPort0=9000");
+    CHECK(fake_param_value(&f, "IngressUdpCidr0") != NULL &&
+              strcmp(fake_param_value(&f, "IngressUdpCidr0"), "0.0.0.0/0") == 0,
+          "IngressUdpCidr0=0.0.0.0/0");
+    CHECK(fake_param_value(&f, "IngressTcpPort1") == NULL,
+          "unused TCP slot is not passed");
+    CHECK(fake_param_value(&f, "IngressUdpPort1") == NULL,
+          "unused UDP slot is not passed");
+    config_free(cfg);
+}
+
+/* F4: DDNS identity params are passed iff DDNS_HOST is configured. */
+static void test_ddns_params(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    fixture_write_env_custom(&fx, "443", "", "DDNS_HOST=home\n"
+                                            "DDNS_DOMAIN=example.com\n");
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "DDNS config loads");
+    if (cfg == NULL) {
+        return;
+    }
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "DDNS deploy succeeds");
+    CHECK(fake_param_value(&f, "DdnsHost") != NULL &&
+              strcmp(fake_param_value(&f, "DdnsHost"), "home") == 0,
+          "DdnsHost passed when configured");
+    CHECK(fake_param_value(&f, "DdnsDomain") != NULL &&
+              strcmp(fake_param_value(&f, "DdnsDomain"), "example.com") == 0,
+          "DdnsDomain passed when configured");
+    config_free(cfg);
+
+    /* Unset: neither param is passed. */
+    fixture fx2;
+    fake f2 = {0};
+
+    fixture_init(&fx2);
+    cfg = load_config(&fx2);
+    env = make_env(&f2, cfg, &fx2);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "no-DDNS deploy succeeds");
+    CHECK(fake_param_value(&f2, "DdnsHost") == NULL,
+          "DdnsHost absent when unset");
+    CHECK(fake_param_value(&f2, "DdnsDomain") == NULL,
+          "DdnsDomain absent when unset");
+    config_free(cfg);
+}
+
+/* F10: EnableSpotAlerts is always passed; SpotAlertEmail only when on. */
+static void test_spot_alert_params(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    /* Alerts on: both parameters, email carried through. */
+    fixture_init(&fx);
+    fixture_write_env_custom(&fx, "443", "",
+                             "ENABLE_SPOT_ALERTS=true\n"
+                             "SPOT_ALERT_EMAIL=ops@example.com\n");
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "spot-alert config loads");
+    if (cfg == NULL) {
+        return;
+    }
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "spot-alert deploy succeeds");
+    CHECK(fake_param_value(&f, "EnableSpotAlerts") != NULL &&
+              strcmp(fake_param_value(&f, "EnableSpotAlerts"), "true") == 0,
+          "EnableSpotAlerts=true when alerts are on");
+    CHECK(fake_param_value(&f, "SpotAlertEmail") != NULL &&
+              strcmp(fake_param_value(&f, "SpotAlertEmail"),
+                     "ops@example.com") == 0,
+          "SpotAlertEmail passed when alerts are on");
+    config_free(cfg);
+
+    /* Alerts off (default): EnableSpotAlerts=false, no email parameter. */
+    {
+        fixture fx2;
+        fake f2 = {0};
+
+        fixture_init(&fx2);
+        cfg = load_config(&fx2);
+        CHECK(cfg != NULL, "default spot-alert config loads");
+        if (cfg == NULL) {
+            return;
+        }
+        env = make_env(&f2, cfg, &fx2);
+        CHECK(deploy_run(&env) == CLI_EXIT_OK, "no-alert deploy succeeds");
+        CHECK(fake_param_value(&f2, "EnableSpotAlerts") != NULL &&
+                  strcmp(fake_param_value(&f2, "EnableSpotAlerts"), "false") ==
+                      0,
+              "EnableSpotAlerts=false when alerts are off");
+        CHECK(fake_param_value(&f2, "SpotAlertEmail") == NULL,
+              "SpotAlertEmail absent when alerts are off");
+        config_free(cfg);
+    }
+}
+
+/* F11: ImageBuilderParentImage is passed iff the config key is set. */
+static void test_image_builder_parent_image_param(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    fixture_write_env_custom_builder(&fx, "443", "", "true",
+                                     "IMAGE_BUILDER_PARENT_IMAGE=ami-parent123\n");
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "builder-parent config loads");
+    if (cfg == NULL) {
+        return;
+    }
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "builder-parent deploy succeeds");
+    CHECK(fake_param_value(&f, "ImageBuilderParentImage") != NULL &&
+              strcmp(fake_param_value(&f, "ImageBuilderParentImage"),
+                     "ami-parent123") == 0,
+          "ImageBuilderParentImage passed when set");
+    config_free(cfg);
+
+    /* Unset: the parameter is omitted. */
+    {
+        fixture fx2;
+        fake f2 = {0};
+
+        fixture_init(&fx2);
+        fixture_write_env_custom_builder(&fx2, "443", "", "true", NULL);
+        cfg = load_config(&fx2);
+        CHECK(cfg != NULL, "builder config without parent loads");
+        if (cfg == NULL) {
+            return;
+        }
+        env = make_env(&f2, cfg, &fx2);
+        CHECK(deploy_run(&env) == CLI_EXIT_OK, "builder deploy succeeds");
+        CHECK(fake_param_value(&f2, "ImageBuilderParentImage") == NULL,
+              "ImageBuilderParentImage absent when unset");
+        config_free(cfg);
+    }
+}
+
+/* F3: identity guard runs before publish and blocks mismatches. */
+static void test_identity_guard(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    /* Matching identity proceeds. */
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "matching identity proceeds");
+    CHECK(f.identity_calls == 1, "identity asserted once");
+    CHECK(trace_index(&f, TRACE_IDENTITY) >= 0 &&
+              trace_index(&f, TRACE_IDENTITY) < trace_index(&f, TRACE_PUBLISH),
+          "identity asserted before publish");
+    config_free(cfg);
+
+    /* Suffix mismatch aborts before any S3/CFN mutation with exit 3. */
+    {
+        fixture fx2;
+        fake f2 = {0};
+
+        fixture_init(&fx2);
+        cfg = load_config(&fx2);
+        env = make_env(&f2, cfg, &fx2);
+        f2.identity_rc = CLI_EXIT_VERIFY;
+        CHECK(deploy_run(&env) == CLI_EXIT_VERIFY,
+              "identity mismatch exits 3");
+        CHECK(f2.published_count == 0, "mismatch publishes nothing");
+        CHECK(trace_index(&f2, TRACE_RELEASE_EXISTS) < 0,
+              "mismatch aborts before S3 release checks");
+        CHECK(trace_index(&f2, TRACE_CREATE_CS) < 0,
+              "mismatch creates no change set");
+        config_free(cfg);
+    }
+
+    /* STS failure maps to exit 2. */
+    {
+        fixture fx3;
+        fake f3 = {0};
+
+        fixture_init(&fx3);
+        cfg = load_config(&fx3);
+        env = make_env(&f3, cfg, &fx3);
+        f3.identity_rc = CLI_EXIT_AWS;
+        CHECK(deploy_run(&env) == CLI_EXIT_AWS, "STS failure exits 2");
+        CHECK(f3.published_count == 0, "STS failure publishes nothing");
+        config_free(cfg);
+    }
+
+    /* dry-run still asserts identity before bailing. */
+    {
+        fixture fx4;
+        fake f4 = {0};
+
+        fixture_init(&fx4);
+        cfg = load_config(&fx4);
+        env = make_env(&f4, cfg, &fx4);
+        env.dry_run = 1;
+        f4.identity_rc = CLI_EXIT_VERIFY;
+        CHECK(deploy_run(&env) == CLI_EXIT_VERIFY,
+              "dry-run still fails on identity mismatch");
+        CHECK(f4.published_count == 0, "dry-run mismatch publishes nothing");
+        CHECK(trace_index(&f4, TRACE_CREATE_CS) < 0,
+              "dry-run mismatch creates no change set");
+        config_free(cfg);
+    }
 }
 
 static void test_decline_and_noninteractive(void) {
@@ -1296,6 +1637,150 @@ static void test_prune_selection(void) {
     CHECK(deploy_prune_mark(entries, 12, "v1.0.1", "v1.0.2", "v1.0.3", now) ==
               0,
           "protected old releases are kept");
+}
+
+/* F7: verify-before-prune decisions are driven by a cheap-verify callback. */
+typedef struct prune_verify_fake {
+    const char *fail_tag; /* tag to fail, or NULL when rc drives the failure */
+    int rc;               /* uniform failure code for every candidate */
+    int calls;
+} prune_verify_fake;
+
+static int fake_cheap_verify(void *ud, const char *tag) {
+    prune_verify_fake *v = ud;
+
+    v->calls++;
+    if (v->rc != 0) {
+        return v->rc;
+    }
+    if (v->fail_tag != NULL && strcmp(tag, v->fail_tag) == 0) {
+        return ENOENT;
+    }
+    return 0;
+}
+
+static void prune_entries_init(deploy_release_entry *entries, size_t count,
+                               const char *prefix) {
+    for (size_t i = 0; i < count; i++) {
+        snprintf(entries[i].tag, sizeof(entries[i].tag), "%s%zu", prefix, i);
+        entries[i].manifest_epoch = 1000 + (long long)i;
+        entries[i].delete_me = 1;
+    }
+}
+
+static void test_prune_verify_keeps_one_failure(void) {
+    deploy_release_entry entries[3] = {0};
+    deploy_prune_result result = {0};
+    prune_verify_fake v = {.fail_tag = "v1.0.1"};
+    FILE *err = tmpfile();
+    size_t remaining;
+
+    prune_entries_init(entries, 3, "v1.0.");
+    remaining =
+        deploy_prune_verify(entries, 3, DEPLOY_PRUNE_VERIFY_CAP,
+                            fake_cheap_verify, &v, &result, err);
+    CHECK(remaining == 2, "verified candidates remain deletable");
+    CHECK(entries[0].delete_me == 1 && entries[2].delete_me == 1,
+          "verified releases are pruned");
+    CHECK(entries[1].delete_me == 0, "unverifiable release is kept");
+    CHECK(result.candidates == 3 && result.verified == 2 &&
+              result.kept_unverifiable == 1 && result.deferred == 0,
+          "prune result counts one unverifiable candidate");
+    CHECK(stream_contains(err, "v1.0.1"), "warning names the kept tag");
+    CHECK(stream_contains(err, "kept"), "warning says the release was kept");
+    CHECK(stream_contains(err, "kept: unverifiable"),
+          "partial failure reports the unverifiable summary");
+    if (err != NULL) {
+        fclose(err);
+    }
+}
+
+static void test_prune_verify_all_verifiable(void) {
+    deploy_release_entry entries[3] = {0};
+    deploy_prune_result result = {0};
+    prune_verify_fake v = {0};
+    FILE *err = tmpfile();
+    size_t remaining;
+
+    prune_entries_init(entries, 2, "v1.0.");
+    /* A protected/unmarked entry must not be verified or counted. */
+    snprintf(entries[2].tag, sizeof(entries[2].tag), "v9.9.9");
+    remaining = deploy_prune_verify(entries, 3, DEPLOY_PRUNE_VERIFY_CAP,
+                                    fake_cheap_verify, &v, &result, err);
+    CHECK(remaining == 2, "all verifiable candidates are pruned");
+    CHECK(entries[0].delete_me == 1 && entries[1].delete_me == 1,
+          "verifiable releases stay marked");
+    CHECK(entries[2].delete_me == 0, "unmarked entry is untouched");
+    CHECK(result.candidates == 2 && result.verified == 2 &&
+              result.kept_unverifiable == 0,
+          "only marked candidates are verified");
+    CHECK(v.calls == 2, "cheap verify called once per marked candidate");
+    CHECK(!stream_contains(err, "unverifiable"),
+          "no unverifiable summary on a clean sweep");
+    if (err != NULL) {
+        fclose(err);
+    }
+}
+
+static void test_prune_verify_all_fail_keeps_everything(void) {
+    deploy_release_entry entries[3] = {0};
+    deploy_prune_result result = {0};
+    prune_verify_fake v = {.rc = ENOENT};
+    FILE *err = tmpfile();
+    size_t remaining;
+
+    prune_entries_init(entries, 3, "v1.0.");
+    remaining = deploy_prune_verify(entries, 3, DEPLOY_PRUNE_VERIFY_CAP,
+                                    fake_cheap_verify, &v, &result, err);
+    CHECK(remaining == 0, "nothing is pruned when every candidate fails");
+    CHECK(entries[0].delete_me == 0 && entries[1].delete_me == 0 &&
+              entries[2].delete_me == 0,
+          "every unverifiable release is kept");
+    CHECK(result.verified == 0 && result.kept_unverifiable == 3,
+          "all candidates counted unverifiable");
+    CHECK(stream_contains(err, "kept: unverifiable"),
+          "all-fail emits the kept-unverifiable summary");
+    CHECK(stream_contains(err, "3 releases kept: unverifiable"),
+          "all-fail uses the design wording naming the number kept");
+    if (err != NULL) {
+        fclose(err);
+    }
+}
+
+static void test_prune_verify_caps_at_twenty(void) {
+    deploy_release_entry entries[25] = {0};
+    deploy_prune_result result = {0};
+    prune_verify_fake v = {0};
+    FILE *err = tmpfile();
+    size_t remaining;
+
+    prune_entries_init(entries, 25, "v1.0.");
+    remaining = deploy_prune_verify(entries, 25, DEPLOY_PRUNE_VERIFY_CAP,
+                                    fake_cheap_verify, &v, &result, err);
+    CHECK(DEPLOY_PRUNE_VERIFY_CAP == 20, "verification cap is 20 per run");
+    CHECK(v.calls == 20, "only twenty candidates are verified");
+    CHECK(remaining == 20, "only verified candidates are pruned");
+    CHECK(result.deferred == 5, "remainder is deferred");
+    CHECK(entries[20].delete_me == 0 && entries[24].delete_me == 0,
+          "deferred candidates are kept for the next run");
+    CHECK(stream_contains(err, "deferred"), "deferral emits a summary line");
+    if (err != NULL) {
+        fclose(err);
+    }
+}
+
+/* F7: a manifest with no member lines proves nothing and must not verify. */
+static void test_cheap_verify_rejects_zero_member_manifest(void) {
+    char empty[1] = "";
+    char blank_lines[] = "\n\n";
+
+    CHECK(deploy_cheap_verify_manifest_for_test("bucket", "v1.0.0", empty) ==
+              CLI_EXIT_VERIFY,
+          "empty manifest fails cheap verification");
+    CHECK(deploy_cheap_verify_manifest_for_test("bucket", "v1.0.0",
+                                                blank_lines) ==
+              CLI_EXIT_VERIFY,
+          "manifest with no member lines fails cheap verification");
 }
 
 static void test_manifest_line_sha_first(void) {
@@ -1687,11 +2172,272 @@ static void test_prod_aws_init_installs_abort_hook(void) {
     }
 }
 
+
+/* F14: the ambiguity diagnostic names every release tag on HEAD. */
+static void test_ambiguous_tag_error_names_tags(void) {
+    char message[512] = {0};
+
+    CHECK(deploy_ambiguous_tag_error("v1.0.0\nv2.0.0\n", message,
+                                     sizeof(message)) == 2,
+          "two semver tags are collected");
+    CHECK(strstr(message, "v1.0.0") != NULL,
+          "ambiguous error names the first tag");
+    CHECK(strstr(message, "v2.0.0") != NULL,
+          "ambiguous error names the second tag");
+}
+
+/* Large tag sets are truncated explicitly, never silently (F14 nit). */
+static void test_ambiguous_tag_error_marks_truncation(void) {
+    char input[4096] = {0};
+    char message[512] = {0};
+    size_t used = 0;
+    size_t count;
+
+    for (int i = 0; i < 120; i++) {
+        int rc =
+            snprintf(input + used, sizeof(input) - used, "v1.0.%03d\n", i);
+
+        CHECK(rc > 0 && (size_t)rc < sizeof(input) - used, "tag fits input");
+        if (rc <= 0) {
+            return;
+        }
+        used += (size_t)rc;
+    }
+    count = deploy_ambiguous_tag_error(input, message, sizeof(message));
+    CHECK(count == 120, "every semver tag is counted");
+    CHECK(strstr(message, " more)") != NULL,
+          "truncated tag list ends with a (+N more) tail");
+    {
+        const char *tail = strstr(message, " … (+");
+        const char *last_sep = NULL;
+        const char *token;
+
+        CHECK(tail != NULL, "truncation tail is present");
+        if (tail != NULL) {
+            for (const char *p = tail; p > message; p--) {
+                if (p[-1] == ',' && p[0] == ' ') {
+                    last_sep = p - 1;
+                    break;
+                }
+            }
+            token = last_sep != NULL ? last_sep + 2 : message;
+            /* Every full tag is v1.0.NNN (three patch digits); a mid-tag clip
+             * would leave a shorter patch, so this proves the cut is on a
+             * tag boundary. */
+            CHECK(strncmp(token, "v1.0.", 5) == 0,
+                  "truncation ends on a complete tag prefix");
+            CHECK(token[7] >= '0' && token[7] <= '9',
+                  "truncation ends on a full three-digit patch tag");
+            CHECK(token[8] == ' ',
+                  "truncation tag is followed by the tail separator");
+        }
+    }
+}
+
+/* F14 production path: the real provenance scan consumes a multi-line
+ * `git tag --points-at HEAD` result without destroying it before the
+ * diagnostic formats the names. A fake git keeps the test hermetic. */
+static void test_prod_provenance_ambiguous_names_tags(void) {
+    char template[] = "/tmp/stackctl-provenance-XXXXXX";
+    char *dir = mkdtemp(template);
+    char git_path[PATH_MAX];
+    char *saved_path;
+    char tag[128] = {0};
+    FILE *captured;
+    int saved_stderr;
+    int rc = CLI_EXIT_VERIFY;
+
+    CHECK(dir != NULL, "provenance fixture dir");
+    if (dir == NULL) {
+        return;
+    }
+    snprintf(git_path, sizeof(git_path), "%s/git", dir);
+    {
+        FILE *script = fopen(git_path, "w");
+
+        CHECK(script != NULL, "fake git script opens");
+        if (script == NULL) {
+            return;
+        }
+        fputs("#!/bin/sh\nprintf 'v1.0.0\\nv2.0.0\\n'\n", script);
+        fclose(script);
+    }
+    CHECK(chmod(git_path, 0755) == 0, "fake git script executable");
+    saved_path = getenv("PATH");
+    {
+        char path[PATH_MAX * 2];
+
+        snprintf(path, sizeof(path), "%s:%s", dir,
+                 saved_path != NULL ? saved_path : "");
+        CHECK(setenv("PATH", path, 1) == 0, "PATH points at fake git");
+    }
+    captured = tmpfile();
+    CHECK(captured != NULL, "stderr capture opens");
+    saved_stderr = dup(STDERR_FILENO);
+    CHECK(saved_stderr >= 0, "stderr saved");
+    if (captured != NULL && saved_stderr >= 0) {
+        CHECK(dup2(fileno(captured), STDERR_FILENO) >= 0, "stderr redirected");
+        rc = deploy_prod_provenance_for_test(dir, 0, tag, sizeof(tag));
+        fflush(stderr);
+        CHECK(dup2(saved_stderr, STDERR_FILENO) >= 0, "stderr restored");
+        close(saved_stderr);
+        CHECK(rc == CLI_EXIT_USAGE, "ambiguous production provenance exits 1");
+        CHECK(stream_contains(captured, "v1.0.0"),
+              "production diagnostic names the first tag");
+        CHECK(stream_contains(captured, "v2.0.0"),
+              "production diagnostic names the second tag");
+        fclose(captured);
+    } else {
+        if (saved_stderr >= 0) {
+            close(saved_stderr);
+        }
+        if (captured != NULL) {
+            fclose(captured);
+        }
+    }
+    if (saved_path != NULL) {
+        CHECK(setenv("PATH", saved_path, 1) == 0, "PATH restored");
+    } else {
+        unsetenv("PATH");
+    }
+    (void)unlink(git_path);
+    (void)rmdir(dir);
+}
+
+/* F15: rollback of a pruned tag lists the manifest-bearing releases. */
+static void test_rollback_missing_lists_available_releases(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "rollback listing fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.rel_exists = 0;
+    snprintf(f.available_releases, sizeof(f.available_releases),
+             "v1.0.0, v1.1.0");
+    env = make_env(&f, cfg, &fx);
+    env.tag_arg = "v9.9.9";
+    env.err = errors;
+    CHECK(deploy_run(&env) == CLI_EXIT_VERIFY,
+          "missing rollback tag still exits 3");
+    CHECK(f.list_releases_calls == 1, "S3 listing seam is consulted");
+    CHECK(stream_contains(errors, "v1.0.0") &&
+              stream_contains(errors, "v1.1.0"),
+          "pruned-tag error names the available releases");
+    fclose(errors);
+    config_free(cfg);
+}
+
+/* F15: only manifest-bearing release prefixes are listed. */
+static void test_collect_release_tags_needs_manifest(void) {
+    s3_object_list listing = {0};
+    s3_object_info items[4] = {0};
+    char tags[256] = {0};
+
+    items[0].key = "releases/v1.0.0/release-manifest.txt";
+    items[1].key = "releases/v1.1.0/artifact.tar.gz";
+    items[2].key = "releases/v1.2.0/release-manifest.txt";
+    items[3].key = "releases/notes.txt";
+    listing.items = items;
+    listing.count = 4;
+    CHECK(deploy_collect_release_tags(&listing, tags, sizeof(tags)) == 2,
+          "only manifest-bearing prefixes are available releases");
+    CHECK(strstr(tags, "v1.0.0") != NULL && strstr(tags, "v1.2.0") != NULL,
+          "available release list names manifest-bearing tags");
+    CHECK(strstr(tags, "v1.1.0") == NULL,
+          "manifest-less prefix is not an available release");
+}
+
+/* F20: an interrupted stack wait says the work continues server-side. */
+static void test_wait_stack_signal_diagnostic(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "wait diagnostic fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.rel_exists = 0;
+    f.wait_stack_rc = EINTR;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    CHECK(deploy_run(&env) == CLI_EXIT_AWS, "interrupted wait exits 2");
+    CHECK(stream_contains(errors, "continues server-side"),
+          "interrupted-wait diagnostic says the operation continues");
+    CHECK(stream_contains(errors, "stackctl status"),
+          "interrupted-wait diagnostic points at stackctl status");
+    fclose(errors);
+    config_free(cfg);
+}
+
+/* Deferred (b): an all-unverifiable prune never fails the deploy. */
+static void test_prune_all_unverifiable_still_exit_ok(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "prune fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.rel_exists = 0;
+    f.prune_all_unverifiable = 1;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    f.prune_err = errors;
+    CHECK(deploy_run(&env) == CLI_EXIT_OK,
+          "all-unverifiable prune leaves the deploy at exit 0");
+    CHECK(f.prune_calls == 1, "prune ran");
+    CHECK(f.prune_unverifiable_swept == 1,
+          "prune took the all-unverifiable sweep path");
+    CHECK(stream_contains(errors, "release(s) kept: unverifiable"),
+          "all-unverifiable sweep prints the kept summary");
+    fclose(errors);
+    config_free(cfg);
+}
+
 int main(void) {
     test_prod_aws_init_installs_abort_hook();
     test_null_env();
     test_provenance_failure();
     test_ambiguous_tag_is_usage();
+    test_ambiguous_tag_error_names_tags();
+    test_ambiguous_tag_error_marks_truncation();
+    test_prod_provenance_ambiguous_names_tags();
+    test_rollback_missing_lists_available_releases();
+    test_collect_release_tags_needs_manifest();
+    test_wait_stack_signal_diagnostic();
+    test_prune_all_unverifiable_still_exit_ok();
     test_freshness_failure_is_6();
     test_skip_build_bypasses_freshness();
     test_ami_preflight_failure_is_usage();
@@ -1704,7 +2450,12 @@ int main(void) {
     test_existing_release_verify_failure_is_verify();
     test_publish_failure_is_aws();
     test_empty_change_set_skips_execute();
-    test_dry_run_deletes_change_set();
+    test_dry_run_is_fully_dry();
+    test_ingress_indexed_params();
+    test_ddns_params();
+    test_spot_alert_params();
+    test_image_builder_parent_image_param();
+    test_identity_guard();
     test_decline_and_noninteractive();
     test_execute_failure_is_aws();
     test_idempotent_redeploy_uses_existing_release();
@@ -1712,6 +2463,11 @@ int main(void) {
     test_publish_readback_before_record();
     test_prune_runs_after_execute();
     test_prune_selection();
+    test_prune_verify_keeps_one_failure();
+    test_prune_verify_all_verifiable();
+    test_prune_verify_all_fail_keeps_everything();
+    test_prune_verify_caps_at_twenty();
+    test_cheap_verify_rejects_zero_member_manifest();
     test_manifest_line_sha_first();
     test_shell_quote_escapes();
     test_iso8601_parser();

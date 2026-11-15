@@ -163,6 +163,19 @@ static void test_verb_exit(void) {
     CHECK(cli_dispatch_verb_exit(0) == CLI_EXIT_OK);
 }
 
+static void test_signal_consumed_honors_verb_exit(void) {
+    cli_signal_test_reset();
+    cli_signal_test_fire(SIGINT);
+    cli_signal_mark_consumed();
+    CHECK(cli_dispatch_verb_exit(CLI_EXIT_LAUNCH) == CLI_EXIT_LAUNCH);
+    CHECK(cli_dispatch_verb_exit(CLI_EXIT_OK) == CLI_EXIT_OK);
+    cli_signal_test_reset();
+    /* Without a consumed flag the legacy OK-under-signal mapping stands. */
+    cli_signal_test_fire(SIGINT);
+    CHECK(cli_dispatch_verb_exit(CLI_EXIT_OK) == CLI_EXIT_AWS);
+    cli_signal_test_reset();
+}
+
 static void test_check_globals(void) {
     cli_globals globals;
     char err[256];
@@ -542,6 +555,7 @@ int main(void) {
     test_find();
     test_normalize_rc();
     test_verb_exit();
+    test_signal_consumed_honors_verb_exit();
     test_check_globals();
     test_help();
     test_version();

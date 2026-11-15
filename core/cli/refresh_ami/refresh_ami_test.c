@@ -88,6 +88,35 @@ static char *read_text(const char *path) {
     return buffer;
 }
 
+/* Rewrite the single occurrence of `from` in `path` to `to`. */
+static int replace_in_file(const char *path, const char *from, const char *to) {
+    char *text = read_text(path);
+    char *pos;
+    size_t prefix;
+    size_t need;
+    char *rewritten;
+
+    if (text == NULL) {
+        return 0;
+    }
+    pos = strstr(text, from);
+    if (pos == NULL) {
+        free(text);
+        return 0;
+    }
+    prefix = (size_t)(pos - text);
+    need = prefix + strlen(to) + strlen(pos + strlen(from)) + 1;
+    rewritten = calloc(need, 1);
+    if (rewritten != NULL) {
+        snprintf(rewritten, need, "%.*s%s%s", (int)prefix, text, to,
+                 pos + strlen(from));
+        write_text(path, rewritten);
+    }
+    free(rewritten);
+    free(text);
+    return rewritten != NULL; /* pointer value only; not dereferenced */
+}
+
 /* ------------------------------------------------------------------------- */
 /* Fake SSM resolver                                                         */
 /* ------------------------------------------------------------------------- */
@@ -96,6 +125,8 @@ typedef struct fake_ssm {
     const char *amd64;
     const char *arm64;
     int calls;
+    int identity_calls;
+    int identity_rc;
     char last_name[256];
 } fake_ssm;
 
@@ -123,8 +154,16 @@ static int fake_resolve(void *ud, const char *profile, const char *region,
     return *value_out != NULL ? 0 : ENOMEM;
 }
 
-static const refresh_ami_ops fake_ops = {.resolve_parameter = fake_resolve};
+static int fake_assert_identity(void *ud, const char *profile) {
+    fake_ssm *fake = ud;
 
+    (void)profile;
+    fake->identity_calls++;
+    return fake->identity_rc;
+}
+
+static const refresh_ami_ops fake_ops = {.resolve_parameter = fake_resolve,
+                                         .assert_identity = fake_assert_identity};
 /* File seam that fails the committed example write but never the local .env. */
 typedef struct failing_file_ops {
     int writes;
@@ -687,6 +726,227 @@ static void test_prod_aws_init_installs_abort_hook(void) {
     }
 }
 
+static void test_identity_guard_before_ssm(void) {
+    fixture fx;
+    cli_ctx *ctx;
+    fake_ssm mismatch = {.amd64 = "ami-newamd64",
+                         .identity_rc = CLI_EXIT_VERIFY};
+
+    fixture_init(&fx, 0, "pinned", 1, 1);
+    fixture_setenv(&fx);
+    refresh_ami_set_ops_for_test(&fake_ops, &mismatch);
+    ctx = make_ctx(&fx, NULL);
+    CHECK(ctx != NULL, "ctx for identity mismatch");
+    CHECK(cli_cmd_refresh_ami(ctx) == CLI_EXIT_VERIFY,
+          "identity mismatch exits 3");
+    CHECK(mismatch.identity_calls == 1, "identity asserted once");
+    CHECK(mismatch.calls == 0, "no SSM read before identity");
+    cli_ctx_free(ctx);
+    refresh_ami_set_ops_for_test(NULL, NULL);
+    fixture_clear_env();
+
+    {
+        fake_ssm matching = {.amd64 = "ami-newamd64"};
+
+        fixture_init(&fx, 0, "pinned", 1, 1);
+        fixture_setenv(&fx);
+        refresh_ami_set_ops_for_test(&fake_ops, &matching);
+        ctx = make_ctx(&fx, NULL);
+        CHECK(ctx != NULL, "ctx for matching identity");
+        CHECK(cli_cmd_refresh_ami(ctx) == CLI_EXIT_OK,
+              "matching identity proceeds");
+        CHECK(matching.identity_calls == 1, "identity asserted once");
+        CHECK(matching.calls == 1, "SSM read follows identity");
+        cli_ctx_free(ctx);
+        refresh_ami_set_ops_for_test(NULL, NULL);
+        fixture_clear_env();
+    }
+}
+
+/*
+ * F19: drive refresh_ami_run directly with a tmpfile stdout so the dry-run
+ * diff can be asserted without touching process-wide file descriptors.
+ */
+static char *run_dry_run_capture(const fixture *fx, fake_ssm *fake, int *rc_out) {
+    cli_ctx *ctx = make_ctx(fx, NULL);
+    refresh_ami_env env = {0};
+    FILE *sink = tmpfile();
+    char *text = NULL;
+
+    if (ctx == NULL || sink == NULL) {
+        if (ctx != NULL) {
+            cli_ctx_free(ctx);
+        }
+        if (sink != NULL) {
+            fclose(sink);
+        }
+        *rc_out = CLI_EXIT_USAGE;
+        return NULL;
+    }
+    env.cfg = cli_ctx_config(ctx);
+    env.profile = config_project(env.cfg);
+    env.config_dir = config_dir(env.cfg);
+    env.region = config_region(env.cfg);
+    env.dry_run = 1;
+    env.json = 0;
+    env.out = sink;
+    env.err = stderr;
+    env.ops = &fake_ops;
+    env.ops_ud = fake;
+    *rc_out = refresh_ami_run(&env);
+
+    {
+        long size = -1;
+
+        if (fseek(sink, 0, SEEK_END) == 0) {
+            size = ftell(sink);
+        }
+        if (size >= 0 && fseek(sink, 0, SEEK_SET) == 0) {
+            text = calloc((size_t)size + 1, 1);
+            if (text != NULL &&
+                fread(text, 1, (size_t)size, sink) != (size_t)size) {
+                free(text);
+                text = NULL;
+            }
+        }
+    }
+    fclose(sink);
+    cli_ctx_free(ctx);
+    return text;
+}
+
+/* Rewrite both fixture files as ARCH=both with the arm64 pins present. */
+static void fixture_set_both_arches(fixture *fx) {
+    const char *paths[2];
+    char *texts[2];
+
+    paths[0] = fx->env_path;
+    paths[1] = fx->example_path;
+    for (size_t i = 0; i < 2; i++) {
+        char *pos;
+        size_t prefix_len;
+        const char *rest;
+        size_t need;
+        char *rewritten;
+
+        texts[i] = read_text(paths[i]);
+        CHECK(texts[i] != NULL, "both-arch fixture readable");
+        if (texts[i] == NULL) {
+            return;
+        }
+        pos = strstr(texts[i], "ARCH=amd64\n");
+        CHECK(pos != NULL, "both-arch fixture has base ARCH line");
+        if (pos == NULL) {
+            free(texts[i]);
+            return;
+        }
+        prefix_len = (size_t)(pos - texts[i]);
+        rest = pos + strlen("ARCH=amd64\n");
+        need = prefix_len + strlen("ARCH=both\n") + strlen(rest) +
+               strlen("INSTANCE_TYPES_ARM64=g5g.xlarge\n"
+                      "AMI_ID_ARM64=ami-oldarm64\n"
+                      "AMI_SSM_ARM64=/aws/service/ami/arm64\n") +
+               1;
+        rewritten = calloc(need, 1);
+        CHECK(rewritten != NULL, "both-arch rewrite buffer");
+        if (rewritten == NULL) {
+            free(texts[i]);
+            return;
+        }
+        snprintf(rewritten, need,
+                 "%.*sARCH=both\n%sINSTANCE_TYPES_ARM64=g5g.xlarge\n"
+                 "AMI_ID_ARM64=ami-oldarm64\n"
+                 "AMI_SSM_ARM64=/aws/service/ami/arm64\n",
+                 (int)prefix_len, texts[i], rest);
+        write_text(paths[i], rewritten);
+        free(rewritten);
+        free(texts[i]);
+    }
+}
+
+static void test_dry_run_diff_changed_key(void) {
+    fixture fx;
+    fake_ssm fake = {.amd64 = "ami-newamd64"};
+    int rc = -1;
+    char *out = NULL;
+
+    fixture_init(&fx, 0, "pinned", 1, 1);
+    fixture_setenv(&fx);
+    out = run_dry_run_capture(&fx, &fake, &rc);
+    CHECK(rc == CLI_EXIT_OK, "dry-run diff succeeds");
+    CHECK(out != NULL && strstr(out, "AMI_ID_AMD64: ami-oldamd64 -> ami-newamd64\n") != NULL,
+          "changed key prints exactly one old -> new line");
+    free(out);
+    fixture_clear_env();
+}
+
+/* F19: when the active .env already holds the new value but the committed
+ * example still holds an older one, the diff reports the example's old value
+ * so the dual-file update is visible. */
+static void test_dry_run_diff_uses_example_old_value(void) {
+    fixture fx;
+    fake_ssm fake = {.amd64 = "ami-newamd64"};
+    int rc = -1;
+    char *out = NULL;
+
+    fixture_init(&fx, 0, "pinned", 1, 1);
+    CHECK(replace_in_file(fx.env_path, "AMI_ID_AMD64=ami-oldamd64",
+                          "AMI_ID_AMD64=ami-newamd64"),
+          "active .env rewritten to the new value");
+    fixture_setenv(&fx);
+    out = run_dry_run_capture(&fx, &fake, &rc);
+    CHECK(rc == CLI_EXIT_OK, "example-only dry-run diff succeeds");
+    CHECK(out != NULL &&
+              strstr(out,
+                     "AMI_ID_AMD64: ami-oldamd64 -> ami-newamd64\n") != NULL,
+          "diff uses the example-file old value when .env is unchanged");
+    free(out);
+    fixture_clear_env();
+}
+
+static void test_dry_run_diff_unchanged_key_silent(void) {
+    fixture fx;
+    fake_ssm fake = {.amd64 = "ami-oldamd64"};
+    int rc = -1;
+    char *out = NULL;
+
+    fixture_init(&fx, 0, "pinned", 1, 1);
+    fixture_setenv(&fx);
+    out = run_dry_run_capture(&fx, &fake, &rc);
+    CHECK(rc == CLI_EXIT_OK, "unchanged dry-run succeeds");
+    CHECK(out != NULL && strstr(out, "AMI_ID_AMD64") == NULL,
+          "unchanged key is silent");
+    free(out);
+    fixture_clear_env();
+}
+
+static void test_dry_run_diff_multiple_keys_ordered(void) {
+    fixture fx;
+    fake_ssm fake = {.amd64 = "ami-newamd64", .arm64 = "ami-newarm64"};
+    int rc = -1;
+    char *out = NULL;
+    const char *amd64_line;
+    const char *arm64_line;
+
+    fixture_init(&fx, 0, "pinned", 1, 1);
+    fixture_set_both_arches(&fx);
+    fixture_setenv(&fx);
+    out = run_dry_run_capture(&fx, &fake, &rc);
+    CHECK(rc == CLI_EXIT_OK, "multi-arch dry-run succeeds");
+    amd64_line = out != NULL
+                     ? strstr(out, "AMI_ID_AMD64: ami-oldamd64 -> ami-newamd64\n")
+                     : NULL;
+    arm64_line = out != NULL
+                     ? strstr(out, "AMI_ID_ARM64: ami-oldarm64 -> ami-newarm64\n")
+                     : NULL;
+    CHECK(amd64_line != NULL, "amd64 diff line present");
+    CHECK(arm64_line != NULL, "arm64 diff line present");
+    CHECK(amd64_line != NULL && arm64_line != NULL && amd64_line < arm64_line,
+          "diff lines follow declared arch order");
+    free(out);
+    fixture_clear_env();
+}
+
 int main(void) {
     test_prod_aws_init_installs_abort_hook();
     test_null_context();
@@ -702,6 +962,11 @@ int main(void) {
     test_region_variant_targets();
     test_ssm_failure_maps_to_aws();
     test_project_dir_follows_accessor();
+    test_identity_guard_before_ssm();
+    test_dry_run_diff_changed_key();
+    test_dry_run_diff_uses_example_old_value();
+    test_dry_run_diff_unchanged_key_silent();
+    test_dry_run_diff_multiple_keys_ordered();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

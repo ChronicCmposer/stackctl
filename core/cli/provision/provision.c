@@ -821,8 +821,9 @@ int provision_run(const provision_env *env) {
     cfn_stack_list stacks = {0};
     cfn_change_set_type type = CFN_CHANGE_SET_TYPE_CREATE;
     int prior_review = 0;
+    int ci_was_enabled = 0;
     operator_union union_cfg;
-    cfn_parameter params[6] = {0};
+    cfn_parameter params[8] = {0};
     size_t param_count = 0;
     cfn_change_set_spec spec = {0};
     cfn_change_set_result result = {0};
@@ -967,14 +968,42 @@ int provision_run(const provision_env *env) {
     }
 
     collect_union(env, &union_cfg);
+    /*
+     * F5: an existing CiUser output proves the stack had CI enabled. Clearing
+     * RELEASE_PREFIXES deletes that user and invalidates its access keys, so
+     * the change-set summary warns about the one-way transition.
+     */
+    if (stacks.count > 0) {
+        const char *ci_output =
+            cfn_stack_output(&stacks.items[0], "CiUserName");
+
+        /* Presence is unconditional: the output is "-" when CI is off, so the
+         * warning must key on a real user name, not on the output's existence.
+         * A missing output stays silent (no proof CI was ever enabled). */
+        ci_was_enabled =
+            ci_output != NULL && strcmp(ci_output, "-") != 0;
+    }
+
     add_param(params, &param_count, "ProjectName", project);
     add_param(params, &param_count, "InstanceTypeAllowlist",
               union_cfg.types_amd64[0] != '\0' ? union_cfg.types_amd64
                                                : union_cfg.types_arm64);
     add_param(params, &param_count, "EnableImageBuilder",
               union_cfg.image_builder != 0 ? "true" : "false");
+    add_param(params, &param_count, "EnableCiUser",
+              union_cfg.has_ci != 0 ? "true" : "false");
     if (union_cfg.has_ci != 0) {
         add_param(params, &param_count, "ReleasePrefixes", union_cfg.prefixes);
+    }
+    /* F6: same membership test the infra stack uses (deploy.c). */
+    add_param(params, &param_count, "CertBucketEnabled",
+              strstr(union_cfg.buckets, "cert") != NULL ? "true" : "false");
+    {
+        const char *boundary = config_get(env->cfg, "PERMISSIONS_BOUNDARY_ARN");
+
+        if (boundary != NULL) {
+            add_param(params, &param_count, "PermissionsBoundaryArn", boundary);
+        }
     }
 
     spec.stack_name = stack;
@@ -1028,6 +1057,13 @@ int provision_run(const provision_env *env) {
     if (env->json == 0) {
         fprintf(env->out, "%s: %zu change(s) in the change set\n", stack,
                 change_set.change_count);
+    }
+
+    /* F5: warn on the one-way true->false CI-user transition. */
+    if (ci_was_enabled != 0 && union_cfg.has_ci == 0) {
+        fprintf(env->err,
+                "stackctl: warning: RELEASE_PREFIXES is empty; this change "
+                "deletes CiUser and invalidates its access keys\n");
     }
 
     if (env->dry_run != 0) {
@@ -1093,7 +1129,9 @@ int provision_run(const provision_env *env) {
                                                             : CFN_WAIT_UPDATE,
                          180, 5, &timed_out);
     if (rc != 0 || timed_out != 0) {
-        fprintf(env->err, "stackctl: stack operation on %s did not complete\n",
+        fprintf(env->err,
+                "stackctl: stack operation on %s did not complete; stack "
+                "operation continues server-side; run `stackctl status`\n",
                 stack);
         rc = CLI_EXIT_AWS;
         goto done;

@@ -394,10 +394,24 @@ static int production_resolve(void *ud, const char *profile, const char *region,
     return rc;
 }
 
+static int production_assert_identity(void *ud, const char *profile) {
+    aws_ctx *aws = NULL;
+    int rc;
+
+    (void)ud;
+    rc = production_aws_init(profile, &aws);
+    if (rc != 0) {
+        return CLI_EXIT_AWS;
+    }
+    rc = cli_assert_operator_identity(aws, profile);
+    aws_free(aws);
+    return rc;
+}
+
 static const refresh_ami_ops production_ops = {
     .resolve_parameter = production_resolve,
+    .assert_identity = production_assert_identity,
 };
-
 /* ------------------------------------------------------------------------- */
 /* Paths and reporting                                                       */
 /* ------------------------------------------------------------------------- */
@@ -464,6 +478,8 @@ static void report_json(const refresh_ami_env *env, const char *local,
 typedef struct pin {
     char ssm_key[64];
     char pin_key[64];
+    char old_value[256];         /* active .env value */
+    char old_example_value[256]; /* committed .env.example value */
     char *value;
 } pin;
 
@@ -481,6 +497,7 @@ int refresh_ami_run(const refresh_ami_env *env) {
     size_t local_len = 0;
     size_t example_len = 0;
     size_t example_original_len = 0;
+    int identity_asserted = 0;
     int rc;
 
     if (env == NULL || env->cfg == NULL || env->config_dir == NULL ||
@@ -519,6 +536,16 @@ int refresh_ami_run(const refresh_ami_env *env) {
                     pins[pin_count].ssm_key);
             return CLI_EXIT_USAGE;
         }
+        /* F3: assert the caller identity before the first SSM GetParameter. */
+        if (!identity_asserted) {
+            if (ops->assert_identity != NULL) {
+                rc = ops->assert_identity(ops_ud, env->profile);
+                if (rc != 0) {
+                    return rc;
+                }
+            }
+            identity_asserted = 1;
+        }
         rc = ops->resolve_parameter(ops_ud, env->profile, env->region, ssm_name,
                                     &pins[pin_count].value);
         if (rc != 0) {
@@ -551,17 +578,18 @@ int refresh_ami_run(const refresh_ami_env *env) {
 
     /* Both files must contain every pin key before anything is written. */
     for (size_t i = 0; i < pin_count; i++) {
-        char ignored[64];
-
-        if (find_line_value(local_text, pins[i].pin_key, ignored,
-                            sizeof(ignored)) == NULL) {
+        /* Capture both old values: the dry-run diff reports the file that
+         * actually changes, preferring the active .env when both do. */
+        if (find_line_value(local_text, pins[i].pin_key, pins[i].old_value,
+                            sizeof(pins[i].old_value)) == NULL) {
             fprintf(env->err, "stackctl: %s is missing %s\n", local,
                     pins[i].pin_key);
             rc = CLI_EXIT_USAGE;
             goto done;
         }
-        if (find_line_value(example_text, pins[i].pin_key, ignored,
-                            sizeof(ignored)) == NULL) {
+        if (find_line_value(example_text, pins[i].pin_key,
+                            pins[i].old_example_value,
+                            sizeof(pins[i].old_example_value)) == NULL) {
             fprintf(env->err, "stackctl: %s is missing %s\n", example,
                     pins[i].pin_key);
             rc = CLI_EXIT_USAGE;
@@ -612,7 +640,17 @@ int refresh_ami_run(const refresh_ami_env *env) {
         } else {
             fprintf(env->out, "would update %s and %s\n", local, example);
             for (size_t i = 0; i < pin_count; i++) {
-                fprintf(env->out, "  %s=%s\n", pins[i].pin_key, pins[i].value);
+                /* Report the file that actually changes: the active .env wins
+                 * when both differ, otherwise fall back to the example. */
+                const char *old = pins[i].old_value;
+
+                if (strcmp(old, pins[i].value) == 0) {
+                    old = pins[i].old_example_value;
+                }
+                if (strcmp(old, pins[i].value) != 0) {
+                    fprintf(env->out, "%s: %s -> %s\n", pins[i].pin_key, old,
+                            pins[i].value);
+                }
             }
             fprintf(env->out, "run deploy to apply\n");
         }

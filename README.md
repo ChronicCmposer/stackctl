@@ -174,7 +174,11 @@ Validation is fail-closed at startup, before any AWS call:
   `<project>-*` resource names is unambiguous. `N` is derived so the longest bucket name fits
   S3's 63-character limit in the configured region.
 - Cross-key rules are enforced, for example `ARCH=arm64` requires `INSTANCE_TYPES_ARM64`,
-  `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`, and DDNS keys are required together.
+  `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`, `IMAGE_BUILDER_PARENT_IMAGE` is valid
+  only when `ENABLE_IMAGE_BUILDER=true`, and DDNS keys are required together.
+- Ingress rules are fully parsed at config load. Each item is `port` or `port:cidr`; IPv4 only,
+  no port ranges, strict CIDR (host bits must be clear), no exact duplicate `port:cidr` pairs,
+  and at most 8 rules per protocol. Malformed input exits 1 before any AWS call.
 - Booleans, ports and volume sizes are range-checked.
 
 ### Keys
@@ -199,8 +203,10 @@ Validation is fail-closed at startup, before any AWS call:
 | `SSH_USER` | no | SSH login user; default `ec2-user`. No launch flag. |
 | `BUCKET_MODULES` | yes | Comma list drawn from `artifact` and `cert`. |
 | `ENABLE_IMAGE_BUILDER` | yes | `true`/`false`; toggles Image Builder roles and the pipeline. |
+| `IMAGE_BUILDER_PARENT_IMAGE` | builder | Image Builder parent image; valid only when `ENABLE_IMAGE_BUILDER=true`. |
 | `ENABLE_SPOT_ALERTS` | no | `true`/`false` (default false); adds the SNS spot-interruption alert module. |
 | `SPOT_ALERT_EMAIL` | spot alerts | Required when `ENABLE_SPOT_ALERTS=true`; SNS email target. |
+| `PERMISSIONS_BOUNDARY_ARN` | no | IAM permissions-boundary ARN, applied to the instance role only. |
 | `SETUP_ENTRYPOINT` | yes | Bundle entrypoint; default `deploy.sh`. |
 | `SERVICE_UNIT` | start/stop | systemd unit name used by `start`/`stop`; no derivation convention. |
 | `SSH_PORT` | yes | Operator SSH port; default `22`. |
@@ -213,11 +219,16 @@ Validation is fail-closed at startup, before any AWS call:
 | `DDNS_ONBOX` | no | `true`/`false` (default false). When true, the DDNS password is delivered to the box. |
 | `RELEASE_TARGETS` | yes | Comma list of Bazel labels locating the deployment artifact(s). |
 | `BAZEL_COMMAND` | no | Bazel invocation; default `bazel`. Honors wrapper scripts. |
-| `RELEASE_PREFIXES` | yes | S3 prefixes the CI reader user may read. |
+| `RELEASE_PREFIXES` | yes | S3 prefixes the CI reader user may read. Required key; may be empty (no CI user). |
 | `TEMPLATE_OVERRIDE` | no | Path to a local CFN template replacing the canonical one. |
 
 Because `stackctl`'s lifecycle is SSH-only, `launch`, `start` and `stop` fail closed (exit 1)
 when `OPERATOR_CIDR` is empty.
+
+`INGRESS_TCP`/`INGRESS_UDP` rules map in list order to the infra template's indexed slots: rule
+`i` populates `IngressTcpPort<i>` and `IngressTcpCidr<i>` (or `IngressUdpPort<i>` and
+`IngressUdpCidr<i>`). Each protocol allows at most 8 rules, and the SSH rule is separate. The
+template is IPv4-only, and a port is always emitted together with its CIDR.
 
 ### Credentials profiles
 
@@ -273,8 +284,15 @@ provision [--rotate] [--rotate-ci]
 
 Deploys the account-global `<project>-operator` CFN stack in the primary region using the
 `[default]` admin profile and `CAPABILITY_NAMED_IAM`. It then ensures the operator user
-`<project>` (and the CI user `<project>-ci` when `RELEASE_PREFIXES` is configured) has one
+`<project>` (and, when `RELEASE_PREFIXES` is non-empty, the CI user `<project>-ci`) has one
 usable key in `~/.aws/credentials`.
+
+`RELEASE_PREFIXES` is a required key whose value may be empty. An empty value means no CI
+user: on an existing stack, `provision` passes `EnableCiUser=false`, which **deletes the CI
+user and invalidates its access keys** (irreversible from the operator's view). `provision`
+emits a one-line change-set-summary warning on that transition. When
+`PERMISSIONS_BOUNDARY_ARN` is set, it applies to the instance role only, not the CI user or
+the Image Builder roles.
 
 Re-runs are create-or-update. An update is previewed with a change set and requires
 confirmation unless `--yes` is given; `--dry-run` prints the preview and exits. After a decline
@@ -308,13 +326,18 @@ deploy [--tag <vX.Y.Z>] [--allow-dirty] [--skip-build]
    bypass the remote-tag check. Multiple release tags on `HEAD` exit 1.
 2. **Freshness gate.** Bazel locates the built artifacts and errors without compiling if they
    are stale (exit 6). `--skip-build` skips only this gate.
-3. **Publish.** Build a manifest, upload `.sha256` sidecars before objects and the manifest
+3. **Identity guard.** The caller ARN must end in `:user/<project>`; an `assumed-role` ARN is
+   rejected with exit 3 before any mutation. The guard runs under `--dry-run` too.
+4. **Publish.** Build a manifest, upload `.sha256` sidecars before objects and the manifest
    last, then verify every member by S3 HEAD and read-back.
-4. **Record and update.** Update the `<project>-infra` stack with a change-set preview, then
+5. **Record and update.** Update the `<project>-infra` stack with a change-set preview, then
    record the release in stack tags `stackctl:release-tag` / `stackctl:release-sha` and in the
-   `ReleaseTag` / `ReleaseManifestSha256` parameters referenced from resource metadata.
-5. **Prune.** Keep the 10 newest releases, protecting the stack-pinned tag, the previous
-   rollback tag and the just-uploaded tag.
+   `ReleaseTag` / `ReleaseManifestSha256` parameters referenced from resource metadata. The
+   change set also carries the parsed ingress slots, `DdnsHost`/`DdnsDomain` when DDNS is
+   configured, the spot-alert parameters, and `ImageBuilderParentImage` when configured.
+6. **Prune.** Keep the 10 newest releases, protecting the stack-pinned tag, the previous
+   rollback tag and the just-uploaded tag. A candidate is deleted only after a cheap check of
+   its manifest and members; anything unverifiable is kept with a warning.
 
 | Flag | Meaning |
 |---|---|
@@ -325,6 +348,10 @@ deploy [--tag <vX.Y.Z>] [--allow-dirty] [--skip-build]
 A release tag is immutable once a complete verified manifest exists. Publishing the same tag
 again takes the rollback path: verify and record only. `--skip-build` against an immutable tag
 exits 3.
+
+`--dry-run` is genuinely dry: it runs the read-only provenance, freshness and identity checks
+and stops before publishing, with zero S3 writes and no change-set creation. If every prune
+candidate is unverifiable, nothing is pruned and the deploy still exits 0 with a summary line.
 
 ```bash
 bazel run //:stackctl -- --project deploy/aws deploy
@@ -344,14 +371,17 @@ Exit codes: 0, 1, 2, 3, 5, 6.
 refresh-ami [--dry-run]
 ```
 
-Requires `AMI_POLICY=pinned`; under `ssm` or `baked` it exits 1. Resolves the current SSM float
-for every declared architecture and dual-writes `AMI_ID_AMD64` / `AMI_ID_ARM64` into both the
-local config and its committed `.env.example` counterpart. The write replaces only the matching
-`KEY=` line and is atomic, preserving comments and key order.
+Requires `AMI_POLICY=pinned`; under `ssm` or `baked` it exits 1. It re-asserts the
+`:user/<project>` caller identity before the first SSM call and rejects an `assumed-role` ARN
+with exit 3. It resolves the current SSM float for every declared architecture and dual-writes
+`AMI_ID_AMD64` / `AMI_ID_ARM64` into both the local config and its committed `.env.example`
+counterpart. The write replaces only the matching `KEY=` line and is atomic, preserving
+comments and key order.
 
-`--dry-run` prints the diff without writing. Missing keys or a missing example file exit 1;
-nothing is appended or created. The new pin reaches launches only after `deploy` moves it onto
-the stack, so the verb ends by printing "run deploy to apply".
+`--dry-run` prints `KEY: <old> -> <new>` for each changed key (unchanged keys are silent)
+without writing. Missing keys or a missing example file exit 1; nothing is appended or created.
+The new pin reaches launches only after `deploy` moves it onto the stack, so the verb ends by
+printing "run deploy to apply".
 
 ```bash
 bazel run //:stackctl -- --project deploy/aws refresh-ami --dry-run
@@ -371,8 +401,9 @@ launch [--arch <amd64|arm64>] [--instance-type <type>] [--variant <go|c>]
 Runs preflight first — AMI resolution, DDNS record and SSM parameter presence, non-empty
 `OPERATOR_CIDR`, and `ssh-keyscan` availability — all before any spend. It resolves the infra
 stack outputs (missing stack exits 1), reads the DDNS secret, calls `RunInstances`, waits for an
-IP, updates and verifies DDNS, verifies the host key, binds known-hosts, runs the setup
-entrypoint, then replaces the previous Project-tagged instance.
+IP, updates and verifies DDNS, verifies the host key, binds known-hosts, extracts the bundle in
+a staging directory, runs the setup entrypoint from the bundle root, then replaces the previous
+Project-tagged instance.
 
 | Flag | Meaning |
 |---|---|
@@ -393,7 +424,10 @@ message suggests `--no-spot` or another allowlisted instance type. Spot requests
 On failure the new instance is terminated unless `--keep-on-failure`, and DDNS is restored per
 the restore-target rule: the snapshot IP only if it still belongs to a running Project-tagged
 instance, otherwise the record is parked at `0.0.0.0`. Cleanup failure takes precedence and
-exits 5. SSH transport failures exit 7 but still terminate the instance unless kept.
+exits 5. A setup timeout is a launch failure: the instance is terminated (unless kept), DDNS is
+restored, and the verb exits 4. The first signal during setup interrupts the SSH session and
+takes the same path. SSH transport failures exit 7 but still terminate the instance unless
+kept.
 
 ```bash
 bazel run //:stackctl -- --project deploy/aws launch
@@ -515,9 +549,12 @@ rollback and just-uploaded tags, and never expires `releases/` through an S3 lif
 
 The bundle is pulled **on-box from S3** with the instance role, never pushed by the operator.
 `launch` verifies the manifest and member sha operator-side, then the box checks the passed
-member sha with `sha256sum --check` before extraction. `aws-cli` must therefore exist on the AMI,
-including baked AMIs. The bundle is staged in `/run/stackctl-setup.<nonce>/` (tmpfs, 0700,
-removed after success); the entrypoint's NVMe phase 0 runs inside the bundle, not in stackctl.
+member sha with `sha256sum --check` before extraction. `aws-cli` must therefore exist on the
+AMI, including baked AMIs. The bundle is staged in `/run/stackctl-setup.<nonce>/` (tmpfs, 0700)
+and extracted there after a path-safety precheck; the entrypoint then runs from the bundle
+root. A missing or non-executable `SETUP_ENTRYPOINT`, or an unsafe archive member path, is a
+verification failure (rc 3). The staging directory is removed after the setup status is read.
+The entrypoint's NVMe phase 0 runs inside the bundle, not in stackctl.
 
 The entrypoint runs as one `ssh -T` session through `sudo env -u BASH_ENV ...` with every value
 shell-quoted. The binary exports these variables:

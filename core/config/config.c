@@ -34,6 +34,12 @@ struct stackctl_config {
     const char *project;
     const char *arch;
     const char *arch_list[3];
+    const char *image_builder_parent_image;
+    const char *permissions_boundary_arn;
+    config_ingress_rule ingress_tcp[CONFIG_INGRESS_MAX];
+    size_t ingress_tcp_count;
+    config_ingress_rule ingress_udp[CONFIG_INGRESS_MAX];
+    size_t ingress_udp_count;
 };
 
 /* ------------------------------------------------------------------------- */
@@ -67,7 +73,8 @@ static const char *const known_keys[] = {
     "IP_ECHO_URL",        "INGRESS_TCP",       "INGRESS_UDP",
     "DDNS_HOST",          "DDNS_DOMAIN",       "DDNS_ONBOX",
     "RELEASE_TARGETS",    "BAZEL_COMMAND",     "RELEASE_PREFIXES",
-    "TEMPLATE_OVERRIDE",  NULL,
+    "TEMPLATE_OVERRIDE",  "IMAGE_BUILDER_PARENT_IMAGE",
+    "PERMISSIONS_BOUNDARY_ARN", NULL,
 };
 
 static int key_is_known(const char *key) {
@@ -143,6 +150,45 @@ static int region_is_valid(const char *value) {
 
 static int bool_is_valid(const char *value) {
     return strcmp(value, "true") == 0 || strcmp(value, "false") == 0;
+}
+
+/*
+ * ARN shape: `arn:<partition>:<service>:<region>:<account>:<resource>`. Region
+ * and account may be empty (global services); partition, service and resource
+ * must be present. Whitespace is rejected.
+ */
+static int arn_shape_is_valid(const char *value) {
+    const char *partition;
+    const char *service;
+    const char *last;
+    size_t colons = 0;
+
+    if (value == NULL || strncmp(value, "arn:", 4) != 0) {
+        return 0;
+    }
+    for (const char *cursor = value; *cursor != '\0'; cursor++) {
+        if (*cursor == ':') {
+            colons++;
+        } else if (*cursor == ' ' || *cursor == '\t' || *cursor == '\n' ||
+                   *cursor == '\r') {
+            return 0;
+        }
+    }
+    if (colons < 5) {
+        return 0;
+    }
+
+    partition = value + 4;
+    service = strchr(partition, ':');
+    if (service == NULL || service == partition) {
+        return 0;
+    }
+    service++;
+    if (*service == ':' || *service == '\0') {
+        return 0;
+    }
+    last = strrchr(value, ':');
+    return last != NULL && last[1] != '\0';
 }
 
 static int parse_uint(const char *value, long min, long max, long *out) {
@@ -238,35 +284,202 @@ static int bucket_module_field(const char *field, size_t len, void *ctx) {
 }
 
 /* Each ingress entry is `port` or `port:cidr`. */
-static int ingress_field(const char *field, size_t len, void *ctx) {
-    char buffer[128];
-    const char *colon;
-    size_t port_len;
-    char port[16];
-    long port_number;
+/*
+ * Parse one strict IPv4 CIDR ("a.b.c.d/prefix") into canonical form. Rejects
+ * IPv6 (any ':'), malformed octets/prefix, and host bits set below the prefix.
+ * Returns 0 on success, or a negative marker via `reason_out`; the caller turns
+ * that into a protocol-specific diagnostic.
+ */
+static int cidr_parse(const char *text, char *out, size_t cap,
+                      const char **reason_out) {
+    const char *slash = strchr(text, '/');
+    unsigned octets[4] = {0};
+    unsigned prefix = 0;
+    unsigned addr = 0;
+    unsigned mask;
+    const char *cursor = text;
+    char prefix_text[4];
+    size_t prefix_len;
 
-    (void)ctx;
-    trim_field(&field, &len);
-    if (len == 0 || len >= sizeof buffer) {
+    *reason_out = NULL;
+    if (strchr(text, ':') != NULL) {
+        *reason_out = "IPv6 is not supported (IPv4 CIDR only)";
         return 0;
     }
-    memcpy(buffer, field, len);
-    buffer[len] = '\0';
+    if (slash == NULL || strchr(slash + 1, '/') != NULL) {
+        *reason_out = "CIDR must be IPv4/prefix (e.g. 0.0.0.0/0)";
+        return 0;
+    }
 
-    colon = strchr(buffer, ':');
-    port_len = colon != NULL ? (size_t)(colon - buffer) : strlen(buffer);
-    if (port_len == 0 || port_len >= sizeof port) {
+    for (int i = 0; i < 4; i++) {
+        const char *end = i == 3 ? slash : strchr(cursor, '.');
+
+        if (end == NULL || end == cursor) {
+            *reason_out = "CIDR must have four dotted octets";
+            return 0;
+        }
+        for (const char *p = cursor; p < end; p++) {
+            if (p[0] < '0' || p[0] > '9') {
+                *reason_out = "CIDR octets must be decimal 0..255";
+                return 0;
+            }
+        }
+        {
+            char octet_text[4] = {0};
+            size_t octet_len = (size_t)(end - cursor);
+
+            if (octet_len >= sizeof octet_text) {
+                *reason_out = "CIDR octet out of range (0..255)";
+                return 0;
+            }
+            memcpy(octet_text, cursor, octet_len);
+            octets[i] = (unsigned)strtoul(octet_text, NULL, 10);
+            if (octets[i] > 255) {
+                *reason_out = "CIDR octet out of range (0..255)";
+                return 0;
+            }
+        }
+        cursor = end + 1;
+    }
+
+    prefix_len = strlen(slash + 1);
+    if (prefix_len == 0 || prefix_len >= sizeof prefix_text) {
+        *reason_out = "CIDR prefix must be 0..32";
         return 0;
     }
-    memcpy(port, buffer, port_len);
-    port[port_len] = '\0';
-    if (!parse_uint(port, 1, 65535, &port_number)) {
+    for (size_t i = 0; i < prefix_len; i++) {
+        if (slash[1 + i] < '0' || slash[1 + i] > '9') {
+            *reason_out = "CIDR prefix must be 0..32";
+            return 0;
+        }
+    }
+    memcpy(prefix_text, slash + 1, prefix_len);
+    prefix_text[prefix_len] = '\0';
+    prefix = (unsigned)strtoul(prefix_text, NULL, 10);
+    if (prefix > 32) {
+        *reason_out = "CIDR prefix must be 0..32";
         return 0;
     }
-    if (colon != NULL && colon[1] == '\0') {
+
+    addr = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    mask = prefix == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix));
+    if ((addr & ~mask) != 0) {
+        *reason_out = "CIDR has host bits set for its prefix";
         return 0;
     }
+
+    snprintf(out, cap, "%u.%u.%u.%u/%u", octets[0], octets[1], octets[2],
+             octets[3], prefix);
     return 1;
+}
+
+static int ingress_rule_exists(const config_ingress_rule *rules, size_t count,
+                               unsigned port, const char *cidr) {
+    for (size_t i = 0; i < count; i++) {
+        if (rules[i].port == port && strcmp(rules[i].cidr, cidr) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Number of comma-separated items in a non-empty list (whitespace ignored). */
+static size_t csv_item_count(const char *value) {
+    size_t count = 1;
+
+    for (const char *cursor = value; *cursor != '\0'; cursor++) {
+        if (*cursor == ',') {
+            count++;
+        }
+    }
+    return count;
+}
+
+/*
+ * Parse a full `port[:cidr]` comma list for one protocol into `rules`. An empty
+ * value means no rules. Malformed entries, exact duplicates, IPv6, ranges, CIDR
+ * violations and more than CONFIG_INGRESS_MAX rules are hard errors.
+ */
+static int ingress_list_parse(const char *value, const char *protocol,
+                              config_ingress_rule *rules, size_t *count_out) {
+    const char *start = value;
+
+    *count_out = 0;
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+
+    for (;;) {
+        const char *comma = strchr(start, ',');
+        const char *field = start;
+        size_t len = comma != NULL ? (size_t)(comma - start) : strlen(start);
+        char item[128];
+        char port_text[16];
+        const char *colon;
+        size_t port_len;
+        long port_number;
+        const char *cidr = "0.0.0.0/0";
+        char cidr_text[19] = "0.0.0.0/0";
+        const char *reason = NULL;
+
+        trim_field(&field, &len);
+        if (len == 0) {
+            return cfg_error(EINVAL,
+                             "%s has an empty entry (trailing comma?)",
+                             protocol);
+        }
+        if (*count_out >= CONFIG_INGRESS_MAX) {
+            return cfg_error(EINVAL,
+                             "%s has %zu rules, exceeding the %d-slot limit "
+                             "per protocol",
+                             protocol, csv_item_count(value), CONFIG_INGRESS_MAX);
+        }
+        if (len >= sizeof item) {
+            return cfg_error(EINVAL, "%s entry is too long", protocol);
+        }
+        memcpy(item, field, len);
+        item[len] = '\0';
+
+        colon = strchr(item, ':');
+        port_len = colon != NULL ? (size_t)(colon - item) : strlen(item);
+        if (port_len == 0 || port_len >= sizeof port_text) {
+            return cfg_error(EINVAL, "%s entry has an invalid port", protocol);
+        }
+        memcpy(port_text, item, port_len);
+        port_text[port_len] = '\0';
+        if (!parse_uint(port_text, 1, 65535, &port_number)) {
+            return cfg_error(EINVAL,
+                             "%s entry has an invalid port (1..65535, no "
+                             "ranges)",
+                             protocol);
+        }
+        if (colon != NULL) {
+            if (colon[1] == '\0') {
+                return cfg_error(EINVAL, "%s entry has an empty CIDR",
+                                 protocol);
+            }
+            if (!cidr_parse(colon + 1, cidr_text, sizeof cidr_text, &reason)) {
+                return cfg_error(EINVAL, "%s entry \"%s\": %s", protocol, item,
+                                 reason != NULL ? reason : "invalid CIDR");
+            }
+            cidr = cidr_text;
+        }
+
+        if (ingress_rule_exists(rules, *count_out, (unsigned)port_number, cidr)) {
+            return cfg_error(EINVAL,
+                             "%s has a duplicate rule %u:%s", protocol,
+                             (unsigned)port_number, cidr);
+        }
+        rules[*count_out].port = (unsigned)port_number;
+        snprintf(rules[*count_out].cidr, sizeof rules[*count_out].cidr, "%s",
+                 cidr);
+        (*count_out)++;
+
+        if (comma == NULL) {
+            return 0;
+        }
+        start = comma + 1;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -294,6 +507,10 @@ struct validated {
     const char *project;
     const char *arch;
     const char *arch_list[3];
+    config_ingress_rule ingress_tcp[CONFIG_INGRESS_MAX];
+    size_t ingress_tcp_count;
+    config_ingress_rule ingress_udp[CONFIG_INGRESS_MAX];
+    size_t ingress_udp_count;
 };
 
 static int validate_region_consistency(const config_envfile *env, int region_explicit,
@@ -352,6 +569,9 @@ static int validate_cross_keys(const config_envfile *env, const char *arch) {
     const char *ddns_onbox = config_envfile_get(env, "DDNS_ONBOX");
     const char *ddns_host = config_envfile_get(env, "DDNS_HOST");
     const char *ddns_domain = config_envfile_get(env, "DDNS_DOMAIN");
+    const char *builder_parent =
+        config_envfile_get(env, "IMAGE_BUILDER_PARENT_IMAGE");
+    const char *boundary = config_envfile_get(env, "PERMISSIONS_BOUNDARY_ARN");
     int rc;
 
     /* AMI policy ↔ AMI_ID_* / AMI_SSM_*. */
@@ -418,6 +638,37 @@ static int validate_cross_keys(const config_envfile *env, const char *arch) {
         return cfg_error(EINVAL,
                          "DDNS_HOST and DDNS_DOMAIN must be configured together");
     }
+
+    /* F11: a builder parent image is meaningful only with the builder on. */
+    if (builder_parent != NULL) {
+        const char *builder = config_envfile_get(env, "ENABLE_IMAGE_BUILDER");
+
+        if (builder_parent[0] == '\0') {
+            return cfg_error(EINVAL,
+                             "IMAGE_BUILDER_PARENT_IMAGE must not be empty");
+        }
+        if (builder == NULL || strcmp(builder, "true") != 0) {
+            return cfg_error(EINVAL,
+                             "IMAGE_BUILDER_PARENT_IMAGE is only valid when "
+                             "ENABLE_IMAGE_BUILDER=true (ENABLE_IMAGE_BUILDER=%s)",
+                             builder != NULL ? builder : "unset");
+        }
+    }
+
+    /* F13: the optional permissions boundary must look like an ARN. */
+    if (boundary != NULL) {
+        if (boundary[0] == '\0') {
+            return cfg_error(EINVAL,
+                             "PERMISSIONS_BOUNDARY_ARN must not be empty");
+        }
+        if (!arn_shape_is_valid(boundary)) {
+            return cfg_error(EINVAL,
+                             "PERMISSIONS_BOUNDARY_ARN \"%s\" must be an ARN "
+                             "(arn:<partition>:<service>:<region>:<account>:"
+                             "<resource>)",
+                             boundary);
+        }
+    }
     return 0;
 }
 
@@ -428,11 +679,11 @@ static int validate_config(const config_envfile *env, int region_explicit,
         "PROJECT",          "ARCH",        "SPOT_DEFAULT",
         "AMI_POLICY",       "INSTANCE_TYPES_AMD64", "ROOT_VOLUME_SIZE",
         "KEY_NAME",         "SSH_IDENTITY", "BUCKET_MODULES",
-        "ENABLE_IMAGE_BUILDER", "RELEASE_TARGETS", "RELEASE_PREFIXES",
-        NULL,
+        "ENABLE_IMAGE_BUILDER", "RELEASE_TARGETS", NULL,
     };
     static const char *const required_present[] = {
-        "OPERATOR_CIDR", "INGRESS_TCP", "INGRESS_UDP", NULL,
+        "OPERATOR_CIDR", "INGRESS_TCP", "INGRESS_UDP", "RELEASE_PREFIXES",
+        NULL,
     };
     const char *project;
     const char *arch;
@@ -565,19 +816,20 @@ static int validate_config(const config_envfile *env, int region_explicit,
         }
     }
     {
-        const char *ingress_tcp = config_envfile_get(env, "INGRESS_TCP");
-        const char *ingress_udp = config_envfile_get(env, "INGRESS_UDP");
+        int ingress_rc;
 
-        /* An empty list means "no rule" and is valid. */
-        if (ingress_tcp[0] != '\0' &&
-            !csv_each(ingress_tcp, ingress_field, NULL)) {
-            return cfg_error(EINVAL,
-                             "INGRESS_TCP entries must be port[:cidr]");
+        /* Empty lists mean "no rule"; everything else is parsed fail-closed. */
+        ingress_rc = ingress_list_parse(
+            config_envfile_get(env, "INGRESS_TCP"), "INGRESS_TCP",
+            out->ingress_tcp, &out->ingress_tcp_count);
+        if (ingress_rc != 0) {
+            return ingress_rc;
         }
-        if (ingress_udp[0] != '\0' &&
-            !csv_each(ingress_udp, ingress_field, NULL)) {
-            return cfg_error(EINVAL,
-                             "INGRESS_UDP entries must be port[:cidr]");
+        ingress_rc = ingress_list_parse(
+            config_envfile_get(env, "INGRESS_UDP"), "INGRESS_UDP",
+            out->ingress_udp, &out->ingress_udp_count);
+        if (ingress_rc != 0) {
+            return ingress_rc;
         }
     }
     if (!csv_each(config_envfile_get(env, "RELEASE_TARGETS"), field_is_nonempty,
@@ -585,8 +837,13 @@ static int validate_config(const config_envfile *env, int region_explicit,
         return cfg_error(EINVAL,
                          "RELEASE_TARGETS must be a non-empty comma list");
     }
-    if (!csv_each(config_envfile_get(env, "RELEASE_PREFIXES"), field_is_nonempty,
-                  NULL)) {
+    /*
+     * F5: RELEASE_PREFIXES is a required-present key whose empty value means
+     * "no CI user". A non-empty value still has to be a valid comma list.
+     */
+    if (config_envfile_get(env, "RELEASE_PREFIXES")[0] != '\0' &&
+        !csv_each(config_envfile_get(env, "RELEASE_PREFIXES"),
+                  field_is_nonempty, NULL)) {
         return cfg_error(EINVAL,
                          "RELEASE_PREFIXES must be a non-empty comma list");
     }
@@ -844,6 +1101,16 @@ int config_load(const char *dir, int region_explicit, const char *region_flag,
     cfg->project = validated.project;
     cfg->arch = validated.arch;
     memcpy(cfg->arch_list, validated.arch_list, sizeof cfg->arch_list);
+    cfg->image_builder_parent_image =
+        config_envfile_get(cfg->env, "IMAGE_BUILDER_PARENT_IMAGE");
+    cfg->permissions_boundary_arn =
+        config_envfile_get(cfg->env, "PERMISSIONS_BOUNDARY_ARN");
+    memcpy(cfg->ingress_tcp, validated.ingress_tcp,
+           sizeof cfg->ingress_tcp);
+    cfg->ingress_tcp_count = validated.ingress_tcp_count;
+    memcpy(cfg->ingress_udp, validated.ingress_udp,
+           sizeof cfg->ingress_udp);
+    cfg->ingress_udp_count = validated.ingress_udp_count;
 
     *out = cfg;
     cfg = NULL;
@@ -908,4 +1175,32 @@ const char *config_dir(const stackctl_config *cfg) {
 
 const char *const *config_arch_list(const stackctl_config *cfg) {
     return cfg == NULL ? NULL : cfg->arch_list;
+}
+
+const char *config_image_builder_parent_image(const stackctl_config *cfg) {
+    return cfg == NULL ? NULL : cfg->image_builder_parent_image;
+}
+
+const char *config_permissions_boundary_arn(const stackctl_config *cfg) {
+    return cfg == NULL ? NULL : cfg->permissions_boundary_arn;
+}
+
+size_t config_ingress_tcp(const stackctl_config *cfg,
+                          const config_ingress_rule **rules_out) {
+    if (rules_out != NULL) {
+        *rules_out = cfg != NULL && cfg->ingress_tcp_count > 0
+                         ? cfg->ingress_tcp
+                         : NULL;
+    }
+    return cfg == NULL ? 0 : cfg->ingress_tcp_count;
+}
+
+size_t config_ingress_udp(const stackctl_config *cfg,
+                          const config_ingress_rule **rules_out) {
+    if (rules_out != NULL) {
+        *rules_out = cfg != NULL && cfg->ingress_udp_count > 0
+                         ? cfg->ingress_udp
+                         : NULL;
+    }
+    return cfg == NULL ? 0 : cfg->ingress_udp_count;
 }

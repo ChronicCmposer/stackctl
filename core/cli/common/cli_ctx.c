@@ -214,6 +214,7 @@ const char *const *cli_verb_names(size_t *count) {
 
 static volatile sig_atomic_t signal_count;
 static volatile sig_atomic_t signal_seen;
+static volatile sig_atomic_t signal_consumed;
 
 static void on_signal(int number) {
     signal_count++;
@@ -240,6 +241,10 @@ int cli_signal_received(void) { return signal_count != 0; }
 
 int cli_signal_number(void) { return (int)signal_seen; }
 
+void cli_signal_mark_consumed(void) { signal_consumed = 1; }
+
+int cli_signal_consumed(void) { return signal_consumed != 0; }
+
 int cli_abort_check(void *user) {
     (void)user;
     return cli_signal_received();
@@ -255,4 +260,5 @@ void cli_signal_test_fire(int number) {
 void cli_signal_test_reset(void) {
     signal_count = 0;
     signal_seen = 0;
+    signal_consumed = 0;
 }

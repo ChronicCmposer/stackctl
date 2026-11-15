@@ -1,6 +1,6 @@
 # Onboarding a new Bazel project to stackctl
 
-Tested against stackctl v0.1.0.
+Tested against stackctl v0.1.1.
 
 This guide is for a repository maintainer adding stackctl to a **new** Bazel
 project. It is the one-time integration path: dependencies, wrapper target,
@@ -56,12 +56,12 @@ Add the module dependency and pin it to the repository until stackctl is in a
 registry. In `MODULE.bazel`:
 
 ```starlark
-bazel_dep(name = "stackctl", version = "0.1.0")
+bazel_dep(name = "stackctl", version = "0.1.1")
 
 git_override(
     module_name = "stackctl",
     remote = "git@git.cmposer.cc:stackctl",
-    tag = "v0.1.0",
+    tag = "v0.1.1",
 )
 ```
 
@@ -119,7 +119,7 @@ deploy/aws/.env.*
 !deploy/aws/.env.example
 ```
 
-The allowlist has 34 keys in v0.1.0. Unknown keys are hard errors, and validation
+The allowlist has 36 keys in v0.1.1. Unknown keys are hard errors, and validation
 is fail-closed **before any AWS call**. A complete starting `.env.example`:
 
 ```dotenv
@@ -146,8 +146,10 @@ OPERATOR_CIDR=203.0.113.0/24
 
 BUCKET_MODULES=artifact
 ENABLE_IMAGE_BUILDER=false
+# IMAGE_BUILDER_PARENT_IMAGE is valid only when ENABLE_IMAGE_BUILDER=true.
 ENABLE_SPOT_ALERTS=false
 # SPOT_ALERT_EMAIL=ops@example.com
+# PERMISSIONS_BOUNDARY_ARN=arn:aws:iam::123456789012:policy/operator-boundary
 
 SETUP_ENTRYPOINT=deploy.sh
 SERVICE_UNIT=demo.service
@@ -176,9 +178,12 @@ Rules that catch new maintainers:
 - `ARCH=arm64` requires `INSTANCE_TYPES_ARM64`; `ARCH=both` requires both lists
   and `launch --arch` at run time.
 - `BUCKET_MODULES` must include `artifact`; `cert` is optional.
-- Enable spot alerts only together with `SPOT_ALERT_EMAIL`.
+- `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`. `IMAGE_BUILDER_PARENT_IMAGE`
+  is valid only when `ENABLE_IMAGE_BUILDER=true`.
 - `INGRESS_TCP`/`INGRESS_UDP` are comma lists of `port[:cidr]`; an omitted CIDR
-  means `0.0.0.0/0`.
+  means `0.0.0.0/0`. Each protocol has at most 8 slots. IPv4 only, no port ranges,
+  and the CIDR must not have host bits set. Malformed input fails config validation
+  with exit 1 before any AWS call.
 - A sibling `.env.<region>` must declare `REGION=<region>` exactly. Plain `.env`
   must not declare a region whose variant file exists.
 
@@ -245,22 +250,36 @@ TEMPLATE_OVERRIDE=deploy/aws/infra-demo.yaml
 ### Ingress slots: verify the rendered security group
 
 The infra template exposes eight indexed slots per protocol
-(`IngressTcp0..7`/`IngressTcpCidr0..7`, `IngressUdp0..7`/`IngressUdpCidr0..7`).
-Slot order follows the config list order; the SSH rule is separate and
-conditional, so application slots start at 0.
+(`IngressTcpPort0..7`/`IngressTcpCidr0..7`, `IngressUdpPort0..7`/`IngressUdpCidr0..7`).
+`deploy` maps each parsed `INGRESS_TCP`/`INGRESS_UDP` rule to one slot, emitting the
+port and the CIDR together; slot order follows the config list order. The SSH rule
+is separate and conditional, so application slots start at 0.
 
-In v0.1.0 `deploy` sends `INGRESS_TCP`/`INGRESS_UDP` to the stack as the audit
-list but does not yet populate the indexed slot parameters. After the first
-deploy, confirm the security group contains the application rules you expect. If
-it does not, add the rules in the console or use an infra `TEMPLATE_OVERRIDE`
-that derives the rules from the comma lists.
+Each protocol has at most 8 rules. Config validation is strict and runs before any
+AWS call: empty items, a trailing comma, IPv6, port ranges, malformed CIDRs, a CIDR
+with host bits set, exact duplicate `port:cidr` pairs, and more than 8 rules per
+protocol all exit 1 at config load. After the first deploy, confirm the security
+group contains the application rules you expect.
 
 ## Step 5: provision once
 
 `provision` is account-global and primary-region-only. It uses the `[default]`
 admin profile and deploys `<project>-operator` with `CAPABILITY_NAMED_IAM`. It
 also ensures the operator user `<project>` (and the CI user `<project>-ci` when
-`RELEASE_PREFIXES` is set) has one usable key in `~/.aws/credentials`.
+`RELEASE_PREFIXES` is non-empty) has one usable key in `~/.aws/credentials`.
+
+`RELEASE_PREFIXES` is a required key whose value may be empty. An empty value
+means "no CI user": on an existing stack, `provision` passes
+`EnableCiUser=false`, which **deletes the CI user and invalidates its access
+keys**. This is irreversible from the operator's view; `provision` warns in the
+change-set summary when it happens.
+
+`RELEASE_PREFIXES` and `BUCKET_MODULES` are collected across **all** `.env.*`
+siblings (a union). Clearing a key in the active `.env` alone does not disable the
+CI user if a sibling still lists prefixes; clear it in every sibling.
+
+When set, `PERMISSIONS_BOUNDARY_ARN` applies the boundary to the instance role
+only. The Image Builder and publish roles, and the infra stack, stay unbounded.
 
 ```bash
 bazel run //deploy/aws:stackctl -- provision --dry-run
@@ -291,13 +310,23 @@ The pipeline is:
 1. provenance gate (annotated tag on `HEAD` and on `origin` at the same commit;
    `--allow-dirty` relaxes the dirty tree, not the remote tag);
 2. freshness gate (exit 6 when the built artifact is stale or unbuilt);
-3. publish `releases/<tag>/` with `.sha256` sidecars uploaded before objects and
+3. identity guard: the caller ARN must end in `:user/<project>`; an
+   `assumed-role` ARN is rejected with exit 3 before any mutation;
+4. publish `releases/<tag>/` with `.sha256` sidecars uploaded before objects and
    the manifest last, then verify every member by HEAD and read-back;
-4. update `<project>-infra` through a change-set preview, and record
+5. update `<project>-infra` through a change-set preview, passing the parsed
+   ingress slots, `DdnsHost`/`DdnsDomain` when DDNS is configured, the
+   spot-alert parameters, and `ImageBuilderParentImage` when configured; record
    `stackctl:release-tag` / `stackctl:release-sha` plus the `ReleaseTag` /
    `ReleaseManifestSha256` parameters;
-5. prune, keeping the 10 newest releases and protecting the pinned tag, the
-   previous rollback tag, and the just-uploaded tag.
+6. prune, keeping the 10 newest releases and protecting the pinned tag, the
+   previous rollback tag, and the just-uploaded tag. A candidate is deleted only
+   after a cheap verification of its manifest and members; anything unverifiable
+   is kept with a warning.
+
+`deploy --dry-run` is genuinely dry: it runs the read-only gates (including the
+identity guard) and stops before publishing, with zero S3 writes and no
+change-set creation.
 
 A release tag is immutable once a complete verified manifest exists. Publishing
 the same tag again takes the rollback path: verify and record only.

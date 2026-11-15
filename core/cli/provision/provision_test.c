@@ -100,8 +100,11 @@ typedef struct fake {
     unsigned last_caps;
     char last_stack[128];
     size_t last_param_count;
-    char params[8][128];
-    char param_values[8][256];
+    char params[12][128];
+    char param_values[12][256];
+
+    /* When non-NULL, the described stack exposes this CiUserName output. */
+    const char *ci_output;
 
     int executed;
     int deleted_change_sets;
@@ -112,6 +115,22 @@ typedef struct fake {
     int confirm_calls;
     int confirm_result;
 } fake;
+
+
+static int stream_contains(FILE *stream, const char *needle) {
+    char buffer[8192];
+    size_t got;
+
+    if (stream == NULL) {
+        return 0;
+    }
+    fflush(stream);
+    rewind(stream);
+    got = fread(buffer, 1, sizeof buffer - 1, stream);
+    buffer[got] = '\0';
+    clearerr(stream);
+    return strstr(buffer, needle) != NULL;
+}
 
 static void trace(fake *f, int tag) {
     if (f->trace_count < (int)(sizeof(f->trace) / sizeof(f->trace[0]))) {
@@ -178,12 +197,26 @@ static int fake_describe(void *ud, cfn_client *client, const char *region,
     snprintf(out->items[0].stack_name, sizeof(out->items[0].stack_name), "%s",
              stack_name);
     out->items[0].status = f->status;
+    if (f->ci_output != NULL) {
+        out->items[0].outputs = calloc(1, sizeof(*out->items[0].outputs));
+        if (out->items[0].outputs == NULL) {
+            return ENOMEM;
+        }
+        out->items[0].output_count = 1;
+        snprintf(out->items[0].outputs[0].key,
+                 sizeof(out->items[0].outputs[0].key), "CiUserName");
+        snprintf(out->items[0].outputs[0].value,
+                 sizeof(out->items[0].outputs[0].value), "%s", f->ci_output);
+    }
     return 0;
 }
 
 static void fake_stack_list_free(void *ud, cfn_stack_list *list) {
     (void)ud;
     if (list != NULL) {
+        if (list->items != NULL) {
+            free(list->items[0].outputs);
+        }
         free(list->items);
         list->items = NULL;
         list->count = 0;
@@ -595,6 +628,42 @@ static void fixture_init(fixture *fx) {
     write_text(path, "");
     snprintf(path, sizeof(path), "%s/.env", fx->config_dir);
     write_text(path, base_env);
+}
+
+/*
+ * Rewrite the fixture `.env` with one literal substitution applied to the
+ * shared base environment, so a single key can be changed per case.
+ */
+static void fixture_env_with(fixture *fx, const char *needle,
+                             const char *replacement) {
+    const char *at = strstr(base_env, needle);
+    char path[PATH_MAX];
+    char buffer[4096];
+    int written;
+
+    if (at == NULL) {
+        fprintf(stderr, "fixture base env lacks %s\n", needle);
+        exit(1);
+    }
+    written = snprintf(buffer, sizeof(buffer), "%.*s%s%s",
+                       (int)(at - base_env), base_env, replacement,
+                       at + strlen(needle));
+    if (written < 0 || (size_t)written >= sizeof(buffer)) {
+        fprintf(stderr, "fixture env replacement overflows\n");
+        exit(1);
+    }
+    snprintf(path, sizeof(path), "%s/.env", fx->config_dir);
+    write_text(path, buffer);
+}
+
+/* Return the captured parameter value for `key`, or NULL when absent. */
+static const char *captured_param(const fake *f, const char *key) {
+    for (size_t i = 0; i < f->last_param_count && i < 12; i++) {
+        if (strcmp(f->params[i], key) == 0) {
+            return f->param_values[i];
+        }
+    }
+    return NULL;
 }
 
 static char *read_text_file(const char *path) {
@@ -1032,6 +1101,149 @@ static void test_union_of_region_variants(void) {
 }
 
 /* ------------------------------------------------------------------------- */
+/* Operator parameters (F5 / F6 / F13)                                       */
+/* ------------------------------------------------------------------------- */
+
+static void test_ci_user_enabled_with_prefixes(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    const char *ci;
+    const char *prefixes;
+    const char *certs;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    f.stack_present = 0;
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "prefixes run succeeds");
+    ci = captured_param(&f, "EnableCiUser");
+    prefixes = captured_param(&f, "ReleasePrefixes");
+    certs = captured_param(&f, "CertBucketEnabled");
+    CHECK(ci != NULL && strcmp(ci, "true") == 0,
+          "EnableCiUser=true with prefixes");
+    CHECK(prefixes != NULL && strcmp(prefixes, "releases/") == 0,
+          "ReleasePrefixes passed with prefixes");
+    CHECK(certs != NULL && strcmp(certs, "true") == 0,
+          "CertBucketEnabled=true when cert module present");
+    CHECK(captured_param(&f, "PermissionsBoundaryArn") == NULL,
+          "PermissionsBoundaryArn absent when unset");
+    config_free(cfg);
+}
+
+static void test_ci_user_disabled_without_prefixes(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    const char *ci;
+
+    fixture_init(&fx);
+    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "empty-prefix config loads");
+    f.stack_present = 0;
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "empty-prefix run succeeds");
+    ci = captured_param(&f, "EnableCiUser");
+    CHECK(ci != NULL && strcmp(ci, "false") == 0,
+          "EnableCiUser=false when prefixes empty");
+    CHECK(captured_param(&f, "ReleasePrefixes") == NULL,
+          "ReleasePrefixes omitted when prefixes empty");
+    config_free(cfg);
+}
+
+static void test_ci_user_removal_warns(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    FILE *errors;
+    char captured[2048];
+    size_t got;
+
+    fixture_init(&fx);
+    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "warning fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.ci_output = "demo-ci";
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "CI removal run succeeds");
+    rewind(errors);
+    got = fread(captured, 1, sizeof(captured) - 1, errors);
+    captured[got] = '\0';
+    fclose(errors);
+    CHECK(strstr(captured, "CiUser") != NULL,
+          "removal warning names the CiUser deletion");
+    CHECK(strstr(captured, "access keys") != NULL,
+          "removal warning names key invalidation");
+    config_free(cfg);
+}
+
+static void test_cert_bucket_disabled_without_cert_module(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    const char *certs;
+
+    fixture_init(&fx);
+    fixture_env_with(&fx, "BUCKET_MODULES=artifact,cert",
+                     "BUCKET_MODULES=artifact");
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "artifact-only config loads");
+    f.stack_present = 0;
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "artifact-only run succeeds");
+    certs = captured_param(&f, "CertBucketEnabled");
+    CHECK(certs != NULL && strcmp(certs, "false") == 0,
+          "CertBucketEnabled=false without cert module");
+    config_free(cfg);
+}
+
+static void test_permissions_boundary_passed_when_set(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    const char *arn;
+
+    fixture_init(&fx);
+    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/",
+                     "RELEASE_PREFIXES=releases/\n"
+                     "PERMISSIONS_BOUNDARY_ARN=arn:aws:iam::123456789012:"
+                     "policy/stackctl-boundary");
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "boundary config loads");
+    f.stack_present = 0;
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "boundary run succeeds");
+    arn = captured_param(&f, "PermissionsBoundaryArn");
+    CHECK(arn != NULL &&
+              strcmp(arn, "arn:aws:iam::123456789012:policy/"
+                          "stackctl-boundary") == 0,
+          "PermissionsBoundaryArn passed verbatim");
+    config_free(cfg);
+}
+
+/* ------------------------------------------------------------------------- */
 /* Key lifecycle (core/iam)                                                  */
 /* ------------------------------------------------------------------------- */
 
@@ -1348,6 +1560,106 @@ static void test_prod_aws_init_installs_abort_hook(void) {
     }
 }
 
+
+/* F20: an interrupted stack wait says the work continues server-side. */
+static void test_wait_stack_signal_diagnostic(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "wait diagnostic fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.stack_present = 0;
+    f.change_count = 1;
+    f.wait_stack_rc = EINTR;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    CHECK(provision_run(&env) == CLI_EXIT_AWS, "interrupted wait exits 2");
+    CHECK(stream_contains(errors, "continues server-side"),
+          "interrupted-wait diagnostic says the operation continues");
+    CHECK(stream_contains(errors, "stackctl status"),
+          "interrupted-wait diagnostic points at stackctl status");
+    fclose(errors);
+    config_free(cfg);
+}
+
+/* Deferred (a): the placeholder CiUserName output is not a real CI user. */
+static void test_ci_placeholder_output_no_warning(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "placeholder fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.ci_output = "-";
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    CHECK(provision_run(&env) == CLI_EXIT_OK,
+          "placeholder output run succeeds");
+    CHECK(!stream_contains(errors, "deletes CiUser"),
+          "placeholder output does not warn about CI-user removal");
+    fclose(errors);
+    config_free(cfg);
+}
+
+static void test_ci_real_output_empty_prefixes_warns(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "real-output fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.ci_output = "demo-ci";
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "real-output run succeeds");
+    CHECK(stream_contains(errors, "deletes CiUser"),
+          "real CiUserName output with empty prefixes warns");
+    fclose(errors);
+    config_free(cfg);
+}
+
 int main(void) {
     test_prod_aws_init_installs_abort_hook();
     test_null_context();
@@ -1365,6 +1677,14 @@ int main(void) {
     test_wait_stack_failure_is_aws();
     test_identity_mismatch_is_verify();
     test_union_of_region_variants();
+    test_ci_user_enabled_with_prefixes();
+    test_ci_user_disabled_without_prefixes();
+    test_ci_user_removal_warns();
+    test_wait_stack_signal_diagnostic();
+    test_ci_placeholder_output_no_warning();
+    test_ci_real_output_empty_prefixes_warns();
+    test_cert_bucket_disabled_without_cert_module();
+    test_permissions_boundary_passed_when_set();
     test_keys_reuse_enforces_single();
     test_keys_prune_before_create_and_rotate();
     test_keys_missing_local_mints();

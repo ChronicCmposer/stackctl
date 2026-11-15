@@ -40,6 +40,8 @@ struct prod_context {
     const char *project;
     const char *region;
     const char *bazel;
+    const deploy_ops *ops; /* complete_ops, for optional in-vtable seams */
+    void *ops_ud;
 };
 
 void deploy_set_ops_for_test(const deploy_ops *ops, void *ud) {
@@ -166,6 +168,34 @@ static int tag_is_semver(const char *tag) {
 }
 
 /*
+ * Scan `*cursor` for the next newline-delimited semver tag. On success writes
+ * the tag to `tag`, advances `*cursor` past it and returns 1; returns 0 at the
+ * end of the input (and sets `*cursor` to NULL). Shared by the provenance scan
+ * and the ambiguity diagnostic so the two cannot drift.
+ */
+static int scan_next_semver_tag(const char **cursor, char *tag, size_t cap) {
+    const char *p = *cursor;
+
+    while (p != NULL && *p != '\0') {
+        const char *newline = strchr(p, '\n');
+        size_t len = newline != NULL ? (size_t)(newline - p) : strlen(p);
+        const char *next = newline != NULL ? newline + 1 : NULL;
+
+        if (len > 0 && len < cap) {
+            memcpy(tag, p, len);
+            tag[len] = '\0';
+            if (tag_is_semver(tag)) {
+                *cursor = next;
+                return 1;
+            }
+        }
+        p = next;
+    }
+    *cursor = NULL;
+    return 0;
+}
+
+/*
  * Copy `in` into `out` as a POSIX single-quoted word, replacing each embedded
  * `'` with `'\''`. Returns 0 or ENAMETOOLONG (out is never left unterminated).
  */
@@ -200,6 +230,104 @@ int deploy_shell_quote(const char *in, char *out, size_t cap) {
     out[used++] = '\'';
     out[used] = '\0';
     return 0;
+}
+
+/* Append `tag` only when the whole tag (plus separator) fits; never clip a
+ * tag mid-word. Returns 1 when appended, 0 when the list is full. */
+static int append_tag_list(char *out, size_t cap, size_t *used,
+                           const char *tag) {
+    size_t separator = *used != 0 ? 2 : 0;
+    size_t need = strlen(tag) + separator + 1;
+    int rc;
+
+    if (need > cap - *used) {
+        return 0;
+    }
+    rc = snprintf(out + *used, cap - *used, "%s%s", *used != 0 ? ", " : "",
+                  tag);
+    if (rc < 0 || (size_t)rc >= cap - *used) {
+        return 0;
+    }
+    *used += (size_t)rc;
+    return 1;
+}
+
+size_t deploy_ambiguous_tag_error(const char *tags_output, char *out,
+                                  size_t cap) {
+    enum { TAG_LIST_RESERVE = 48 };
+    char tags[384] = {0};
+    char line[128];
+    size_t tag_cap = sizeof(tags) - TAG_LIST_RESERVE;
+    size_t found = 0;
+    size_t emitted = 0;
+    size_t used = 0;
+    const char *cursor;
+
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (tags_output == NULL) {
+        return 0;
+    }
+    cursor = tags_output;
+    while (scan_next_semver_tag(&cursor, line, sizeof(line))) {
+        found++;
+        emitted += (size_t)append_tag_list(tags, tag_cap, &used, line);
+    }
+    if (found > 1) {
+        if (emitted < found && used < sizeof(tags)) {
+            snprintf(tags + used, sizeof(tags) - used, " … (+%zu more)",
+                     found - emitted);
+        }
+        snprintf(out, cap,
+                 "stackctl: ambiguous release identity: multiple release tags "
+                 "point at HEAD: %s\n",
+                 tags);
+    }
+    return found;
+}
+
+size_t deploy_collect_release_tags(const s3_object_list *listing, char *out,
+                                   size_t cap) {
+    size_t found = 0;
+    size_t used = 0;
+
+    if (out == NULL || cap == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+    if (listing == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < listing->count; i++) {
+        const char *key = listing->items[i].key;
+        const char *tag_start;
+        const char *slash;
+        char tag[128];
+        size_t tag_len;
+
+        if (key == NULL || strncmp(key, "releases/", 9) != 0) {
+            continue;
+        }
+        tag_start = key + 9;
+        slash = strchr(tag_start, '/');
+        if (slash == NULL || strcmp(slash + 1, "release-manifest.txt") != 0) {
+            continue;
+        }
+        tag_len = (size_t)(slash - tag_start);
+        if (tag_len == 0 || tag_len >= sizeof(tag)) {
+            continue;
+        }
+        memcpy(tag, tag_start, tag_len);
+        tag[tag_len] = '\0';
+        if (!tag_is_semver(tag)) {
+            continue;
+        }
+        append_tag_list(out, cap, &used, tag);
+        found++;
+    }
+    return found;
 }
 
 int deploy_manifest_line(const char *sha, const char *member, char *out,
@@ -378,7 +506,7 @@ static int prod_provenance(void *ud, const char *repo_root, int allow_dirty,
     char command[PATH_MAX * 4];
     char quoted_root[PATH_MAX * 2];
     char *tags = NULL;
-    char *cursor;
+    const char *cursor;
     char selected[128] = {0};
     int found = 0;
     int rc;
@@ -396,30 +524,29 @@ static int prod_provenance(void *ud, const char *repo_root, int allow_dirty,
         return CLI_EXIT_VERIFY;
     }
     cursor = tags;
-    while (cursor != NULL && *cursor != '\0') {
-        char *line = cursor;
-        char *newline = strchr(cursor, '\n');
+    {
+        char line[128];
 
-        if (newline != NULL) {
-            *newline = '\0';
-            cursor = newline + 1;
-        } else {
-            cursor = NULL;
-        }
-        if (tag_is_semver(line)) {
+        while (scan_next_semver_tag(&cursor, line, sizeof(line))) {
             if (found == 0) {
                 snprintf(selected, sizeof(selected), "%s", line);
             }
             found++;
         }
     }
-    free(tags);
     if (found == 0) {
+        free(tags);
         return CLI_EXIT_VERIFY;
     }
     if (found > 1) {
+        char message[512];
+
+        (void)deploy_ambiguous_tag_error(tags, message, sizeof(message));
+        fputs(message, stderr);
+        free(tags);
         return CLI_EXIT_USAGE;
     }
+    free(tags);
 
     /* The tag must be annotated. */
     rc = snprintf(command, sizeof(command), "git -C %s cat-file -t '%s'",
@@ -515,6 +642,11 @@ static int prod_provenance(void *ud, const char *repo_root, int allow_dirty,
 
     snprintf(tag, cap, "%s", selected);
     return 0;
+}
+
+int deploy_prod_provenance_for_test(const char *repo_root, int allow_dirty,
+                                    char *tag, size_t cap) {
+    return prod_provenance(NULL, repo_root, allow_dirty, tag, cap);
 }
 
 static int prod_freshness(void *ud, const char *repo_root,
@@ -769,6 +901,192 @@ static int prod_verify_release(void *ud, const char *bucket, const char *tag,
     return rc;
 }
 
+/* Trim a manifest member name in place; return its length. */
+static size_t trim_member_name(char *name) {
+    size_t len = strlen(name);
+
+    while (len > 0 && (name[len - 1] == '\r' || name[len - 1] == ' ' ||
+                       name[len - 1] == '\t')) {
+        name[--len] = '\0';
+    }
+    return len;
+}
+
+/*
+ * F7 cheap verification: parse `<sha256>  <member>` lines and HEAD every
+ * member. A successful HEAD plus a non-empty payload is the whole test; the
+ * full re-hash in prod_verify_release stays reserved for publish provenance
+ * (prune tolerates false negatives: unverifiable releases are kept).
+ */
+static int cheap_verify_manifest_members(s3_client *client, const char *bucket,
+                                         const char *tag, char *manifest) {
+    char *line = manifest;
+    int member_count = 0;
+
+    while (*line != '\0') {
+        char *newline = strchr(line, '\n');
+        char *sha = line;
+        char *sep;
+        char *name = NULL;
+        char object_key[768];
+        unsigned long long size = 0;
+        char etag[S3_ETAG_MAX];
+        int rc = 0;
+
+        if (newline != NULL) {
+            *newline = '\0';
+        }
+        while (*sha == ' ' || *sha == '\t') {
+            sha++;
+        }
+        sep = strpbrk(sha, " \t");
+        if (sep != NULL) {
+            *sep++ = '\0';
+            while (*sep == ' ' || *sep == '\t') {
+                sep++;
+            }
+            name = sep;
+            (void)trim_member_name(name);
+        }
+        if (sep == NULL || strlen(sha) != 64 || name == NULL ||
+            name[0] == '\0') {
+            if (sha[0] != '\0') {
+                return CLI_EXIT_VERIFY;
+            }
+        } else if (snprintf(object_key, sizeof(object_key), "releases/%s/%s",
+                            tag, name) >= (int)sizeof(object_key)) {
+            return ENAMETOOLONG;
+        } else {
+            member_count++;
+            rc = s3_head_object(client, bucket, object_key, &size, etag);
+            if (rc == 0 && size == 0) {
+                rc = EBADMSG; /* present but empty: inconsistent payload */
+            }
+            if (rc == EBADMSG || rc == ENOENT) {
+                rc = CLI_EXIT_VERIFY;
+            }
+            if (rc != 0) {
+                return rc;
+            }
+        }
+        if (newline == NULL) {
+            break;
+        }
+        line = newline + 1;
+    }
+    /* A manifest with no member lines proves nothing; it is not verified. */
+    return member_count > 0 ? 0 : CLI_EXIT_VERIFY;
+}
+
+/* Test-only: drive the manifest-member cheap verifier without S3. */
+int deploy_cheap_verify_manifest_for_test(const char *bucket, const char *tag,
+                                          char *manifest) {
+    return cheap_verify_manifest_members(NULL, bucket, tag, manifest);
+}
+
+/* Cheap prune-time verification seam (F7). */
+static int prod_verify_release_cheap(void *ud, const char *bucket,
+                                     const char *tag, char *sha_out,
+                                     size_t cap) {
+    const struct prod_context *ctx = ud;
+    aws_ctx *aws = NULL;
+    s3_client *client = NULL;
+    char key[512];
+    char *manifest = NULL;
+    size_t len = 0;
+    int rc;
+
+    rc = manifest_key(tag, key, sizeof(key));
+    if (rc != 0) {
+        return rc;
+    }
+    rc = s3_open(ctx != NULL ? ctx->project : "default",
+                 ctx != NULL ? ctx->region : "us-east-1", &aws, &client);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = s3_get_object(client, bucket, key, &manifest, &len);
+    if (rc == 0) {
+        char digest[65];
+
+        sha256_hex(manifest, len, digest);
+        if (sha_out != NULL && cap > 0) {
+            snprintf(sha_out, cap, "%s", digest);
+        }
+        rc = cheap_verify_manifest_members(client, bucket, tag, manifest);
+    }
+    free(manifest);
+    s3_close(aws, client);
+    return rc;
+}
+
+size_t deploy_prune_verify(deploy_release_entry *entries, size_t count,
+                           size_t cap,
+                           int (*verify)(void *ud, const char *tag), void *ud,
+                           deploy_prune_result *result, FILE *err) {
+    deploy_prune_result counts = {0};
+    size_t remaining = 0;
+
+    if (entries == NULL || count == 0) {
+        if (result != NULL) {
+            *result = counts;
+        }
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        int rc;
+
+        if (entries[i].delete_me == 0) {
+            continue;
+        }
+        if (counts.candidates >= cap) {
+            entries[i].delete_me = 0;
+            counts.deferred++;
+            continue;
+        }
+        counts.candidates++;
+        rc = verify != NULL ? verify(ud, entries[i].tag) : EINVAL;
+        if (rc == 0) {
+            counts.verified++;
+            remaining++;
+            continue;
+        }
+        entries[i].delete_me = 0;
+        counts.kept_unverifiable++;
+        if (err != NULL) {
+            const char *reason = "verification failed";
+
+            if (rc == CLI_EXIT_VERIFY) {
+                reason = "missing or malformed member";
+            } else if (rc > 0 && rc < 4096) {
+                reason = strerror(rc);
+            }
+            fprintf(err, "warning: release %s kept: unverifiable (%s)\n",
+                    entries[i].tag, reason);
+        }
+    }
+    if (err != NULL && counts.kept_unverifiable > 0) {
+        if (counts.verified == 0 && counts.deferred == 0) {
+            /* All-fail: nothing is pruned; use the design's wording. */
+            fprintf(err, "%zu releases kept: unverifiable\n",
+                    counts.kept_unverifiable);
+        } else {
+            fprintf(err, "%zu release(s) kept: unverifiable\n",
+                    counts.kept_unverifiable);
+        }
+    }
+    if (err != NULL && counts.deferred > 0) {
+        fprintf(err,
+                "%zu release(s) deferred: verification cap reached (%zu per "
+                "run)\n",
+                counts.deferred, cap);
+    }
+    if (result != NULL) {
+        *result = counts;
+    }
+    return remaining;
+}
+
 static int upload_artifact(s3_client *client, const char *bucket,
                            const char *tag, const char *path,
                            buffer *manifest) {
@@ -954,10 +1272,14 @@ int deploy_prod_aws_init_for_test(const char *profile, aws_ctx **out) {
     return prod_aws_init(NULL, profile, out);
 }
 
+static int prod_assert_identity(void *ud, aws_ctx *aws, const char *project) {
+    (void)ud;
+    return cli_assert_operator_identity(aws, project);
+}
+
 static void prod_aws_free(void *ud, aws_ctx *aws) {
     (void)ud;
-    aws_free(aws);
-}
+    aws_free(aws);}
 
 static int prod_cfn_create(void *ud, aws_ctx *aws, cfn_client **out) {
     (void)ud;
@@ -1161,6 +1483,26 @@ static deploy_release_entry *find_entry(deploy_release_entry *entries,
     return entry;
 }
 
+/* Adapter from the ops cheap-verify seam to the prune-selection callback. */
+typedef struct cheap_verify_ctx {
+    const struct prod_context *ctx;
+    const char *bucket;
+} cheap_verify_ctx;
+
+static int cheap_verify_candidate(void *ud, const char *tag) {
+    const cheap_verify_ctx *verify_ctx = ud;
+    const struct prod_context *ctx = verify_ctx->ctx;
+    char sha[65];
+
+    if (ctx != NULL && ctx->ops != NULL &&
+        ctx->ops->verify_release_cheap != NULL) {
+        return ctx->ops->verify_release_cheap(ctx->ops_ud, verify_ctx->bucket,
+                                             tag, sha, sizeof(sha));
+    }
+    return prod_verify_release_cheap((void *)ctx, verify_ctx->bucket, tag, sha,
+                                     sizeof(sha));
+}
+
 static int prod_prune(void *ud, const char *bucket, const char *pinned,
                       const char *previous, const char *just_uploaded) {
     const struct prod_context *ctx = ud;
@@ -1168,6 +1510,8 @@ static int prod_prune(void *ud, const char *bucket, const char *pinned,
     s3_client *client = NULL;
     s3_object_list listing = {0};
     deploy_release_entry entries[256] = {0};
+    deploy_prune_result prune_result = {0};
+    cheap_verify_ctx verify_ctx = {ctx, bucket};
     size_t entry_count = 0;
     long long now = (long long)time(NULL);
     int rc;
@@ -1228,6 +1572,11 @@ static int prod_prune(void *ud, const char *bucket, const char *pinned,
 
     (void)deploy_prune_mark(entries, entry_count, pinned, previous,
                             just_uploaded, now);
+    /* F7: verification only for candidates past the protections, capped per
+     * run; failures keep the release (prune must never fail a deploy). */
+    (void)deploy_prune_verify(entries, entry_count, DEPLOY_PRUNE_VERIFY_CAP,
+                              cheap_verify_candidate, &verify_ctx,
+                              &prune_result, stderr);
 
     rc = 0;
     for (size_t i = 0; i < entry_count; i++) {
@@ -1257,6 +1606,34 @@ static int prod_prune(void *ud, const char *bucket, const char *pinned,
     return rc;
 }
 
+static int prod_list_releases(void *ud, const char *bucket, char *out,
+                               size_t cap) {
+    const struct prod_context *ctx = ud;
+    aws_ctx *aws = NULL;
+    s3_client *client = NULL;
+    s3_object_list listing = {0};
+    int rc;
+
+    if (out == NULL || cap == 0) {
+        return EINVAL;
+    }
+    out[0] = '\0';
+    rc = s3_open(ctx != NULL ? ctx->project : "default",
+                 ctx != NULL ? ctx->region : "us-east-1", &aws, &client);
+    if (rc != 0) {
+        return rc;
+    }
+    /* Single page by design: S3 caps ListObjectsV2 at 1000 keys, so a bucket
+     * with more release objects may omit older tags from the hint. */
+    rc = s3_list_objects_v2(client, bucket, "releases/", &listing);
+    if (rc == 0) {
+        (void)deploy_collect_release_tags(&listing, out, cap);
+    }
+    s3_object_list_free(&listing);
+    s3_close(aws, client);
+    return rc;
+}
+
 static const deploy_ops complete_ops = {
     .git_provenance = prod_provenance,
     .freshness = prod_freshness,
@@ -1265,11 +1642,14 @@ static const deploy_ops complete_ops = {
     .ami_exists = prod_ami_exists,
     .release_exists = prod_release_exists,
     .verify_release = prod_verify_release,
+    .verify_release_cheap = prod_verify_release_cheap,
     .publish_release = prod_publish_release,
     .count_live_instances = prod_count_live,
     .prune_releases = prod_prune,
+    .list_releases = prod_list_releases,
     .aws_init = prod_aws_init,
     .aws_free = prod_aws_free,
+    .assert_identity = prod_assert_identity,
     .cfn_create = prod_cfn_create,
     .cfn_destroy = prod_cfn_destroy,
     .describe_stacks = prod_describe,
@@ -1499,7 +1879,7 @@ static int deploy_run_impl(deploy_env *env) {
     cfn_stack_list stacks = {0};
     cfn_change_set_type type = CFN_CHANGE_SET_TYPE_CREATE;
     int prior_review = 0;
-    cfn_parameter params[12] = {0};
+    cfn_parameter params[64] = {0};
     size_t param_count = 0;
     cfn_tag tags[2] = {0};
     size_t tag_count = 0;
@@ -1522,6 +1902,8 @@ static int deploy_run_impl(deploy_env *env) {
         prod_ctx.project = config_project(env->cfg);
         prod_ctx.region = config_region(env->cfg);
         prod_ctx.bazel = config_get(env->cfg, "BAZEL_COMMAND");
+        prod_ctx.ops = &complete_ops;
+        prod_ctx.ops_ud = &prod_ctx;
         ud = &prod_ctx;
     }
     if (ops->git_provenance == NULL || ops->resolve_bucket == NULL ||
@@ -1593,11 +1975,9 @@ static int deploy_run_impl(deploy_env *env) {
         rc = ops->git_provenance(ud, repo_root, env->allow_dirty, env->tag,
                                  sizeof(env->tag));
         if (rc != 0) {
-            if (rc == CLI_EXIT_USAGE) {
-                fprintf(env->err,
-                        "stackctl: ambiguous release identity (more than one "
-                        "vX.Y.Z tag on HEAD)\n");
-            } else {
+            /* The production provenance stage emits the ambiguity diagnostic
+             * itself so it can name every offending tag (F14). */
+            if (rc != CLI_EXIT_USAGE) {
                 fprintf(env->err,
                         "stackctl: provenance gate failed (annotated vX.Y.Z "
                         "tag on HEAD and origin)\n");
@@ -1658,6 +2038,26 @@ static int deploy_run_impl(deploy_env *env) {
         ami_count++;
     }
 
+    /* F3: create the mutating AWS client and assert project identity before
+     * any S3/CFN mutation and before the dry-run bail. Bucket naming may have
+     * already made its own read-only STS call. */
+    rc = ops->aws_init(ud, project, &aws);
+    if (rc != 0) {
+        fprintf(env->err, "stackctl: cannot authenticate as %s\n", project);
+        return CLI_EXIT_AWS;
+    }
+    rc = ops->cfn_create(ud, aws, &client);
+    if (rc != 0) {
+        ops->aws_free(ud, aws);
+        return CLI_EXIT_AWS;
+    }
+    if (ops->assert_identity != NULL) {
+        rc = ops->assert_identity(ud, aws, project);
+        if (rc != 0) {
+            goto done;
+        }
+    }
+
     rc = ops->release_exists(ud, bucket, env->tag, &exists);
     if (rc != 0) {
         fprintf(env->err, "stackctl: cannot check releases/%s/\n", env->tag);
@@ -1680,11 +2080,24 @@ static int deploy_run_impl(deploy_env *env) {
             return rc == CLI_EXIT_VERIFY ? CLI_EXIT_VERIFY : CLI_EXIT_AWS;
         }
     } else if (rollback) {
-        fprintf(env->err,
-                "stackctl: release %s no longer exists (pruned); available "
-                "releases are listed by `stackctl status`\n",
-                env->tag);
+        char available[512] = {0};
+
+        if (ops->list_releases != NULL &&
+            ops->list_releases(ud, bucket, available, sizeof(available)) == 0 &&
+            available[0] != '\0') {
+            fprintf(env->err,
+                    "stackctl: release %s no longer exists (pruned); "
+                    "available releases: %s\n",
+                    env->tag, available);
+        } else {
+            fprintf(env->err,
+                    "stackctl: release %s no longer exists (pruned); "
+                    "available releases are listed by `stackctl status`\n",
+                    env->tag);
+        }
         return CLI_EXIT_VERIFY;
+    } else if (env->dry_run != 0) {
+        /* F22: a dry run performs no S3 writes; skip publishing entirely. */
     } else {
         rc = ops->publish_release(ud, bucket, env->tag, repo_root, targets,
                                   env->manifest_sha,
@@ -1708,17 +2121,6 @@ static int deploy_run_impl(deploy_env *env) {
                     env->tag);
             return rc == CLI_EXIT_VERIFY ? CLI_EXIT_VERIFY : CLI_EXIT_AWS;
         }
-    }
-
-    rc = ops->aws_init(ud, project, &aws);
-    if (rc != 0) {
-        fprintf(env->err, "stackctl: cannot authenticate as %s\n", project);
-        return CLI_EXIT_AWS;
-    }
-    rc = ops->cfn_create(ud, aws, &client);
-    if (rc != 0) {
-        ops->aws_free(ud, aws);
-        return CLI_EXIT_AWS;
     }
 
     rc = ops->describe_stacks(ud, client, region, stack, &stacks);
@@ -1810,6 +2212,45 @@ static int deploy_run_impl(deploy_env *env) {
               config_get(env->cfg, "INGRESS_TCP"));
     add_param(params, &param_count, "IngressUdp",
               config_get(env->cfg, "INGRESS_UDP"));
+    /* F2: map each parsed rule to its indexed port+cidr pair. Unused slots are
+     * omitted so the template's conditional resources stay off. */
+    {
+        const config_ingress_rule *rules = NULL;
+        size_t count = config_ingress_tcp(env->cfg, &rules);
+
+        for (size_t i = 0; i < count; i++) {
+            char key[32];
+            char port[16];
+
+            snprintf(port, sizeof port, "%u", rules[i].port);
+            snprintf(key, sizeof key, "IngressTcpPort%zu", i);
+            add_param(params, &param_count, key, port);
+            snprintf(key, sizeof key, "IngressTcpCidr%zu", i);
+            add_param(params, &param_count, key, rules[i].cidr);
+        }
+    }
+    {
+        const config_ingress_rule *rules = NULL;
+        size_t count = config_ingress_udp(env->cfg, &rules);
+
+        for (size_t i = 0; i < count; i++) {
+            char key[32];
+            char port[16];
+
+            snprintf(port, sizeof port, "%u", rules[i].port);
+            snprintf(key, sizeof key, "IngressUdpPort%zu", i);
+            add_param(params, &param_count, key, port);
+            snprintf(key, sizeof key, "IngressUdpCidr%zu", i);
+            add_param(params, &param_count, key, rules[i].cidr);
+        }
+    }
+    /* F4: pass the DDNS identity only when the pair is configured. */
+    if (config_get(env->cfg, "DDNS_HOST") != NULL) {
+        add_param(params, &param_count, "DdnsHost",
+                  config_get(env->cfg, "DDNS_HOST"));
+        add_param(params, &param_count, "DdnsDomain",
+                  config_get(env->cfg, "DDNS_DOMAIN"));
+    }
     {
         const char *buckets = config_get(env->cfg, "BUCKET_MODULES");
 
@@ -1819,6 +2260,46 @@ static int deploy_run_impl(deploy_env *env) {
     }
     add_param(params, &param_count, "EnableImageBuilder",
               config_get(env->cfg, "ENABLE_IMAGE_BUILDER"));
+    /* F10: the spot-alert switch is always passed; the email only when on
+     * (config already enforces email-when-on). */
+    {
+        const char *alerts = config_get(env->cfg, "ENABLE_SPOT_ALERTS");
+        int alerts_on = alerts != NULL && strcmp(alerts, "true") == 0;
+
+        add_param(params, &param_count, "EnableSpotAlerts",
+                  alerts_on != 0 ? "true" : "false");
+        if (alerts_on) {
+            add_param(params, &param_count, "SpotAlertEmail",
+                      config_get(env->cfg, "SPOT_ALERT_EMAIL"));
+        }
+    }
+    /* F11: the image-builder parent image is passed iff configured. */
+    {
+        const char *parent = config_get(env->cfg, "IMAGE_BUILDER_PARENT_IMAGE");
+
+        if (parent != NULL) {
+            add_param(params, &param_count, "ImageBuilderParentImage", parent);
+        }
+    }
+
+    /* F22: a dry run stops here — identity/provenance/AMI checks already ran,
+     * but nothing is published and no change set is created. */
+    if (env->dry_run != 0) {
+        if (env->json != 0) {
+            report_json(env, stack, 0, 0, "dry-run", current_stack, params,
+                        param_count);
+        } else {
+            fprintf(env->out,
+                    "release: %s (dry-run: nothing published or applied)\n",
+                    env->tag);
+            fprintf(env->out, "%s: no change set created\n", stack);
+            (void)deploy_param_diff_write(env->out, current_stack, params,
+                                          param_count);
+            fprintf(env->out, "live Project instances: %d\n", live_count);
+        }
+        rc = CLI_EXIT_OK;
+        goto done;
+    }
 
     rc = add_release_tags(tags, &tag_count, env->tag, env->manifest_sha);
     if (rc != 0) {
@@ -1898,22 +2379,6 @@ static int deploy_run_impl(deploy_env *env) {
         }
     }
 
-    if (env->dry_run != 0) {
-        (void)ops->delete_change_set(ud, client, region, stack,
-                                     change_set_name);
-        if (prior_review != 0) {
-            (void)ops->delete_stack(ud, client, region, stack);
-        }
-        if (env->json != 0) {
-            report_json(env, stack, change_set.change_count, 0, "dry-run",
-                        current_stack, params, param_count);
-        } else {
-            fprintf(env->out, "dry-run: change set deleted, nothing applied\n");
-        }
-        rc = CLI_EXIT_OK;
-        goto done;
-    }
-
     {
         int decision = env->confirm != NULL
                            ? env->confirm(env->confirm_ud, "apply? [y/N] ")
@@ -1962,7 +2427,9 @@ static int deploy_run_impl(deploy_env *env) {
                                                             : CFN_WAIT_UPDATE,
                          180, 5, &timed_out);
     if (rc != 0 || timed_out != 0) {
-        fprintf(env->err, "stackctl: stack operation on %s did not complete\n",
+        fprintf(env->err,
+                "stackctl: stack operation on %s did not complete; continues "
+                "server-side; run `stackctl status`\n",
                 stack);
         rc = CLI_EXIT_AWS;
         goto done;
