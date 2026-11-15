@@ -1,0 +1,33 @@
+# In-repo package for the vendored Mbed TLS overlay and its hand-written config.
+#
+# BUILD.mbedtls is the build file applied to the @mbedtls external repo
+# (build_file = "//third_party/mbedtls:BUILD.mbedtls" in MODULE.bazel). The
+# :config target here exports the two minimal config headers to that external
+# repo via an include root, so it builds against stackctl's client-only profile
+# instead of the upstream defaults.
+
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["BUILD.mbedtls"])
+
+cc_library(
+    name = "config",
+    hdrs = [
+        "configs/crypto_config.h",
+        "configs/mbedtls_config.h",
+    ],
+    # Exposes the package root as an include dir so the external overlay's
+    # -DMBEDTLS_CONFIG_FILE="configs/mbedtls_config.h" resolves here.
+    includes = ["."],
+)
+
+# Colocated check that the two config headers exist and still describe the
+# intended client-only TLS 1.2/1.3 profile.
+cc_test(
+    name = "config_presence_test",
+    srcs = ["config_presence_test.c"],
+    copts = ["-std=gnu23"],
+    deps = [":config"],
+)

@@ -1,0 +1,38 @@
+# BUILD file applied to the @cares external repo (c-ares 1.34.9 source, pinned
+# in MODULE.bazel). Builds the whole DNS client as a static cc_library used
+# directly by the stackctl `dns` module (never as curl's resolver).
+#
+# The release tarball ships no generated ares_config.h (autotools/CMake produce
+# one at configure time), so //third_party/cares:ares_config.patch commits a
+# hand-written Linux config into src/lib/ares_config.h. Values mirror c-ares's
+# own configure/CMake results for a modern Linux C library and are identical for
+# both LP64 target arches (amd64 and arm64).
+#
+# Compiled statically against musl by the hermetic zig toolchain; linkstatic +
+# disabled dynamic-linker support are the repo's vendored-static convention.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "cares",
+    srcs = glob(["src/lib/**/*.c"]),
+    hdrs = glob([
+        "include/*.h",
+        "src/lib/**/*.h",
+    ]),
+    copts = [
+        "-D_GNU_SOURCE",
+        "-DHAVE_CONFIG_H",
+        "-DCARES_NO_DEPRECATED",
+    ],
+    defines = ["CARES_STATICLIB"],
+    includes = [
+        "include",
+        "src/lib",
+        "src/lib/include",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+)

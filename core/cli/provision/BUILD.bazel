@@ -1,0 +1,46 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# `stackctl provision` — deploy the account-global <project>-operator stack
+# from the primary config, then verify the project identity (spec §4).
+cc_library(
+    name = "provision",
+    srcs = ["provision.c"],
+    hdrs = [
+        "provision.h",
+        "provision_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/aws",
+        "//core/cfn",
+        "//core/cli/common:cli",
+        "//core/config",
+        "//core/iam",
+        "//core/ini",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "provision_test",
+    srcs = ["provision_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":provision"],
+)

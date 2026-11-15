@@ -1,0 +1,57 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# Shared substrate for the instance-lifecycle verbs (launch, terminate, status,
+# start, stop): an injectable services vtable over the frozen module surfaces
+# plus a runtime carrying the config snapshot, state store and I/O policy.
+cc_library(
+    name = "instance_common",
+    srcs = [
+        "instance_config.c",
+        "instance_dns.c",
+        "instance_runtime.c",
+        "instance_services.c",
+        "instance_util.c",
+    ],
+    hdrs = ["instance.h"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/aws",
+        "//core/cfn",
+        "//core/cli/common:cli",
+        "//core/config",
+        "//core/crypto",
+        "//core/ddns",
+        "//core/dns",
+        "//core/ec2",
+        "//core/iam",
+        "//core/knownhosts",
+        "//core/s3",
+        "//core/ssh",
+        "//core/ssm",
+        "//core/state",
+    ],
+)
+
+cc_test(
+    name = "instance_util_test",
+    srcs = ["instance_util_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":instance_common"],
+)

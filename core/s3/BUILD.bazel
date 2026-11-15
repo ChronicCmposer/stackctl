@@ -1,0 +1,43 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# core/s3 — S3 request builders and response parsers over core/aws (spec §5.5).
+#
+# Path-style addressing, UNSIGNED-PAYLOAD for PUT/GET/HEAD, single-PUT objects
+# (no multipart), and the bucket-configuration subresources used by the stack
+# templates. No sockets: every call goes through the core/aws seam.
+cc_library(
+    name = "s3",
+    srcs = ["s3.c"],
+    hdrs = [
+        "s3.h",
+        "s3_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/aws",
+        "//core/crypto",
+    ],
+)
+
+cc_test(
+    name = "s3_test",
+    srcs = ["s3_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":s3"],
+)

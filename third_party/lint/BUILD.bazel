@@ -1,0 +1,11 @@
+# Package marker for the hermetic lint tool overlays.
+#
+# BUILD.shellcheck and BUILD.cppcheck are the build files applied to the
+# corresponding http_archive external repositories in MODULE.bazel.
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "BUILD.cppcheck",
+    "BUILD.shellcheck",
+])

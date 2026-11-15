@@ -1,0 +1,48 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# core/ssm — AWS Systems Manager (Parameter Store + Run Command) request
+# builders and response parsers over core/aws (spec §3/§4, CONTRACT §core/ssm).
+#
+# The AWS SSM API is JSON-1.1; every call carries signed `X-Amz-Target` and
+# `Content-Type` extra headers (CONTRACT Amendment 5). No sockets of its own:
+# all traffic goes through the core/aws seam.
+cc_library(
+    name = "ssm",
+    srcs = ["ssm.c"],
+    hdrs = [
+        "ssm.h",
+        "ssm_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/aws",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "ssm_test",
+    srcs = ["ssm_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":ssm",
+        "@yyjson",
+    ],
+)

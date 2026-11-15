@@ -1,0 +1,45 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# `stackctl start` / `stackctl stop` — SSH-exec systemctl start|stop on the
+# Project-tagged instance (spec §4).
+cc_library(
+    name = "startstop",
+    srcs = ["startstop.c"],
+    hdrs = [
+        "startstop.h",
+        "startstop_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/cli/common:cli",
+        "//core/cli/launch/common:instance_common",
+        "//core/ec2",
+        "//core/knownhosts",
+        "//core/ssh",
+        "//core/state",
+    ],
+)
+
+cc_test(
+    name = "startstop_test",
+    srcs = ["startstop_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":startstop"],
+)

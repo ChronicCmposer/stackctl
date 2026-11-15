@@ -1,0 +1,106 @@
+# stackctl monorepo root package.
+#
+# The build is bzlmod-only (see MODULE.bazel); vendored third-party C libraries
+# live under //third_party and first-party modules under //core. Each module
+# directory owns its own cc_library/cc_test targets.
+#
+# This root package owns the command-line binary (core/main.c) and publishes the
+# repository metadata that packaging and `stackctl --version` consume. VERSION
+# is the single source of truth for the release identity (spec §4): the binary
+# ships it as a runfile, so `bazel run //:stackctl -- --version` reports it.
+
+load("@bazel_skylib//rules:write_file.bzl", "write_file")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "MODULE.bazel",
+    "VERSION",
+    # The entry point lives in the root package (no BUILD file intervenes below
+    # core/), so the dispatch package's `cc_binary` references it as
+    # `//:core/main.c`; exporting makes that cross-package source label legal.
+    "core/main.c",
+])
+
+# Metadata filegroup for packaging targets that need the release identity
+# without depending on the binary itself.
+filegroup(
+    name = "release_metadata",
+    srcs = ["VERSION"],
+)
+
+# Convenience entry point for `bazel run //:stackctl`. The single `cc_binary`
+# is declared by the dispatch package (its owner), which keeps one binary
+# target in the graph; this alias is the packaging-facing label.
+alias(
+    name = "stackctl",
+    actual = "//core/cli/dispatch:stackctl",
+)
+
+# --- version consistency ---------------------------------------------------
+# bzlmod evaluates MODULE.bazel before any workspace file can be read, so the
+# module version duplicates VERSION. This hermetic test keeps the two in
+# lockstep and fails `bazel test //...` on drift.
+#
+# `write_file` emits the check script with Bazel's Starlark FileWriteAction: no
+# shell, no host `cat`/`chmod`, and the executable bit is recorded by the action
+# (CONTRACT Amendment 4). The script deliberately has no `#!` line: it is run by
+# the hermetic bash that rules_shell's `use_bash_launcher` bootstrap installs
+# (bash falls back to interpreting an executable text file without a shebang),
+# so the check never resolves an interpreter through the host PATH.
+write_file(
+    name = "version_consistency_test_sh",
+    out = "version_consistency_test.sh",
+    content = [
+        "set -euo pipefail",
+        "",
+        'root="${TEST_SRCDIR:-}/${TEST_WORKSPACE:-}"',
+        'version_file="$root/VERSION"',
+        'module_file="$root/MODULE.bazel"',
+        "",
+        'if [[ ! -r "$version_file" ]]; then',
+        "    printf 'version-consistency: missing runfile VERSION\\n' >&2",
+        "    exit 1",
+        "fi",
+        'if [[ ! -r "$module_file" ]]; then',
+        "    printf 'version-consistency: missing runfile MODULE.bazel\\n' >&2",
+        "    exit 1",
+        "fi",
+        "",
+        'version="$(<"$version_file")"',
+        'version="${version//[[:space:]]/}"',
+        "",
+        'module_version=""',
+        "while IFS= read -r line; do",
+        '    if [[ "$line" =~ ^[[:space:]]*version[[:space:]]*=[[:space:]]*\\"([^\\"]*)\\" ]]; then',
+        '        module_version="${BASH_REMATCH[1]}"',
+        "        break",
+        "    fi",
+        'done < "$module_file"',
+        "",
+        'if [[ -z "$module_version" ]]; then',
+        "    printf 'version-consistency: no module version in MODULE.bazel\\n' >&2",
+        "    exit 1",
+        "fi",
+        'if [[ "$version" != "$module_version" ]]; then',
+        "    printf 'version-consistency: VERSION=%s differs from MODULE.bazel version=%s\\n' \\",
+        '        "$version" "$module_version" >&2',
+        "    exit 1",
+        "fi",
+        "",
+        "printf 'version-consistency: %s matches MODULE.bazel\\n' \"$version\"",
+    ],
+    is_executable = True,
+    newline = "unix",
+)
+
+sh_test(
+    name = "version_consistency_test",
+    srcs = [":version_consistency_test_sh"],
+    data = [
+        "MODULE.bazel",
+        "VERSION",
+    ],
+    use_bash_launcher = True,
+)

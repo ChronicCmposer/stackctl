@@ -1,0 +1,6 @@
+# shellcheck configuration for stackctl.
+#
+# The lint gate invokes shellcheck at severity=warning for every *.sh/*.bash in
+# the workspace (vendored upstream scripts live in Bazel external repos and are
+# not part of the workspace walk).
+external-sources=false

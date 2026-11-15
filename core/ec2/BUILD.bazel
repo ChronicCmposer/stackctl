@@ -1,0 +1,57 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# core/ec2 — EC2 Query-protocol request builders + XML response parsers over
+# core/aws (spec §4, CONTRACT §core/ec2/ec2.h). No network symbols of its own.
+cc_library(
+    name = "ec2",
+    srcs = [
+        "console.c",
+        "ec2.c",
+        "images.c",
+        "instances.c",
+        "tags.c",
+        "util.c",
+    ],
+    hdrs = [
+        "ec2.h",
+        "ec2_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = ["//core/aws"],
+)
+
+cc_test(
+    name = "ec2_test",
+    srcs = ["ec2_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":ec2"],
+)
+
+cc_test(
+    name = "util_test",
+    srcs = ["util_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":ec2"],
+)

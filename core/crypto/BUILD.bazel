@@ -1,0 +1,35 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "crypto",
+    srcs = [
+        "hmac.c",
+        "sha256.c",
+        "sigv4.c",
+    ],
+    hdrs = ["crypto.h"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    includes = ["."],
+    linkstatic = True,
+)
+
+cc_test(
+    name = "crypto_test",
+    srcs = ["crypto_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":crypto"],
+)

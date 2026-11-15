@@ -1,0 +1,49 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# `stackctl launch` — full instance lifecycle: preflight, RunInstances, waiters,
+# DDNS, host-key pinning, setup SSH, replacement (spec §4 launch).
+cc_library(
+    name = "launch",
+    srcs = ["launch.c"],
+    hdrs = [
+        "launch.h",
+        "launch_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/cfn",
+        "//core/cli/common:cli",
+        "//core/cli/launch/common:instance_common",
+        "//core/ec2",
+        "//core/knownhosts",
+        "//core/s3",
+        "//core/ssh",
+        "//core/ssm",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "launch_test",
+    srcs = ["launch_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":launch"],
+)

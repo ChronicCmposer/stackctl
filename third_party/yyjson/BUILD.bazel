@@ -1,0 +1,20 @@
+# In-repo package marker for the vendored yyjson sources.
+#
+# BUILD.yyjson is the build file applied to the @yyjson external repo
+# (build_file = "//third_party/yyjson:BUILD.yyjson" in MODULE.bazel). The
+# smoke test below is the colocated unit check for the vendored target.
+
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["BUILD.yyjson"])
+
+cc_test(
+    name = "yyjson_smoke_test",
+    srcs = ["yyjson_smoke_test.c"],
+    copts = ["-std=gnu23"],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    deps = ["@yyjson"],
+)

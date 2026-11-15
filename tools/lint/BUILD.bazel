@@ -1,0 +1,141 @@
+# Hermetic lint entry points (CONTRACT Amendment 3 + 4).
+#
+# Every target is runnable with `bazel run`:
+#   bazel run //tools/lint:lint-c
+#   bazel run //tools/lint:lint-starlark
+#   bazel run //tools/lint:lint-shell
+#   bazel run //tools/lint:lint-yaml
+#   bazel run //tools/lint:lint-markdown
+#   bazel run //tools/lint:lint          # aggregate
+#
+# The tools are Bazel-fetched pinned artifacts from MODULE.bazel; the driver
+# (lint.sh) only receives their runfiles paths, so nothing is read from PATH or
+# a host installation.
+
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# Dependency-free Markdown/YAML checkers built with the hermetic C toolchain.
+cc_binary(
+    name = "markdown_check",
+    srcs = ["markdown_check.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkstatic = True,
+)
+
+# http_file preserves the download's 0644 mode; materialize an executable copy
+# so the driver can invoke it directly. Both Linux architectures are pinned in
+# MODULE.bazel; the CPU constraint select keeps lint-starlark working on either.
+genrule(
+    name = "buildifier_bin",
+    srcs = select({
+        "@platforms//cpu:aarch64": ["@buildifier_arm64//file"],
+        "@platforms//cpu:x86_64": ["@buildifier_amd64//file"],
+    }),
+    outs = ["buildifier"],
+    cmd = "cp $< $@ && chmod +x $@",
+    executable = True,
+)
+
+# shellcheck is published as an architecture-specific release tarball; alias the
+# one matching the target CPU. Both archives share //third_party/lint:BUILD.shellcheck.
+alias(
+    name = "shellcheck_bin",
+    actual = select({
+        "@platforms//cpu:aarch64": "@shellcheck_arm64//:shellcheck",
+        "@platforms//cpu:x86_64": "@shellcheck_amd64//:shellcheck",
+    }),
+)
+
+cc_binary(
+    name = "yaml_check",
+    srcs = ["yaml_check.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkstatic = True,
+)
+
+sh_binary(
+    name = "lint-c",
+    srcs = ["lint.sh"],
+    args = [
+        "--mode=c",
+        "--cppcheck=$(rootpath @cppcheck//:cppcheck)",
+    ],
+    data = [
+        "@cppcheck",
+        "@cppcheck//:cfg",
+    ],
+)
+
+sh_binary(
+    name = "lint-starlark",
+    srcs = ["lint.sh"],
+    args = [
+        "--mode=starlark",
+        "--buildifier=$(rootpath :buildifier_bin)",
+    ],
+    data = [":buildifier_bin"],
+)
+
+sh_binary(
+    name = "lint-shell",
+    srcs = ["lint.sh"],
+    args = [
+        "--mode=shell",
+        "--shellcheck=$(rootpath :shellcheck_bin)",
+    ],
+    data = [":shellcheck_bin"],
+)
+
+sh_binary(
+    name = "lint-yaml",
+    srcs = ["lint.sh"],
+    args = [
+        "--mode=yaml",
+        "--yaml-check=$(rootpath :yaml_check)",
+    ],
+    data = [":yaml_check"],
+)
+
+sh_binary(
+    name = "lint-markdown",
+    srcs = ["lint.sh"],
+    args = [
+        "--mode=markdown",
+        "--markdown-check=$(rootpath :markdown_check)",
+    ],
+    data = [":markdown_check"],
+)
+
+sh_binary(
+    name = "lint",
+    srcs = ["lint.sh"],
+    args = [
+        "--mode=all",
+        "--cppcheck=$(rootpath @cppcheck//:cppcheck)",
+        "--buildifier=$(rootpath :buildifier_bin)",
+        "--shellcheck=$(rootpath :shellcheck_bin)",
+        "--yaml-check=$(rootpath :yaml_check)",
+        "--markdown-check=$(rootpath :markdown_check)",
+    ],
+    data = [
+        ":buildifier_bin",
+        ":markdown_check",
+        ":shellcheck_bin",
+        ":yaml_check",
+        "@cppcheck",
+        "@cppcheck//:cfg",
+    ],
+)

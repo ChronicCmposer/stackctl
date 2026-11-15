@@ -1,0 +1,44 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# `stackctl refresh-ami` — resolve SSM AMI floats and dual-write the pinned
+# AMI ids into the local .env and its committed .env.example counterpart.
+cc_library(
+    name = "refresh_ami",
+    srcs = ["refresh_ami.c"],
+    hdrs = [
+        "refresh_ami.h",
+        "refresh_ami_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/aws",
+        "//core/cli/common:cli",
+        "//core/config",
+        "//core/ssm",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "refresh_ami_test",
+    srcs = ["refresh_ami_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":refresh_ami"],
+)

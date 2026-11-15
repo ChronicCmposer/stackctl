@@ -1,0 +1,62 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# Namecheap dynamic-DNS updater + public-IP echo (spec §5.7).
+#
+# Layering: :ddns_core holds all protocol logic (URL construction, XML parsing,
+# redaction, echo parsing) with no network dependency; :ddns adds the libcurl
+# transport seam. Keeping the core curl-free lets the unit tests stay hermetic
+# and link-free even while the vendored curl/mbedTLS consumer link is being
+# repaired in third_party (see the run's orchestrator escalation).
+cc_library(
+    name = "ddns_core",
+    srcs = ["ddns.c"],
+    hdrs = [
+        "ddns.h",
+        "ddns_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+# libcurl-backed transport; one of the few sanctioned network users.
+cc_library(
+    name = "ddns",
+    srcs = ["ddns_curl.c"],
+    hdrs = [
+        "ddns.h",
+        "ddns_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":ddns_core",
+        "@curl",
+    ],
+)
+
+cc_test(
+    name = "ddns_test",
+    srcs = ["ddns_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":ddns_core"],
+)

@@ -1,0 +1,52 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# `stackctl deploy` — provenance/freshness gates, S3 release publish/verify,
+# infra stack change set and release recording (spec §4 deploy, §7).
+cc_library(
+    name = "deploy",
+    srcs = ["deploy.c"],
+    hdrs = [
+        "deploy.h",
+        "deploy_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/aws",
+        "//core/cfn",
+        "//core/cli/common:cli",
+        "//core/config",
+        "//core/crypto",
+        "//core/ec2",
+        "//core/iam",
+        "//core/s3",
+        "//core/ssm",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "deploy_test",
+    srcs = ["deploy_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":deploy",
+        "@yyjson",
+    ],
+)

@@ -1,0 +1,168 @@
+# BUILD file applied to the @mbedtls external repo (Mbed TLS 4.1.1 official
+# release tarball, pinned in MODULE.bazel). The tarball embeds TF-PSA-Crypto
+# 1.1.1 under tf-psa-crypto/ and ships every generated library source
+# (error.c, version_features.c, ssl_debug_helpers_generated.c), so a
+# library-only build needs just a C compiler + archiver + shell (GEN_FILES=OFF).
+#
+# Three cc_library targets mirror the upstream split (spec §11):
+#   :tfpsacrypto  tf-psa-crypto core/extras/platform/utilities + builtin,
+#                 everest and p256-m drivers  (the PSA crypto core)
+#   :mbedx509     library/x509* + pkcs7 + error + mbedtls_config (X.509)
+#   :mbedtls      library/ssl_* + timing + version (+ debug/mps/net_sockets)
+# Link order for curl: mbedtls -> mbedx509 -> tfpsacrypto (encoded via deps).
+#
+# The minimal client profile is supplied by the hand-written config files in
+# //third_party/mbedtls/configs/ and injected through the :config cc_library
+# (its include path is exported by deps). The mbedtls-framework subtree and the
+# post-quantum pqcp driver are deliberately excluded from srcs.
+#
+# Compiled statically against musl by the hermetic zig toolchain. These targets
+# build vendored upstream sources, so they keep -std=gnu11; the C23 requirement
+# (CONTRACT Amendment 1) applies only to stackctl-authored translation units.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Same source set upstream builds for the TF-PSA-Crypto library.
+_TFPSACRYPTO_SRCS = (
+    glob(["tf-psa-crypto/core/*.c"]) +
+    glob(["tf-psa-crypto/extras/*.c"]) +
+    glob(["tf-psa-crypto/platform/*.c"]) +
+    glob(["tf-psa-crypto/utilities/*.c"]) +
+    glob(["tf-psa-crypto/drivers/builtin/src/*.c"]) +
+    [
+        "tf-psa-crypto/drivers/everest/library/x25519.c",
+        "tf-psa-crypto/drivers/everest/library/Hacl_Curve25519_joined.c",
+        "tf-psa-crypto/drivers/p256-m/p256-m_driver_entrypoints.c",
+        "tf-psa-crypto/drivers/p256-m/p256-m/p256-m.c",
+    ]
+)
+
+_TFPSACRYPTO_HDRS = (
+    glob(["tf-psa-crypto/include/**/*.h"]) +
+    glob(["tf-psa-crypto/core/*.h"]) +
+    glob(["tf-psa-crypto/dispatch/*.h"]) +
+    glob(["tf-psa-crypto/extras/*.h"]) +
+    glob(["tf-psa-crypto/platform/*.h"]) +
+    glob(["tf-psa-crypto/utilities/*.h"]) +
+    glob(["tf-psa-crypto/drivers/builtin/include/**/*.h"]) +
+    glob(["tf-psa-crypto/drivers/builtin/src/*.h"]) +
+    glob(["tf-psa-crypto/drivers/everest/include/**/*.h"]) +
+    glob(["tf-psa-crypto/drivers/p256-m/**/*.h"])
+)
+
+cc_library(
+    name = "tfpsacrypto",
+    srcs = _TFPSACRYPTO_SRCS,
+    hdrs = _TFPSACRYPTO_HDRS,
+    copts = [
+        "-std=gnu11",
+        "-Wno-error",
+    ],
+    defines = [
+        # Inject the stackctl minimal configs (from @stackctl//third_party/mbedtls:config).
+        # The escaped quotes survive Bazel's define tokenizer and reach the
+        # compiler as C string literals.
+        "MBEDTLS_CONFIG_FILE=\\\"configs/mbedtls_config.h\\\"",
+        "TF_PSA_CRYPTO_CONFIG_FILE=\\\"configs/crypto_config.h\\\"",
+    ],
+    includes = [
+        "tf-psa-crypto/include",
+        "tf-psa-crypto/core",
+        "tf-psa-crypto/dispatch",
+        "tf-psa-crypto/extras",
+        "tf-psa-crypto/platform",
+        "tf-psa-crypto/utilities",
+        "tf-psa-crypto/drivers/builtin/include",
+        "tf-psa-crypto/drivers/builtin/src",
+        "tf-psa-crypto/drivers/everest/include",
+        "tf-psa-crypto/drivers/everest/include/tf-psa-crypto/private/everest",
+        "tf-psa-crypto/drivers/everest/include/tf-psa-crypto/private/everest/kremlib",
+        "tf-psa-crypto/drivers/p256-m",
+        "tf-psa-crypto/drivers/p256-m/p256-m",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    deps = ["@stackctl//third_party/mbedtls:config"],
+)
+
+cc_library(
+    name = "mbedx509",
+    srcs = [
+        "library/error.c",
+        "library/mbedtls_config.c",
+        "library/pkcs7.c",
+        "library/x509.c",
+        "library/x509_create.c",
+        "library/x509_crl.c",
+        "library/x509_crt.c",
+        "library/x509_csr.c",
+        "library/x509_oid.c",
+        "library/x509write.c",
+        "library/x509write_crt.c",
+        "library/x509write_csr.c",
+    ],
+    hdrs = (
+        glob(["include/mbedtls/*.h"]) +
+        glob(["include/mbedtls/private/*.h"]) +
+        glob(["library/*.h"])
+    ),
+    copts = [
+        "-std=gnu11",
+        "-Wno-error",
+    ],
+    includes = [
+        "include",
+        "library",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    deps = [":tfpsacrypto"],
+)
+
+cc_library(
+    name = "mbedtls",
+    srcs = [
+        "library/debug.c",
+        "library/mps_reader.c",
+        "library/mps_trace.c",
+        "library/net_sockets.c",
+        "library/ssl_cache.c",
+        "library/ssl_ciphersuites.c",
+        "library/ssl_client.c",
+        "library/ssl_cookie.c",
+        "library/ssl_debug_helpers_generated.c",
+        "library/ssl_msg.c",
+        "library/ssl_ticket.c",
+        "library/ssl_tls.c",
+        "library/ssl_tls12_client.c",
+        "library/ssl_tls12_server.c",
+        "library/ssl_tls13_client.c",
+        "library/ssl_tls13_generic.c",
+        "library/ssl_tls13_keys.c",
+        "library/ssl_tls13_server.c",
+        "library/timing.c",
+        "library/version.c",
+        "library/version_features.c",
+    ],
+    hdrs = (
+        glob(["include/mbedtls/*.h"]) +
+        glob(["include/mbedtls/private/*.h"]) +
+        glob(["library/*.h"])
+    ),
+    copts = [
+        "-std=gnu11",
+        "-Wno-error",
+    ],
+    includes = [
+        "include",
+        "library",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    deps = [
+        ":mbedx509",
+        ":tfpsacrypto",
+    ],
+)

@@ -1,0 +1,11 @@
+# In-repo package marker for the vendored c-ares sources.
+#
+# BUILD.cares is the build file applied to the @cares external repo
+# (build_file = "//third_party/cares:BUILD.cares" in MODULE.bazel);
+# cares_linux_ares_config.patch supplies the generated ares_config.h the
+# release tarball does not ship. No in-repo targets live here.
+
+exports_files([
+    "BUILD.cares",
+    "cares_linux_ares_config.patch",
+])

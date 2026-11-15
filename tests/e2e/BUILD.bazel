@@ -1,0 +1,53 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+# End-to-end verb integration tests over hermetic fake services (spec §10).
+#
+# `lifecycle_test` composes launch -> status -> start/stop -> terminate against
+# one shared fake world and a real on-disk state/known-hosts store.
+# `stack_test` drives provision, deploy and refresh-ami through their internal
+# verb bodies (`provision_run`, `deploy_run`, `refresh_ami_execute`) with
+# injected seams and real temp config files.
+
+common_copts = [
+    "-std=gnu23",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+]
+
+cc_test(
+    name = "lifecycle_test",
+    srcs = ["lifecycle_test.c"],
+    copts = common_copts,
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        "//core/cli/launch",
+        "//core/cli/launch/common:instance_common",
+        "//core/cli/startstop",
+        "//core/cli/status",
+        "//core/cli/terminate",
+        "//core/crypto",
+        "//core/knownhosts",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "stack_test",
+    srcs = ["stack_test.c"],
+    copts = common_copts,
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        "//core/cli/common:cli",
+        "//core/cli/deploy",
+        "//core/cli/provision",
+        "//core/cli/refresh_ami",
+        "//core/config",
+        "//core/state",
+    ],
+)

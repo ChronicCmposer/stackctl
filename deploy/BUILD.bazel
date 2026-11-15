@@ -1,0 +1,17 @@
+# Deployment assets for stackctl (CONTRACT lane w2-templates).
+#
+# `bazel test //deploy/...` runs the structural CFN checker over the canonical
+# templates and the negative fixtures; `bazel run //deploy/check:template_check`
+# is the same checker as a standalone gate for TEMPLATE_OVERRIDE files.
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files([
+    "stackctl-infra.yaml",
+    "stackctl-operator.yaml",
+])
+
+test_suite(
+    name = "template_checks",
+    tests = ["//deploy/check:template_check_test"],
+)

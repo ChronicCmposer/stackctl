@@ -1,0 +1,108 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# core/aws — the single AWS-API seam (spec §5, CONTRACT §core/aws/aws.h).
+#
+# Split into a curl-free core (credentials, URL/retry policy, response helpers,
+# waiters) and a transport layer so pure unit tests never link libcurl, plus the
+# public `aws` library that composes both for cfn/ec2/s3/ssm.
+cc_library(
+    name = "aws_core",
+    srcs = [
+        "aws.c",
+        "ini_read.c",
+        "request.c",
+        "resp.c",
+        "wait.c",
+    ],
+    hdrs = [
+        "aws.h",
+        "aws_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    deps = [
+        "//core/crypto",
+        "@yyjson",
+    ],
+)
+
+# Public interface: core + libcurl transport + SigV4 signing.
+cc_library(
+    name = "aws",
+    srcs = ["http.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":aws_core",
+        "@curl",
+    ],
+)
+
+cc_test(
+    name = "aws_test",
+    srcs = ["aws_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":aws_core",
+        "//core/ini",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "retry_test",
+    srcs = ["retry_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":aws_core",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "request_test",
+    srcs = ["request_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":aws",
+        "@yyjson",
+    ],
+)

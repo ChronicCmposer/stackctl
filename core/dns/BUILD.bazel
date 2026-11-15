@@ -1,0 +1,75 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+_COMMON_COPTS = [
+    "-std=gnu23",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+]
+
+# Wire-format helpers over vendored c-ares: query construction and reply
+# parsing (spec §5.7). No sockets, so tests drive them with synthetic replies.
+cc_library(
+    name = "dns_wire",
+    srcs = ["dns_wire.c"],
+    hdrs = [
+        "dns_internal.h",
+        "dns_wire.h",
+    ],
+    copts = _COMMON_COPTS,
+    linkstatic = True,
+    # c-ares marks its stable callback/parse APIs deprecated in favour of the
+    # newer DNS-record API; suppress the attribute for this module only.
+    local_defines = ["CARES_NO_DEPRECATED"],
+    visibility = ["//visibility:public"],
+    deps = ["@cares"],
+)
+
+# Protocol-independent behaviour: FQDN construction, authoritative-NS
+# iteration, parked detection. No network dependency; the public wrappers call
+# dns_cares_ops(), supplied by :dns in production and by the test binary in
+# tests (same seam pattern as :ddns_core/:ddns).
+cc_library(
+    name = "dns_core",
+    srcs = ["dns.c"],
+    hdrs = [
+        "dns.h",
+        "dns_internal.h",
+    ],
+    copts = _COMMON_COPTS,
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+# c-ares-backed production resolver; the only c-ares network user in the tree.
+cc_library(
+    name = "dns",
+    srcs = ["dns_cares.c"],
+    hdrs = [
+        "dns.h",
+        "dns_internal.h",
+        "dns_wire.h",
+    ],
+    copts = _COMMON_COPTS,
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    local_defines = ["CARES_NO_DEPRECATED"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":dns_core",
+        ":dns_wire",
+        "@cares",
+    ],
+)
+
+cc_test(
+    name = "dns_test",
+    srcs = ["dns_test.c"],
+    copts = _COMMON_COPTS,
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":dns_core",
+        ":dns_wire",
+    ],
+)

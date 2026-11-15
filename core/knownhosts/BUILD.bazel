@@ -1,0 +1,31 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# Pure-C dedicated known-hosts store keyed by HostKeyAlias=instance-id.
+# No network, no third-party deps.
+cc_library(
+    name = "knownhosts",
+    srcs = ["knownhosts.c"],
+    hdrs = ["knownhosts.h"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "knownhosts_test",
+    srcs = ["knownhosts_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":knownhosts"],
+)

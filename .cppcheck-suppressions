@@ -1,0 +1,6 @@
+# cppcheck suppressions for stackctl (passed via --inline-suppr results only).
+#
+# The lint gate runs cppcheck with --enable=warning,performance,portability and
+# --suppress=missingIncludeSystem (vendored/system headers live in Bazel external
+# repositories). Add a suppression here only with a comment explaining why.
+missingIncludeSystem

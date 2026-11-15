@@ -1,0 +1,49 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# `stackctl status` — read-only, lockless reporting (spec §4 status).
+cc_library(
+    name = "status",
+    srcs = ["status.c"],
+    hdrs = [
+        "status.h",
+        "status_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/cfn",
+        "//core/cli/common:cli",
+        "//core/cli/launch/common:instance_common",
+        "//core/ec2",
+        "//core/s3",
+        "//core/ssm",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "status_test",
+    srcs = ["status_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":status",
+        "@yyjson",
+    ],
+)

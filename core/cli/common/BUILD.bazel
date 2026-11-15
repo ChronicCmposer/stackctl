@@ -1,0 +1,77 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# core/cli common substrate: global/verb argument parsing, context construction,
+# output/table/JSON helpers, confirmation, redaction, usage rendering and
+# signal policy. The frozen public header lives at core/cli/cli.h (a source file
+# of the repository-root package, which has no intervening BUILD file).
+cc_library(
+    name = "cli",
+    srcs = glob(
+        ["*.c"],
+        exclude = ["*_test.c"],
+    ),
+    hdrs = ["cli.h"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    strip_include_prefix = ".",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//core/config",
+        "//core/state",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "cli_args_test",
+    srcs = ["cli_args_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":cli"],
+)
+
+cc_test(
+    name = "cli_output_test",
+    srcs = ["cli_output_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":cli",
+        "@yyjson",
+    ],
+)
+
+cc_test(
+    name = "cli_ctx_test",
+    srcs = ["cli_ctx_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":cli"],
+)

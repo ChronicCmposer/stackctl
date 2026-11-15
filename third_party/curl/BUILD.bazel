@@ -1,0 +1,7 @@
+# In-repo package marker for the vendored libcurl sources.
+#
+# BUILD.curl is the build file applied to the @curl external repo
+# (build_file = "//third_party/curl:BUILD.curl" in MODULE.bazel). No in-repo
+# targets live here; consumers link @curl//:curl.
+
+exports_files(["BUILD.curl"])

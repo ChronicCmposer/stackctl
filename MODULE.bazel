@@ -1,0 +1,144 @@
+"""stackctl — bzlmod-only build module (Bazel 9.x).
+
+All third-party C dependencies are vendored as sha256-pinned http_archives and
+built from source with the hermetic zig cc musl toolchain. See
+/var/lib/opencode/dev/designs/stackctl.md §5.1 and §11.
+"""
+
+module(
+    name = "stackctl",
+    version = "0.1.0",
+)
+
+# The module version above duplicates the committed VERSION file: bzlmod cannot
+# read a workspace file while evaluating MODULE.bazel. Keep the two in lockstep;
+# the hermetic //:version_consistency_test target fails `bazel test //...` when
+# they drift.
+
+# --- language / toolchain --------------------------------------------------
+# rules_cc is pinned to 0.2.28 (hermetic_cc_toolchain 4.3.0 requires >= 0.2.14;
+# declaring it keeps --check_direct_dependencies happy).
+bazel_dep(name = "rules_cc", version = "0.2.28")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+
+# bazel_skylib supplies `write_file`, a rule that emits a file with Bazel's
+# Starlark FileWriteAction (no shell, no host `cat`/`chmod`). The root
+# //:version_consistency_test uses it to materialize its check script
+# hermetically (CONTRACT Amendment 4). The version matches rules_shell's own
+# requirement, so it adds no extra fetch.
+bazel_dep(name = "bazel_skylib", version = "1.6.1")
+
+# Constraint values used by the per-architecture lint-tool selects in
+# //tools/lint:BUILD.bazel (@platforms//cpu:x86_64 / aarch64).
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# Hermetic musl C toolchain (zig cc 0.15.2), Linux amd64 + arm64 only.
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.3.0")
+
+toolchains = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
+use_repo(toolchains, "zig_sdk")
+
+# Both musl target toolchains are registered; the target platform selects the
+# arch. w5-build finalizes the per-arch build flags/configs.
+register_toolchains(
+    "@zig_sdk//toolchain:linux_amd64_musl",
+    "@zig_sdk//toolchain:linux_arm64_musl",
+    "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
+    "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
+)
+
+# --- vendored C dependencies ----------------------------------------------
+http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+# libcurl 8.23.0 (2026-10-14 release) — HTTP transport; TLS backend mbedTLS.
+http_archive(
+    name = "curl",
+    build_file = "//third_party/curl:BUILD.curl",
+    sha256 = "e3de77cfa6367083c776a26647fc9f633b538c06c3baa73d931a252ac8f72b49",
+    strip_prefix = "curl-8.23.0",
+    urls = ["https://github.com/curl/curl/releases/download/curl-8_23_0/curl-8.23.0.tar.gz"],
+)
+
+# mbedTLS 4.1.1 LTS — official release tarball (embeds TF-PSA-Crypto 1.1.1 and
+# all generated library sources). NEVER the git tag.
+http_archive(
+    name = "mbedtls",
+    build_file = "//third_party/mbedtls:BUILD.mbedtls",
+    sha256 = "3359a349e23db3d5536fcee032ae7b2ecbfc08972fab643089b5cbf2a375c98c",
+    strip_prefix = "mbedtls-4.1.1",
+    urls = ["https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-4.1.1/mbedtls-4.1.1.tar.bz2"],
+)
+
+# yyjson 0.13.0 — single-file JSON (src/yyjson.c + src/yyjson.h in the archive).
+http_archive(
+    name = "yyjson",
+    build_file = "//third_party/yyjson:BUILD.yyjson",
+    sha256 = "34e0f62a2bc11ab20d601e8ca1cc2b2079503aa45119a19133d89d19b94a0fae",
+    strip_prefix = "yyjson-0.13.0",
+    urls = ["https://github.com/ibireme/yyjson/archive/refs/tags/0.13.0.tar.gz"],
+)
+
+# c-ares 1.34.9 — vendored DNS client used directly by the dns module (not as
+# curl's resolver). The release tarball ships no generated ares_config.h, so a
+# committed Linux config is patched into src/lib/ (same approach as strimserver
+# tools/ddns).
+http_archive(
+    name = "cares",
+    build_file = "//third_party/cares:BUILD.cares",
+    patch_strip = 1,
+    patches = ["//third_party/cares:cares_linux_ares_config.patch"],
+    sha256 = "9364b70a12eb59a06830fb488d9357f90100dff0d98b23ea3593a183d43e6f2f",
+    strip_prefix = "c-ares-1.34.9",
+    urls = ["https://github.com/c-ares/c-ares/releases/download/v1.34.9/c-ares-1.34.9.tar.gz"],
+)
+
+# --- hermetic lint toolchain (Amendment 4) --------------------------------
+# Every lint tool is fetched and invoked through Bazel; none is host-installed.
+# Pin updates are an orchestrator/operator action (see CONTRACT Amendment 4).
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+# Prebuilt static Go binaries for both supported Linux architectures. The CPU
+# select lives in //tools/lint:BUILD.bazel; both artifacts are pinned here so
+# lint-starlark works unchanged on amd64 and arm64 hosts.
+http_file(
+    name = "buildifier_amd64",
+    downloaded_file_path = "buildifier",
+    sha256 = "470844069d710d0b7740e55007071c63e4d00be89a833dce5d1a91790e84dc28",
+    urls = ["https://github.com/bazel-contrib/buildtools/releases/download/v10.2.0/buildifier-linux-amd64"],
+)
+
+http_file(
+    name = "buildifier_arm64",
+    downloaded_file_path = "buildifier",
+    sha256 = "e33b41bdb36eca5dfa69647333f4f148272654b98cddcea12f38fac5ec0a00ff",
+    urls = ["https://github.com/bazel-contrib/buildtools/releases/download/v10.2.0/buildifier-linux-arm64"],
+)
+
+# Statically linked shellcheck releases (linux x86_64/aarch64 musl + glibc) for
+# both supported architectures. The CPU select lives in //tools/lint:BUILD.bazel.
+http_archive(
+    name = "shellcheck_amd64",
+    build_file = "//third_party/lint:BUILD.shellcheck",
+    sha256 = "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198",
+    strip_prefix = "shellcheck-v0.11.0",
+    urls = ["https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz"],
+)
+
+http_archive(
+    name = "shellcheck_arm64",
+    build_file = "//third_party/lint:BUILD.shellcheck",
+    sha256 = "12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588",
+    strip_prefix = "shellcheck-v0.11.0",
+    urls = ["https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.aarch64.tar.xz"],
+)
+
+# cppcheck is built from source with the hermetic zig-cc C++ toolchain because
+# upstream publishes no Linux binary. cfg/ is compiled into the lint target's
+# runfiles for future --data-dir use.
+http_archive(
+    name = "cppcheck",
+    build_file = "//third_party/lint:BUILD.cppcheck",
+    sha256 = "d74945deb2d50393430e07596b766f8a779512c7f60dac2a30ea64e059ece57b",
+    strip_prefix = "cppcheck-2.22.0",
+    urls = ["https://downloads.sourceforge.net/project/cppcheck/cppcheck/2.22/cppcheck-2.22.0.tar.gz"],
+)

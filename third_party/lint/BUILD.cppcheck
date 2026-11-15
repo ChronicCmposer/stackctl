@@ -1,0 +1,56 @@
+# Overlay that builds cppcheck from its pinned release source tree.
+#
+# MODULE.bazel fetches the cppcheck 2.22.0 release tarball (sha256-pinned) as
+# http_archive name = "cppcheck". This build file compiles the CLI front end and
+# the analyzer library with the repository's hermetic zig-cc C++ toolchain, so
+# cppcheck itself never depends on a host-installed compiler or cppcheck.
+#
+# Notes:
+#   - `cfg/` (library definitions) is exported as a filegroup but cppcheck is
+#     invoked without a --data-dir; the built-in checks used by tools/lint do not
+#     require the library database.
+#   - HAVE_EXECINFO_H=0: the musl hermetic target has no <execinfo.h>; cppcheck
+#     only uses it for its optional crash backtrace.
+
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_binary(
+    name = "cppcheck",
+    srcs = glob([
+        "cli/*.cpp",
+        "cli/*.h",
+        "frontend/*.cpp",
+        "frontend/*.h",
+        "lib/*.cpp",
+        "lib/*.h",
+        "externals/simplecpp/*.cpp",
+        "externals/picojson/*.h",
+        "externals/simplecpp/*.h",
+        "externals/tinyxml2/*.cpp",
+        "externals/tinyxml2/*.h",
+    ]),
+    copts = [
+        "-std=c++17",
+        "-DNDEBUG",
+        "-DHAVE_EXECINFO_H=0",
+        "-w",
+    ],
+    includes = [
+        "cli",
+        "externals",
+        "externals/picojson",
+        "externals/simplecpp",
+        "externals/tinyxml2",
+        "frontend",
+        "lib",
+    ],
+    linkstatic = True,
+    linkopts = ["-pthread"],
+)
+
+filegroup(
+    name = "cfg",
+    srcs = glob(["cfg/*.cfg"]),
+)

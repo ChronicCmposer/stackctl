@@ -1,0 +1,51 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+# Contract tests: frozen exit-code table, secret redaction, config validation,
+# known-hosts binding semantics and the network-seam link check (spec §10).
+
+cc_test(
+    name = "contract_test",
+    srcs = ["contract_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        "//core/cli/common:cli",
+        "//core/config",
+        "//core/knownhosts",
+        "//core/state",
+    ],
+)
+
+cc_test(
+    name = "network_seam_test",
+    srcs = ["network_seam_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        "//core/cfn",
+        "//core/cli/common:cli",
+        "//core/config",
+        "//core/crypto",
+        "//core/ec2",
+        "//core/ini",
+        "//core/knownhosts",
+        "//core/s3",
+        "//core/ssm",
+        "//core/state",
+        "@yyjson",
+    ],
+)

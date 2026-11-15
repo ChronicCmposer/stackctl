@@ -1,0 +1,16 @@
+{
+  "MD013": {
+    "line_length": 120,
+    "code_blocks": false,
+    "tables": false
+  },
+  "MD009": {
+    "br_spaces": 2,
+    "strict": false
+  },
+  "MD010": true,
+  "MD003": {
+    "style": "atx"
+  },
+  "MD041": false
+}

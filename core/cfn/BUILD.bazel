@@ -1,0 +1,38 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# core/cfn — CloudFormation request builders + response parsers over core/aws.
+# All calls use the AWS Query protocol (form-encoded POST, XML responses).
+cc_library(
+    name = "cfn",
+    srcs = ["cfn.c"],
+    hdrs = [
+        "cfn.h",
+        "cfn_internal.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    includes = ["."],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = ["//core/aws"],
+)
+
+cc_test(
+    name = "cfn_test",
+    srcs = ["cfn_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":cfn"],
+)

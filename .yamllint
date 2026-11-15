@@ -1,0 +1,18 @@
+# yamllint-compatible defaults for stackctl.
+#
+# tools/lint/yaml_check.c enforces the conservative subset below without a
+# Python toolchain: LF endings, no tab indentation, no trailing whitespace, and
+# a final newline. CFN templates additionally get the deploy/ structural checker
+# once wave 2 lands.
+extends: default
+
+rules:
+  line-length:
+    max: 120
+    allow-non-breakable-words: true
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+  trailing-spaces: enable
+  new-line-at-end-of-file: enable
+  key-duplicates: enable

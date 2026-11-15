@@ -1,0 +1,27 @@
+# BUILD file applied to the @yyjson external repo (yyjson 0.13.0 source, pinned
+# in MODULE.bazel). yyjson ships a single amalgamated src/yyjson.c + src/yyjson.h
+# pair in the release archive; expose them as one static cc_library.
+#
+# Consumers get `#include "yyjson.h"` via includes = ["src"]. yyjson is portable
+# C11; this target is vendored upstream code, so it keeps -std=gnu11 (the C23
+# requirement, CONTRACT Amendment 1, applies only to stackctl-authored code).
+# The FP-conversion and non-standard-JSON paths are disabled to cut binary size
+# and attack surface: stackctl's JSON is integer/string/bool only.
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "yyjson",
+    srcs = ["src/yyjson.c"],
+    hdrs = ["src/yyjson.h"],
+    copts = [
+        "-std=gnu11",
+        "-DYYJSON_DISABLE_FAST_FP_CONV=1",
+        "-DYYJSON_DISABLE_NON_STANDARD=1",
+    ],
+    includes = ["src"],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+)

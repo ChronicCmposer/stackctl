@@ -1,0 +1,74 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+
+# Wave-5 CLI wiring: the dispatch library, its tests, and the `stackctl`
+# binary target. `core/main.c` lives in the repository-root package (no BUILD
+# file intervenes), so the binary references it by source-file label without
+# writing outside this lane's globs. The root BUILD is owned by w5-build; a
+# coordination note keeps that lane from declaring a duplicate binary.
+package(default_visibility = ["//visibility:public"])
+
+cc_library(
+    name = "dispatch",
+    srcs = ["dispatch.c"],
+    hdrs = ["dispatch.h"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    strip_include_prefix = ".",
+    deps = [
+        "//core/cli/common:cli",
+        "//core/cli/deploy",
+        "//core/cli/launch",
+        "//core/cli/provision",
+        "//core/cli/refresh_ami",
+        "//core/cli/startstop",
+        "//core/cli/status",
+        "//core/cli/terminate",
+    ],
+)
+
+cc_test(
+    name = "dispatch_test",
+    srcs = ["dispatch_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    features = ["-supports_dynamic_linker"],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [
+        ":dispatch",
+        "//core/cli/common:cli",
+    ],
+)
+
+cc_binary(
+    name = "stackctl",
+    srcs = ["//:core/main.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    data = ["//:VERSION"],
+    features = ["-supports_dynamic_linker"],
+    linkstatic = True,
+    deps = [":dispatch"],
+)
+
+sh_test(
+    name = "cli_invocation_test",
+    srcs = ["cli_invocation_test.sh"],
+    args = ["$(rootpath :stackctl)"],
+    data = [":stackctl"],
+)

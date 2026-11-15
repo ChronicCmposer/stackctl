@@ -1,0 +1,37 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# Pure-C configuration module: flat .env parsing + fail-closed validation.
+# No network, no third-party deps.
+cc_library(
+    name = "config",
+    srcs = [
+        "config.c",
+        "envfile.c",
+    ],
+    hdrs = [
+        "config.h",
+        "envfile.h",
+    ],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
+    name = "config_test",
+    srcs = ["config_test.c"],
+    copts = [
+        "-std=gnu23",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    linkopts = ["-static"],
+    linkstatic = True,
+    deps = [":config"],
+)

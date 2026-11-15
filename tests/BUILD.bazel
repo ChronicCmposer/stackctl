@@ -1,0 +1,16 @@
+# Integration and contract test suite (CONTRACT.md §tests/**, spec §10).
+#
+# Every target here is hermetic: no network, no AWS credentials, no live
+# SSH/DNS. CLI verbs are driven through their internal verb bodies / documented
+# test seams; AWS/DNS/SSH are always fakes.
+test_suite(
+    name = "tests",
+    tests = [
+        "//tests/cli:binary_verb_test",
+        "//tests/cli:cli_contract_test",
+        "//tests/contract:contract_test",
+        "//tests/contract:network_seam_test",
+        "//tests/e2e:lifecycle_test",
+        "//tests/e2e:stack_test",
+    ],
+)
