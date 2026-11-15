@@ -243,6 +243,24 @@ those values into a bundle member (for example `provenance.env`) and render it
 from `STACKCTL_*`. The member is sha-verified end to end, so the entrypoint no
 longer trusts a mutable stack parameter.
 
+## Upgrading to v0.1.2
+
+v0.1.2 lets the instance role read project-scoped SSM SecureStrings so on-box
+entrypoints can fetch secrets (for example the Twitch stream key for the
+strimserver pilot) at boot, without baking secrets into S3 bundles or copying
+them over SSH.
+
+- **Instance-role SSM read.** The canonical operator template's `InstanceRole`
+  now grants `ssm:GetParameter`/`ssm:GetParameters` on
+  `arn:aws:ssm:<region>:<account>:parameter/<project>/*` only. There is no
+  `ssm:PutParameter`, no region wildcard, and no wildcard resource. The grant is
+  applied on the next `provision`/`deploy` of the operator stack.
+- **Consumer action.** Re-copy the vendored canonical
+  `deploy/stackctl-operator.yaml` from the stackctl checkout at `v0.1.2` and
+  commit it; the next `provision` applies the updated instance role. Store any
+  on-box secrets yourself as SSM SecureStrings under `/<project>/<name>` (for
+  example `/strimserver/twitch/stream-key`); stackctl never writes SSM.
+
 ## Upgrading to v0.1.1
 
 v0.1.1 adds config keys and changes deployed AWS state on the next

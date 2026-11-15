@@ -213,6 +213,11 @@ Pre-create the Namecheap **A + Dynamic DNS Record** for `DDNS_HOST` on
 `DDNS_DOMAIN`. `launch` and `status` verify the record against the authoritative
 nameservers and exit 1 with the dashboard instruction when it is absent.
 
+On-box secrets (for example a stream key) are stored the same way: as SSM
+SecureStrings under `/<project>/<name>` and fetched by the setup entrypoint at
+boot. The instance role grants read on `/<project>/*` only, so store each secret
+under that prefix. stackctl never writes these parameters either.
+
 ## Step 4: vendor and check the canonical templates
 
 `provision` and `deploy` read the templates from **your repository** at

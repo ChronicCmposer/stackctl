@@ -72,6 +72,12 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/releases/*
+              - Sid: OnboxSecretRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
         - Fn::If:
             - CertBucketEnabledCondition
             - PolicyName: CertStorageAccess
