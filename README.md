@@ -107,6 +107,19 @@ bazel run //:stackctl -- --project deploy/aws launch
 bazel run //:stackctl -- --project deploy/aws status
 ```
 
+## Documentation
+
+Two maintainer-oriented guides complement this operator reference:
+
+- [Onboarding a new Bazel project](docs/onboarding.md) — add stackctl to a
+  greenfield repository: module dependency, wrapper target, configuration,
+  templates, provisioning, first release and first launch.
+- [Migrating from the `deploy/aws/` shell pipeline](docs/migration.md) — the
+  per-resource cutover plan for the shared predecessor, with the strimserver and
+  movienight appendices.
+
+Both guides are versioned and name the stackctl release they were tested against.
+
 ## Configuration
 
 ### Location, committed versus local
