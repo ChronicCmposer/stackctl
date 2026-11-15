@@ -35,12 +35,16 @@ static int g_remote_rc;
 static char g_argv[48][256];
 static size_t g_argv_count;
 static char pinned_id[64];
+static char identity_arn[256];
+static int identity_fail;
+static int g_describe_calls;
 
 static int fake_describe(ec2_client *client, const ec2_filter *filters,
                          size_t filter_count, ec2_instance_list *out) {
     (void)client;
     (void)filters;
     (void)filter_count;
+    g_describe_calls++;
     out->count = fixture_count;
     out->items = NULL;
     if (fixture_count > 0) {
@@ -74,6 +78,22 @@ static int fake_keyscan(const char *ip, int port, char **line) {
     }
     *line = strdup(g_key_line);
     return *line != NULL ? 0 : ENOMEM;
+}
+
+static int fake_identity(aws_ctx *ctx, char **account, char **arn,
+                         char **user_id) {
+    (void)ctx;
+    if (account != NULL) {
+        *account = NULL;
+    }
+    if (user_id != NULL) {
+        *user_id = NULL;
+    }
+    if (identity_fail) {
+        return EIO;
+    }
+    *arn = strdup(identity_arn);
+    return *arn != NULL ? 0 : ENOMEM;
 }
 
 static bool fake_kh_bound(const char *store, const char *id) {
@@ -120,6 +140,10 @@ static void reset_all(void) {
     memset(g_argv, 0, sizeof g_argv);
     g_argv_count = 0;
     memset(pinned_id, 0, sizeof pinned_id);
+    snprintf(identity_arn, sizeof identity_arn, "%s",
+             "arn:aws:iam::123456789012:user/demo");
+    identity_fail = 0;
+    g_describe_calls = 0;
 }
 
 static void add_instance(const char *id, const char *state, const char *ip) {
@@ -156,6 +180,7 @@ static void make_runtime(instance_runtime *rt, instance_services *svc) {
     svc->kh_bound = fake_kh_bound;
     svc->kh_pin = fake_kh_pin;
     svc->ssh_exec = fake_ssh;
+    svc->iam_get_caller_identity = fake_identity;
 
     instance_runtime_init(rt, &cfg, NULL, svc, 0, 0, 0);
     rt->out = tmpfile();
@@ -287,6 +312,25 @@ static void test_missing_service_unit_is_exit1(void) {
     free_runtime(&rt);
 }
 
+static void test_empty_operator_cidr_is_exit1_without_aws(void) {
+    instance_runtime rt;
+    instance_services svc;
+    startstop_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(rt.cfg.operator_cidr, sizeof rt.cfg.operator_cidr, "%s", "");
+    add_instance("i-1", "running", "203.0.113.9");
+
+    rc = startstop_execute(&rt, &opts, STARTSTOP_START);
+
+    CHECK(rc == CLI_EXIT_USAGE, "empty OPERATOR_CIDR is exit 1");
+    CHECK(g_describe_calls == 0,
+          "no AWS call when SSH is impossible (empty OPERATOR_CIDR)");
+    free_runtime(&rt);
+}
+
 static void test_unbound_reverifies_and_pins(void) {
     instance_runtime rt;
     instance_services svc;
@@ -397,18 +441,61 @@ static void test_explicit_id_must_be_tagged(void) {
     free_runtime(&rt);
 }
 
+
+static void test_identity_mismatch_is_exit3(void) {
+    instance_runtime rt;
+    instance_services svc;
+    startstop_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    add_instance("i-1", "running", "203.0.113.9");
+    g_bound = 1;
+    snprintf(identity_arn, sizeof identity_arn, "%s",
+             "arn:aws:iam::123456789012:user/other-project");
+
+    rc = startstop_execute(&rt, &opts, STARTSTOP_START);
+
+    CHECK(rc == CLI_EXIT_VERIFY, "identity mismatch is exit 3");
+    CHECK(g_argv_count == 0, "no systemctl ssh after an identity mismatch");
+    free_runtime(&rt);
+}
+
+static void test_identity_api_error_is_exit2(void) {
+    instance_runtime rt;
+    instance_services svc;
+    startstop_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    add_instance("i-1", "running", "203.0.113.9");
+    g_bound = 1;
+    identity_fail = 1;
+
+    rc = startstop_execute(&rt, &opts, STARTSTOP_STOP);
+
+    CHECK(rc == CLI_EXIT_AWS, "identity API error is exit 2");
+    CHECK(g_argv_count == 0, "no systemctl ssh when identity is unverifiable");
+    free_runtime(&rt);
+}
+
 int main(void) {
     test_start_bound();
     test_stop_command();
     test_zero_running_is_exit1();
     test_two_running_is_exit1();
     test_missing_service_unit_is_exit1();
+    test_empty_operator_cidr_is_exit1_without_aws();
     test_unbound_reverifies_and_pins();
     test_unbound_no_console_without_flag_is_exit7();
     test_unbound_topu_flag_pins();
     test_ssh_transport_failure_is_exit7();
     test_remote_failure_is_exit1();
     test_explicit_id_must_be_tagged();
+    test_identity_mismatch_is_exit3();
+    test_identity_api_error_is_exit2();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

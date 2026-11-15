@@ -10,6 +10,8 @@
 #include "refresh_ami.h"
 #include "refresh_ami_internal.h"
 
+#include "aws_internal.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -553,7 +555,140 @@ static void test_dual_write_example_failure_leaves_local(void) {
     fixture_clear_env();
 }
 
+/*
+ * A --project outside the conventional `<repo>/deploy/aws` must drive the
+ * dual-write: discovery follows config_dir(), never a re-guessed path. The
+ * decoy BUILD_WORKING_DIRECTORY has no deploy/aws, so the old heuristic would
+ * have failed to find any config at all.
+ */
+static void test_project_dir_follows_accessor(void) {
+    char root_template[] = "/tmp/stackctl-refresh-custom-XXXXXX";
+    char *root = mkdtemp(root_template);
+    char config_dir[PATH_MAX];
+    char decoy[PATH_MAX];
+    char marker[PATH_MAX];
+    char env_path[PATH_MAX];
+    char example_path[PATH_MAX];
+    char state_dir[PATH_MAX];
+    char text[4096];
+    cli_ctx *ctx = NULL;
+    fake_ssm fake = {.amd64 = "ami-newamd64"};
+    char *argv[6];
+    char *example;
+
+    CHECK(root != NULL, "custom project temp root");
+    if (root == NULL) {
+        return;
+    }
+    snprintf(config_dir, sizeof config_dir, "%s/custom/aws", root);
+    snprintf(decoy, sizeof decoy, "%s/decoy", root);
+    snprintf(state_dir, sizeof state_dir, "%s/state", root);
+    snprintf(marker, sizeof marker, "%s/MODULE.bazel", root);
+    snprintf(env_path, sizeof env_path, "%s/.env", config_dir);
+    snprintf(example_path, sizeof example_path, "%s/.env.example", config_dir);
+
+    mkdir_p(config_dir);
+    mkdir_p(decoy);
+    mkdir_p(state_dir);
+    write_text(marker, "");
+
+    snprintf(text, sizeof text,
+             "%sREGION=us-east-1\nAMI_POLICY=pinned\n"
+             "AMI_ID_AMD64=ami-oldamd64\nAMI_SSM_AMD64=/aws/service/ami/amd64\n",
+             base_keys);
+    write_text(env_path, text);
+    snprintf(text, sizeof text,
+             "%sREGION=us-east-1\nAMI_POLICY=pinned\n"
+             "AMI_ID_AMD64=ami-oldamd64\nAMI_SSM_AMD64=/aws/service/ami/amd64\n",
+             base_keys);
+    write_text(example_path, text);
+
+    CHECK(setenv("XDG_STATE_HOME", state_dir, 1) == 0, "custom state home");
+    CHECK(setenv("BUILD_WORKING_DIRECTORY", decoy, 1) == 0, "decoy build cwd");
+    refresh_ami_set_ops_for_test(&fake_ops, &fake);
+
+    argv[0] = "stackctl";
+    argv[1] = "--project";
+    argv[2] = config_dir;
+    argv[3] = "refresh-ami";
+    argv[4] = NULL;
+    CHECK(cli_ctx_init(4, argv, &ctx) == 0, "ctx for custom --project");
+    if (ctx != NULL) {
+        CHECK(cli_cmd_refresh_ami(ctx) == CLI_EXIT_OK,
+              "refresh-ami honours the --project config directory");
+        example = read_text(example_path);
+        CHECK(example != NULL && strstr(example, "ami-newamd64") != NULL,
+              ".env.example written next to the actual config dir");
+        free(example);
+        cli_ctx_free(ctx);
+    }
+
+    refresh_ami_set_ops_for_test(NULL, NULL);
+    unsetenv("BUILD_WORKING_DIRECTORY");
+    unsetenv("XDG_STATE_HOME");
+}
+
+static char *make_credentials_home(void) {
+    char *home = strdup("/tmp/stackctl-abort-XXXXXX");
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+    FILE *file;
+
+    if (home == NULL || mkdtemp(home) == NULL) {
+        perror("mkdtemp");
+        exit(2);
+    }
+    if (snprintf(dir, sizeof dir, "%s/.aws", home) >= (int)sizeof dir ||
+        mkdir(dir, 0700) != 0) {
+        perror("mkdir .aws");
+        exit(2);
+    }
+    if (snprintf(path, sizeof path, "%s/credentials", dir) >= (int)sizeof path) {
+        exit(2);
+    }
+    file = fopen(path, "w");
+    if (file == NULL) {
+        perror("fopen credentials");
+        exit(2);
+    }
+    fputs("[prod-abort]\n"
+          "aws_access_key_id = AKIAFAKEFAKEFAKEFAKE\n"
+          "aws_secret_access_key = fake-secret\n",
+          file);
+    if (fclose(file) != 0) {
+        exit(2);
+    }
+    return home;
+}
+
+static void test_prod_aws_init_installs_abort_hook(void) {
+    char *home = make_credentials_home();
+    const char *saved_home = getenv("HOME");
+    char *saved = saved_home != NULL ? strdup(saved_home) : NULL;
+    aws_ctx *aws = NULL;
+    int rc;
+
+    CHECK(setenv("HOME", home, 1) == 0, "HOME points at fake credentials");
+    rc = refresh_ami_prod_aws_init_for_test("prod-abort", &aws);
+    CHECK(rc == 0, "production aws_init succeeds");
+    if (rc == 0) {
+        CHECK(aws != NULL, "production aws_init returns a client");
+        CHECK(aws != NULL && aws->abort_fn == cli_abort_check,
+              "production aws_init installs the CLI abort hook");
+        CHECK(aws != NULL && aws->abort_ud == NULL,
+              "abort hook has no user data");
+    }
+    aws_free(aws);
+    if (saved != NULL) {
+        CHECK(setenv("HOME", saved, 1) == 0, "HOME restored");
+        free(saved);
+    } else {
+        unsetenv("HOME");
+    }
+}
+
 int main(void) {
+    test_prod_aws_init_installs_abort_hook();
     test_null_context();
     test_rejects_bad_flag();
     test_requires_pinned_policy();
@@ -566,6 +701,7 @@ int main(void) {
     test_symlink_preserved();
     test_region_variant_targets();
     test_ssm_failure_maps_to_aws();
+    test_project_dir_follows_accessor();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

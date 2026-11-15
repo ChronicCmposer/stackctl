@@ -29,6 +29,7 @@ cc_library(
         "//core/s3",
         "//core/ssm",
         "//core/state",
+        "//deploy/check:template_check_lib",
         "@yyjson",
     ],
 )
@@ -41,6 +42,10 @@ cc_test(
         "-Wall",
         "-Wextra",
         "-Werror",
+    ],
+    data = [
+        "//deploy:stackctl-infra.yaml",
+        "//deploy/check:testdata/bad_infra_bucket.yaml",
     ],
     features = ["-supports_dynamic_linker"],
     linkopts = ["-static"],

@@ -958,6 +958,8 @@ static const node *template_outputs(const node *root) {
     return map_get(root, "Outputs");
 }
 
+static int resource_is_type(const node *resource, const char *type);
+
 static void check_sections(checker *c, const node *root) {
     if (root == NULL || root->kind != NODE_MAP) {
         violation(c, "template root must be a mapping");
@@ -1222,6 +1224,103 @@ static void check_operator_s3_scope(checker *c, const node *n) {
     }
 }
 
+static int name_is_project_driven(const node *name) {
+    return name != NULL &&
+           (node_contains(name, "${ProjectName}") || node_references(name, "ProjectName"));
+}
+
+static int operator_policy_attached(const node *root, const char *user_id, const node *user) {
+    const node *properties = map_get(user, "Properties");
+    if (node_references(map_get(properties, "ManagedPolicyArns"), "OperatorPolicy")) {
+        return 1;
+    }
+    const node *policy = map_get(template_resources(root), "OperatorPolicy");
+    const node *policy_properties = map_get(policy, "Properties");
+    return node_references(map_get(policy_properties, "Users"), user_id);
+}
+
+/*
+ * Spec §3: the operator stack always creates the human/operator IAM user
+ * `<project>` (provision mints its key) and that user must carry the operator
+ * managed policy.  The CI user is conditional; the operator user is not.
+ */
+static void check_operator_user(checker *c, const node *root) {
+    const node *resources = template_resources(root);
+    if (resources == NULL || resources->kind != NODE_MAP) {
+        violation(c, "operator stack must create an operator IAM user");
+        return;
+    }
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const node *user = resources->pairs[i].value;
+        if (!resource_is_type(user, "AWS::IAM::User")) {
+            continue;
+        }
+        if (map_get(user, "Condition") != NULL) {
+            continue;
+        }
+        const node *properties = map_get(user, "Properties");
+        if (!name_is_project_driven(map_get(properties, "UserName"))) {
+            continue;
+        }
+        if (!operator_policy_attached(root, resources->pairs[i].key, user)) {
+            continue;
+        }
+        return;
+    }
+    violation(c, "operator stack must create an unconditional ProjectName-named IAM user "
+                 "attached to OperatorPolicy");
+}
+
+static int statement_allows_service(const node *statement, const char *service) {
+    if (statement == NULL || statement->kind != NODE_MAP) {
+        return 0;
+    }
+    if (!action_list_contains(map_get(statement, "Action"), "sts:AssumeRole")) {
+        return 0;
+    }
+    const node *services = map_get(map_get(statement, "Principal"), "Service");
+    for (size_t i = 0; i < scalar_count(services); i++) {
+        const node *entry = scalar_at(services, i);
+        if (entry != NULL && node_scalar_equals(entry, service)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int trust_allows_service(const node *statement, const char *service) {
+    if (statement == NULL) {
+        return 0;
+    }
+    if (statement->kind == NODE_SEQ) {
+        for (size_t i = 0; i < statement->nitems; i++) {
+            if (trust_allows_service(statement->items[i], service)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    return statement_allows_service(statement, service);
+}
+
+/*
+ * BakedAmiPublishRole is assumed by SSM Automation (EventBridge -> SSM
+ * Automation target), never by EC2 directly.  An EC2 trust principal here is
+ * silently unusable, so fail closed on anything but ssm.amazonaws.com.
+ */
+static void check_baked_ami_publish_role(checker *c, const node *root) {
+    const node *role = map_get(template_resources(root), "BakedAmiPublishRole");
+    if (role == NULL) {
+        violation(c, "missing BakedAmiPublishRole resource");
+        return;
+    }
+    const node *properties = map_get(role, "Properties");
+    const node *assume = map_get(properties, "AssumeRolePolicyDocument");
+    if (!trust_allows_service(map_get(assume, "Statement"), "ssm.amazonaws.com")) {
+        violation(c, "BakedAmiPublishRole must trust ssm.amazonaws.com (SSM Automation)");
+    }
+}
+
 static void check_operator(checker *c, const node *root) {
     check_required_params(c, root, OPERATOR_PARAMS,
                           sizeof(OPERATOR_PARAMS) / sizeof(OPERATOR_PARAMS[0]));
@@ -1285,6 +1384,8 @@ static void check_operator(checker *c, const node *root) {
     }
 
     check_operator_role_resources(c, root);
+    check_operator_user(c, root);
+    check_baked_ami_publish_role(c, root);
     check_operator_s3_scope(c, map_get(resources, "OperatorPolicy"));
 }
 
@@ -1306,6 +1407,7 @@ static const char *const INFRA_OUTPUTS[] = {
     "SecurityGroupId",
     "InstanceProfileName",
     "ArtifactBucketName",
+    "CertBucketName",
     "DdnsHost",
 };
 
@@ -1600,6 +1702,14 @@ int tc_check_string(const char *text, size_t length, tc_mode mode) {
         return 2;
     }
     return run_check("<string>", text, length, mode);
+}
+
+int tc_check_buffer(const char *path, const char *text, size_t length,
+                    tc_mode mode) {
+    if (text == NULL) {
+        return 2;
+    }
+    return run_check(path != NULL ? path : "<string>", text, length, mode);
 }
 
 int tc_check_file(const char *path, tc_mode mode) {

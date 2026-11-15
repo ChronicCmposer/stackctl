@@ -390,6 +390,24 @@ int cli_signal_received(void);
 /* The first observed signal number, or 0 when none. */
 int cli_signal_number(void);
 
+/*
+ * Abort callback for interruptible library waits (aws_abort_fn shape): returns
+ * non-zero once the first SIGINT/SIGTERM was recorded. `user` is unused.
+ *
+ * Verb layers install it on their AWS client with aws_set_abort_hook(), so
+ * cfn/ec2 waiters built on aws_wait() stop with EINTR instead of ignoring the
+ * signal until the operation completes.
+ */
+int cli_abort_check(void *user);
+
+/*
+ * Single-threaded test seams for the signal bookkeeping. Production signals
+ * reach the same state through on_signal(); these let the dispatch tests
+ * simulate "a signal was received" without raising one.
+ */
+void cli_signal_test_fire(int number);
+void cli_signal_test_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

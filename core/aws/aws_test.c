@@ -334,6 +334,18 @@ static int wait_fail_cb(aws_ctx *ctx, void *ud, int *done)
     return EIO;
 }
 
+typedef struct {
+    int calls;
+    int stop_at;
+} abort_state;
+
+static int abort_cb(void *ud)
+{
+    abort_state *st = ud;
+    st->calls++;
+    return st->calls >= st->stop_at;
+}
+
 static void test_wait(void)
 {
     wait_state st = {0, 3};
@@ -355,6 +367,41 @@ static void test_wait(void)
 
     CHECK(aws_wait(NULL, wait_cb, &st, 0, 0, &timed_out) == EINVAL,
           "attempts < 1 rejected");
+
+    /* Explicit abort hook: non-zero callback return stops the wait with EINTR. */
+    wait_state blocked = {0, 99};
+    abort_state abort = {0, 3};
+    timed_out = -1;
+    CHECK(aws_wait_interruptible(NULL, wait_cb, &blocked, abort_cb, &abort, 5,
+                                 0, &timed_out) == EINTR,
+          "abort hook maps to EINTR");
+    CHECK(abort.calls == 3, "abort polled once per iteration until it fires");
+    CHECK(blocked.calls == 2, "no poll after the abort fires");
+    CHECK(timed_out == 0, "abort is not a timeout");
+
+    /* NULL abort hook preserves the plain aws_wait() behaviour. */
+    wait_state plain = {0, 3};
+    timed_out = -1;
+    CHECK(aws_wait_interruptible(NULL, wait_cb, &plain, NULL, NULL, 5, 0,
+                                 &timed_out) == 0,
+          "NULL abort hook does not abort");
+    CHECK(plain.calls == 3, "NULL abort hook keeps polling semantics");
+    CHECK(timed_out == 0, "NULL abort hook success not timed out");
+
+    /* Default per-client hook makes plain aws_wait() interruptible. */
+    aws_ctx client = {0};
+    wait_state inherited = {0, 99};
+    abort_state client_abort = {0, 2};
+    aws_set_abort_hook(&client, abort_cb, &client_abort);
+    timed_out = -1;
+    CHECK(aws_wait(&client, wait_cb, &inherited, 5, 0, &timed_out) == EINTR,
+          "per-client abort hook interrupts aws_wait");
+    CHECK(inherited.calls == 1, "per-client abort hook fires mid-wait");
+    aws_set_abort_hook(&client, NULL, NULL);
+    wait_state restored = {0, 2};
+    timed_out = -1;
+    CHECK(aws_wait(&client, wait_cb, &restored, 5, 0, &timed_out) == 0,
+          "clearing the per-client hook restores waiting");
 }
 
 static void add_header(aws_resp *resp, const char *name, const char *value)

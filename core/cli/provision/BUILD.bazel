@@ -26,6 +26,7 @@ cc_library(
         "//core/iam",
         "//core/ini",
         "//core/state",
+        "//deploy/check:template_check_lib",
         "@yyjson",
     ],
 )
@@ -38,6 +39,9 @@ cc_test(
         "-Wall",
         "-Wextra",
         "-Werror",
+    ],
+    data = [
+        "//deploy:stackctl-operator.yaml",
     ],
     features = ["-supports_dynamic_linker"],
     linkopts = ["-static"],

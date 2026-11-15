@@ -18,6 +18,16 @@ extern "C" {
 
 typedef struct status_options {
     int reserved; /* no verb-specific options in v1 */
+    /*
+     * Preflight inputs supplied by the dispatcher-facing entry point. Tests may
+     * leave them NULL to skip the corresponding filesystem probe; production
+     * always sets both.
+     *
+     *   config_dir    resolved --project directory (repo-root discovery)
+     *   bazel_command configured BAZEL_COMMAND (existence check, never run)
+     */
+    const char *config_dir;
+    const char *bazel_command;
 } status_options;
 
 int status_execute(instance_runtime *rt, const status_options *opts);

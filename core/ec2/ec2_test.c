@@ -219,6 +219,12 @@ static void test_run_instances_on_demand(fake_transport *fake)
     CHECK(body_has(fake, "SecurityGroupId.1=sg-1"), "SecurityGroupId.1");
     CHECK(body_has(fake, "IamInstanceProfile.Name=proj-instance-profile"),
           "instance profile is wired by name");
+    CHECK(body_has(fake, "MetadataOptions.HttpEndpoint=enabled"),
+          "IMDSv2 endpoint is enabled");
+    CHECK(body_has(fake, "MetadataOptions.HttpTokens=required"),
+          "IMDSv2 tokens are required");
+    CHECK(body_has(fake, "MetadataOptions.HttpPutResponseHopLimit=2"),
+          "IMDSv2 hop limit is 2 for bridged containers");
     CHECK(body_has(fake, "BlockDeviceMapping.1.DeviceName=%2Fdev%2Fxvda"),
           "root device name is percent-encoded");
     CHECK(body_has(fake, "BlockDeviceMapping.1.Ebs.VolumeSize=100"),

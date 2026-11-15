@@ -359,11 +359,14 @@ static void test_context_success_and_locking(void) {
 
 static void test_signals(void) {
     cli_signal_install();
+    cli_signal_test_reset();
+    CHECK(cli_abort_check(NULL) == 0, "abort poll clear before signal");
     CHECK(cli_signal_received() == 0, "no signal yet");
     CHECK(cli_signal_number() == 0, "no signal number yet");
     CHECK(raise(SIGTERM) == 0, "raise SIGTERM");
     CHECK(cli_signal_received() == 1, "first signal recorded");
     CHECK(cli_signal_number() == SIGTERM, "signal number recorded");
+    CHECK(cli_abort_check(NULL) != 0, "abort poll fires after signal");
 }
 
 int main(void) {

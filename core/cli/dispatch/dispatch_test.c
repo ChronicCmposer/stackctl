@@ -11,6 +11,7 @@
 #include "dispatch.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -128,13 +129,38 @@ static void test_find(void) {
 }
 
 static void test_normalize_rc(void) {
-    for (int code = 0; code <= 7; code++) {
-        CHECK(cli_dispatch_normalize_rc(code) == code);
-    }
+    /*
+     * Every named frozen constant passes through unchanged. They are checked
+     * individually rather than as a 0..7 range so the accepted set is pinned to
+     * the CLI_EXIT_* enum. Note that the frozen values numerically overlap the
+     * first errno values (e.g. CLI_EXIT_FRESHNESS == ENXIO == 6); a verb that
+     * returned a raw errno would be indistinguishable here, which is why the
+     * contracted guard is the cli_cmd_* verb audit.
+     */
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_OK) == CLI_EXIT_OK);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_USAGE) == CLI_EXIT_USAGE);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_AWS) == CLI_EXIT_AWS);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_VERIFY) == CLI_EXIT_VERIFY);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_LAUNCH) == CLI_EXIT_LAUNCH);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_CLEANUP) == CLI_EXIT_CLEANUP);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_FRESHNESS) == CLI_EXIT_FRESHNESS);
+    CHECK(cli_dispatch_normalize_rc(CLI_EXIT_SSH) == CLI_EXIT_SSH);
+    /* Non-frozen errno-style values are classified by cli_rc_to_exit(). */
     CHECK(cli_dispatch_normalize_rc(EINVAL) == CLI_EXIT_USAGE);
     CHECK(cli_dispatch_normalize_rc(ENOMEM) == CLI_EXIT_USAGE);
+    CHECK(cli_dispatch_normalize_rc(EAGAIN) == CLI_EXIT_AWS);
     CHECK(cli_dispatch_normalize_rc(999) == CLI_EXIT_AWS);
     CHECK(cli_dispatch_normalize_rc(-EINVAL) == CLI_EXIT_USAGE);
+}
+
+static void test_verb_exit(void) {
+    cli_signal_test_reset();
+    CHECK(cli_dispatch_verb_exit(0) == CLI_EXIT_OK);
+    cli_signal_test_fire(SIGINT);
+    CHECK(cli_dispatch_verb_exit(0) == CLI_EXIT_AWS);
+    CHECK(cli_dispatch_verb_exit(CLI_EXIT_USAGE) == CLI_EXIT_USAGE);
+    cli_signal_test_reset();
+    CHECK(cli_dispatch_verb_exit(0) == CLI_EXIT_OK);
 }
 
 static void test_check_globals(void) {
@@ -515,6 +541,7 @@ int main(void) {
     test_table();
     test_find();
     test_normalize_rc();
+    test_verb_exit();
     test_check_globals();
     test_help();
     test_version();

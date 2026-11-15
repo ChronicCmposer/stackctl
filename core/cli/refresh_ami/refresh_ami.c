@@ -348,6 +348,22 @@ static int replace_key_line(const char *text, const char *key,
 /* Production SSM resolver                                                   */
 /* ------------------------------------------------------------------------- */
 
+static int production_aws_init(const char *profile, aws_ctx **out) {
+    int rc;
+
+    rc = aws_init(out, profile);
+    if (rc != 0) {
+        return rc;
+    }
+    aws_set_abort_hook(*out, cli_abort_check, NULL);
+    return 0;
+}
+
+/* Test-only entry point for the production init seam. */
+int refresh_ami_prod_aws_init_for_test(const char *profile, aws_ctx **out) {
+    return production_aws_init(profile, out);
+}
+
 static int production_resolve(void *ud, const char *profile, const char *region,
                               const char *name, char **value_out) {
     aws_ctx *aws = NULL;
@@ -356,7 +372,7 @@ static int production_resolve(void *ud, const char *profile, const char *region,
     int rc;
 
     (void)ud;
-    rc = aws_init(&aws, profile);
+    rc = production_aws_init(profile, &aws);
     if (rc != 0) {
         return rc;
     }
@@ -655,31 +671,6 @@ done:
 /* Public entry point                                                        */
 /* ------------------------------------------------------------------------- */
 
-static int derive_config_dir(char *out, size_t cap) {
-    const char *base = config_build_working_directory();
-    char candidate[PATH_MAX];
-    char *real;
-    int rc;
-
-    if (base == NULL || base[0] == '\0') {
-        base = ".";
-    }
-    rc = snprintf(candidate, sizeof(candidate), "%s/deploy/aws", base);
-    if (rc < 0 || (size_t)rc >= sizeof(candidate)) {
-        return ENAMETOOLONG;
-    }
-    if (!is_regular(candidate) && access(candidate, F_OK) != 0) {
-        snprintf(candidate, sizeof(candidate), "%s", base);
-    }
-    real = realpath(candidate, NULL);
-    if (real == NULL) {
-        return errno != 0 ? errno : ENOENT;
-    }
-    snprintf(out, cap, "%s", real);
-    free(real);
-    return 0;
-}
-
 static void log_outcome(cli_ctx *ctx, int code) {
     state_store *store = cli_ctx_state(ctx);
     char args[512];
@@ -705,7 +696,6 @@ int cli_cmd_refresh_ami(cli_ctx *ctx) {
     };
     cli_args args = {0};
     refresh_ami_env env = {0};
-    char config_dir[PATH_MAX];
     int rc;
 
     if (ctx == NULL) {
@@ -722,16 +712,14 @@ int cli_cmd_refresh_ami(cli_ctx *ctx) {
     }
     cli_args_free(&args);
 
-    rc = derive_config_dir(config_dir, sizeof(config_dir));
-    if (rc != 0) {
+    env.cfg = cli_ctx_config(ctx);
+    env.profile = config_project(env.cfg);
+    env.config_dir = config_dir(env.cfg);
+    if (env.config_dir == NULL) {
         return cli_fail(ctx, CLI_EXIT_USAGE,
                         "refresh-ami: cannot locate the project config "
                         "directory");
     }
-
-    env.cfg = cli_ctx_config(ctx);
-    env.profile = config_project(env.cfg);
-    env.config_dir = config_dir;
     env.region = config_region(env.cfg);
     env.dry_run = cli_ctx_dry_run(ctx);
     env.json = cli_ctx_json(ctx);

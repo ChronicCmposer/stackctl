@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define SHA_A                                                                  \
@@ -85,6 +86,7 @@ static int console_calls;
 static int console_empty_calls;
 static int keyscan_calls;
 static int keyscan_null_calls;
+static int tool_missing;
 static int s3_get_calls;
 static char captured_rc_path[256];
 static int captured_reconnect;
@@ -94,6 +96,17 @@ static char last_ssh_argv[64][4096];
 static size_t last_ssh_argc;
 static char last_terminated[8][24];
 static size_t last_terminated_count;
+
+static char identity_arn[256];
+static int identity_fail;
+static char last_scp_argv[64][4096];
+static size_t last_scp_argc;
+static char scp_local_path[512];
+static char scp_local_content[256];
+static mode_t scp_local_mode;
+static int scp_fail;
+static int ssh_install_seen;
+static int cert_bucket_enabled;
 
 typedef struct run_capture {
     char instance_id[64];
@@ -134,7 +147,7 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
     out->items[0].status = CFN_STACK_STATUS_CREATE_COMPLETE;
     out->items[0].tags = calloc(2, sizeof(cfn_tag));
     out->items[0].parameters = calloc(1, sizeof(cfn_parameter));
-    out->items[0].outputs = calloc(5, sizeof(cfn_output));
+    out->items[0].outputs = calloc(6, sizeof(cfn_output));
     if (out->items[0].tags == NULL || out->items[0].parameters == NULL ||
         out->items[0].outputs == NULL) {
         return ENOMEM;
@@ -166,7 +179,7 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
         snprintf(out->items[0].parameters[0].value,
                  sizeof out->items[0].parameters[0].value, "%s", "ami-123");
     }
-    out->items[0].output_count = 5;
+    out->items[0].output_count = cert_bucket_enabled ? 6 : 5;
     snprintf(out->items[0].outputs[0].key, sizeof out->items[0].outputs[0].key,
              "%s", "SubnetId");
     snprintf(out->items[0].outputs[0].value,
@@ -187,6 +200,13 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
              "%s", "ReleaseTag");
     snprintf(out->items[0].outputs[4].value,
              sizeof out->items[0].outputs[4].value, "%s", "v1.2.3");
+    if (cert_bucket_enabled) {
+        snprintf(out->items[0].outputs[5].key,
+                 sizeof out->items[0].outputs[5].key, "%s", "CertBucketName");
+        snprintf(out->items[0].outputs[5].value,
+                 sizeof out->items[0].outputs[5].value, "%s",
+                 "demo-cert-bucket");
+    }
     return 0;
 }
 
@@ -365,6 +385,11 @@ static int fake_keyscan(const char *ip, int port, char **line) {
     return *line != NULL ? 0 : ENOMEM;
 }
 
+static int fake_tool_available(const char *name) {
+    (void)name;
+    return tool_missing ? 0 : 1;
+}
+
 static int fake_pin(const char *store, const char *id, const char *line) {
     (void)store;
     (void)id;
@@ -388,12 +413,70 @@ static int fake_ssh(char *const argv[], int timeout,
     for (size_t i = 0; argv[i] != NULL && i < 64; i++) {
         snprintf(last_ssh_argv[i], sizeof last_ssh_argv[i], "%s", argv[i]);
         last_ssh_argc++;
+        if (strstr(argv[i], "install -D") != NULL) {
+            ssh_install_seen = 1;
+        }
     }
     if (ssh_transport_fail) {
         return ENOTCONN;
     }
     *remote_status = remote_rc;
     return 0;
+}
+
+static int fake_scp(char *const argv[], int timeout,
+                    const sshc_sentinel_spec *sentinel, int *remote_status) {
+    (void)timeout;
+    (void)sentinel;
+    log_call("scp_exec");
+    last_scp_argc = 0;
+    for (size_t i = 0; argv[i] != NULL && i < 64; i++) {
+        snprintf(last_scp_argv[i], sizeof last_scp_argv[i], "%s", argv[i]);
+        last_scp_argc++;
+    }
+    memset(scp_local_path, 0, sizeof scp_local_path);
+    memset(scp_local_content, 0, sizeof scp_local_content);
+    if (last_scp_argc >= 2) {
+        FILE *file;
+
+        snprintf(scp_local_path, sizeof scp_local_path, "%s",
+                 last_scp_argv[last_scp_argc - 2]);
+        struct stat info;
+
+        if (stat(scp_local_path, &info) == 0) {
+            scp_local_mode = info.st_mode;
+        }
+        file = fopen(scp_local_path, "r");
+        if (file != NULL) {
+            size_t got = fread(scp_local_content, 1,
+                               sizeof scp_local_content - 1, file);
+
+            scp_local_content[got] = '\0';
+            fclose(file);
+        }
+    }
+    if (scp_fail) {
+        return ENOTCONN;
+    }
+    *remote_status = 0;
+    return 0;
+}
+
+static int fake_identity(aws_ctx *ctx, char **account, char **arn,
+                         char **user_id) {
+    (void)ctx;
+    if (account != NULL) {
+        *account = NULL;
+    }
+    if (user_id != NULL) {
+        *user_id = NULL;
+    }
+    log_call("iam_identity");
+    if (identity_fail) {
+        return EIO;
+    }
+    *arn = strdup(identity_arn);
+    return *arn != NULL ? 0 : ENOMEM;
 }
 
 static int fake_ssm(ssm_client *client, const char *name, int decrypt,
@@ -476,8 +559,20 @@ static void reset_all(void) {
     console_empty_calls = 0;
     keyscan_calls = 0;
     keyscan_null_calls = 0;
+    tool_missing = 0;
     s3_get_calls = 0;
     memset(captured_rc_path, 0, sizeof captured_rc_path);
+    snprintf(identity_arn, sizeof identity_arn, "%s",
+             "arn:aws:iam::123456789012:user/demo");
+    identity_fail = 0;
+    memset(last_scp_argv, 0, sizeof last_scp_argv);
+    last_scp_argc = 0;
+    memset(scp_local_path, 0, sizeof scp_local_path);
+    memset(scp_local_content, 0, sizeof scp_local_content);
+    scp_local_mode = 0;
+    scp_fail = 0;
+    ssh_install_seen = 0;
+    cert_bucket_enabled = 0;
     captured_reconnect = 0;
     run_called = 0;
 }
@@ -533,8 +628,11 @@ static void make_runtime(instance_runtime *rt, instance_services *svc) {
     svc->ec2_wait_terminated = fake_wait_terminated;
     svc->ec2_get_console_output = fake_console;
     svc->keyscan = fake_keyscan;
+    svc->tool_available = fake_tool_available;
     svc->kh_pin = fake_pin;
     svc->ssh_exec = fake_ssh;
+    svc->scp_exec = fake_scp;
+    svc->iam_get_caller_identity = fake_identity;
     svc->ssm_get_parameter = fake_ssm;
     svc->s3_get_object = fake_s3_get;
     svc->dns_record_exists = fake_dns_record_exists;
@@ -583,6 +681,27 @@ static int failing_append(state_store *store, const state_launch_record *record)
     (void)record;
     return EIO;
 }
+
+static int stream_contains(FILE *stream, const char *needle) {
+    char buffer[8192];
+    size_t got;
+    int found = 0;
+
+    if (stream == NULL) {
+        return 0;
+    }
+    fflush(stream);
+    rewind(stream);
+    got = fread(buffer, 1, sizeof buffer - 1, stream);
+    buffer[got] = '\0';
+    if (strstr(buffer, needle) != NULL) {
+        found = 1;
+    }
+    clearerr(stream);
+    return found;
+}
+
+static int any_ssh_contains(const char *needle);
 
 static int file_contains(const char *path, const char *needle) {
     FILE *file = fopen(path, "r");
@@ -689,6 +808,26 @@ static void test_empty_operator_cidr_is_exit1(void) {
 
     CHECK(rc == CLI_EXIT_USAGE, "empty OPERATOR_CIDR is exit 1");
     CHECK(!run_called, "no spend when SSH is impossible");
+    free_runtime(&rt);
+}
+
+static void test_missing_keyscan_is_exit1_before_spend(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    tool_missing = 1;
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_USAGE, "missing ssh-keyscan preflight is exit 1");
+    CHECK(!run_called, "no spend when ssh-keyscan is unavailable");
+    CHECK(stream_contains(rt.err, "ssh-keyscan"),
+          "diagnostic names the missing ssh-keyscan tool");
     free_runtime(&rt);
 }
 
@@ -889,6 +1028,27 @@ static void test_setup_failure_is_exit4(void) {
     free_runtime(&rt);
 }
 
+static void test_entrypoint_output_is_surfaced(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "launch with output surfacing exits 0");
+    CHECK(last_ssh_argc > 0 &&
+              strstr(last_ssh_argv[last_ssh_argc - 1], "setup.log") != NULL,
+          "setup script captures entrypoint output to a log");
+    CHECK(any_ssh_contains("tail -n 150") && any_ssh_contains(">&2"),
+          "setup script mirrors the last 150 lines to stderr");
+    free_runtime(&rt);
+}
+
 static void test_keep_on_failure_keeps_instance(void) {
     instance_runtime rt;
     instance_services svc;
@@ -991,6 +1151,9 @@ static void test_manifest_ambiguity_is_exit1(void) {
 
     CHECK(rc == CLI_EXIT_USAGE, "ambiguous member without --variant is exit 1");
     CHECK(!run_called, "no spend when the member is ambiguous");
+    CHECK(stream_contains(rt.err, "app-deployment-go-amd64.tar") &&
+              stream_contains(rt.err, "app-deployment-c-amd64.tar"),
+          "ambiguity diagnostic names the candidate members");
     free_runtime(&rt);
 }
 
@@ -1185,9 +1348,164 @@ static void test_state_append_failure_is_cleanup(void) {
     free_runtime(&rt);
 }
 
+
+static int any_ssh_contains(const char *needle) {
+    for (size_t i = 0; i < last_ssh_argc; i++) {
+        if (strstr(last_ssh_argv[i], needle) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void test_identity_mismatch_is_exit3(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    snprintf(identity_arn, sizeof identity_arn, "%s",
+             "arn:aws:iam::123456789012:user/other-project");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_VERIFY, "identity mismatch is exit 3");
+    CHECK(!run_called, "no RunInstances after an identity mismatch");
+    free_runtime(&rt);
+}
+
+static void test_identity_api_error_is_exit2(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    identity_fail = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_AWS, "identity API error is exit 2");
+    CHECK(!run_called, "no RunInstances when identity cannot be verified");
+    free_runtime(&rt);
+}
+
+static void test_cert_bucket_exported(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    cert_bucket_enabled = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "launch with cert bucket output exits 0");
+    CHECK(any_ssh_contains("STACKCTL_BUCKET_CERT='demo-cert-bucket'"),
+          "setup env exports STACKCTL_BUCKET_CERT when the output is present");
+    free_runtime(&rt);
+}
+
+static void test_cert_bucket_absent_when_disabled(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "launch without cert bucket output exits 0");
+    CHECK(!any_ssh_contains("STACKCTL_BUCKET_CERT"),
+          "setup env omits STACKCTL_BUCKET_CERT when the output is absent");
+    free_runtime(&rt);
+}
+
+static void test_ddns_onbox_delivers_password(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    rt.cfg.ddns_onbox = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "DDNS_ONBOX launch exits 0");
+    CHECK(last_scp_argc > 0 && strcmp(last_scp_argv[0], "scp") == 0,
+          "DDNS password delivery uses scp");
+    CHECK(last_scp_argc >= 2 &&
+              strstr(last_scp_argv[last_scp_argc - 1], ":") != NULL &&
+              strstr(last_scp_argv[last_scp_argc - 1],
+                     "/tmp/.stackctl-ddns-") != NULL,
+          "scp destination targets the remote staging path");
+    CHECK(strcmp(scp_local_content, "ddns-secret") == 0,
+          "scp source carries the SSM DDNS password");
+    CHECK((scp_local_mode & 0777) == 0600,
+          "local password temp file is mode 0600");
+    CHECK(access(scp_local_path, F_OK) != 0,
+          "local password temp file is removed after delivery");
+    CHECK(ssh_install_seen,
+          "remote install moves the password to the on-box 0600 path");
+    CHECK(any_ssh_contains("/etc/demo-ddns/password"),
+          "install targets STACKCTL_DDNS_PASSWORD_FILE");
+    free_runtime(&rt);
+}
+
+static void test_ddns_onbox_delivery_failure_is_exit7(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    rt.cfg.ddns_onbox = 1;
+    scp_fail = 1;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_SSH, "scp transport failure is exit 7");
+    CHECK(terminated("i-new"), "delivery failure terminates the instance");
+    free_runtime(&rt);
+}
+
+static void test_no_ddns_delivery_when_off(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "default (DDNS_ONBOX=false) launch exits 0");
+    CHECK(last_scp_argc == 0, "no scp when DDNS_ONBOX is disabled");
+    free_runtime(&rt);
+}
+
 int main(void) {
     test_missing_stack_is_exit1();
     test_empty_operator_cidr_is_exit1();
+    test_missing_keyscan_is_exit1_before_spend();
     test_missing_ddns_record_is_exit1();
     test_missing_ssm_param_is_exit1();
     test_both_arch_requires_flag();
@@ -1198,6 +1516,7 @@ int main(void) {
     test_run_instances_error_is_exit2();
     test_ssh_transport_failure_is_exit7_and_terminates();
     test_setup_failure_is_exit4();
+    test_entrypoint_output_is_surfaced();
     test_keep_on_failure_keeps_instance();
     test_hostkey_mismatch_is_exit3();
     test_pin_failure_is_exit3();
@@ -1212,6 +1531,13 @@ int main(void) {
     test_pinned_ami_has_no_config_fallback();
     test_replaced_ids_recorded();
     test_state_append_failure_is_cleanup();
+    test_identity_mismatch_is_exit3();
+    test_identity_api_error_is_exit2();
+    test_cert_bucket_exported();
+    test_cert_bucket_absent_when_disabled();
+    test_ddns_onbox_delivers_password();
+    test_ddns_onbox_delivery_failure_is_exit7();
+    test_no_ddns_delivery_when_off();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

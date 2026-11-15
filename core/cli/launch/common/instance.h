@@ -160,10 +160,24 @@ typedef struct instance_services {
     int (*keyscan)(const char *ip, int port, char **line_out);
     int (*ssh_exec)(char *const argv[], int timeout,
                     const sshc_sentinel_spec *, int *remote_rc);
+    /*
+     * scp(1) exec adapter sharing ssh_exec's signature. scp emits no
+     * STACKCTL_RC sentinel, so callers pass NULL; the remote status arrives
+     * through *remote_rc. Used only for the DDNS_ONBOX password transfer.
+     */
+    int (*scp_exec)(char *const argv[], int timeout,
+                    const sshc_sentinel_spec *, int *remote_rc);
 
     int (*kh_pin)(const char *, const char *, const char *);
     bool (*kh_bound)(const char *, const char *);
     int (*kh_forget)(const char *, const char *);
+
+    /*
+     * Local-tool preflight: non-zero when `name` resolves to an executable on
+     * PATH. Lets launch fail before spend when ssh-keyscan is unavailable;
+     * tests inject a fake. NULL means "not checked".
+     */
+    int (*tool_available)(const char *name);
 
     /* STS identity guard (status). NULL in tests that do not exercise it. */
     int (*iam_get_caller_identity)(aws_ctx *, char **, char **, char **);
@@ -252,6 +266,15 @@ int instance_fail(instance_runtime *rt, int code, const char *fmt, ...)
 void instance_audit(instance_runtime *rt, const char *verb, const char *args,
                     const char *outcome);
 
+/*
+ * Re-assert the caller identity before a mutating AWS call: the STS ARN must
+ * end in `:user/<project>` (spec §9). Returns CLI_EXIT_OK, CLI_EXIT_AWS when
+ * STS itself fails, or CLI_EXIT_VERIFY (3) on a mismatch. When the vtable has
+ * no identity service the guard is a no-op (unit tests that do not exercise
+ * it), mirroring provision/status.
+ */
+int instance_identity_guard(instance_runtime *rt);
+
 /* ------------------------------------------------------------------------- */
 /* DDNS orchestration helpers (operator-side, always)                        */
 /* ------------------------------------------------------------------------- */
@@ -315,10 +338,22 @@ int instance_console_fingerprints(const char *console, char fingerprints[][INST_
  * `<sha256> <member>` per line (sha256sum format). Returns 0 and fills
  * `member`/`sha256_hex`; EINVAL when the choice is ambiguous or `variant` is
  * missing, ENOENT when no member matches. Buffers are NUL-terminated.
+ *
+ * When the choice is ambiguous and `choices`/`choices_size` are supplied, the
+ * matching member names are written there as a comma-separated list so the
+ * caller can name them in its diagnostic. `choices` may be NULL.
  */
 int instance_manifest_select(const char *manifest, const char *variant,
                              const char *arch, char *member, size_t member_size,
-                             char *sha256_hex, size_t sha_size);
+                             char *sha256_hex, size_t sha_size, char *choices,
+                             size_t choices_size);
+
+/*
+ * Non-zero when `name` resolves to an executable regular file on PATH. A NULL
+ * or empty name, an unset PATH, or a directory entry that is not executable
+ * yields 0. Used for launch's ssh-keyscan preflight.
+ */
+int instance_tool_available(const char *name);
 
 /*
  * Resolve the launch arch. `config_arch` is the validated ARCH value; `flag`

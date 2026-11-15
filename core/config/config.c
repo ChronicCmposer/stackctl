@@ -98,6 +98,12 @@ static const char *default_for(const char *key) {
     if (strcmp(key, "BAZEL_COMMAND") == 0) {
         return "bazel";
     }
+    if (strcmp(key, "SETUP_ENTRYPOINT") == 0) {
+        return "deploy.sh";
+    }
+    if (strcmp(key, "SSH_PORT") == 0) {
+        return "22";
+    }
     return NULL;
 }
 
@@ -343,7 +349,6 @@ static int validate_region_consistency(const config_envfile *env, int region_exp
 static int validate_cross_keys(const config_envfile *env, const char *arch) {
     const char *policy = config_envfile_get(env, "AMI_POLICY");
     const char *spot_alerts = config_envfile_get(env, "ENABLE_SPOT_ALERTS");
-    const char *spot_email = config_envfile_get(env, "SPOT_ALERT_EMAIL");
     const char *ddns_onbox = config_envfile_get(env, "DDNS_ONBOX");
     const char *ddns_host = config_envfile_get(env, "DDNS_HOST");
     const char *ddns_domain = config_envfile_get(env, "DDNS_DOMAIN");
@@ -395,15 +400,11 @@ static int validate_cross_keys(const config_envfile *env, const char *arch) {
         return rc;
     }
 
-    /* Spot alerts need an email target, and an email implies alerts on. */
+    /* Spot alerts need an email target; an email alone is harmless. */
     if (spot_alerts != NULL && strcmp(spot_alerts, "true") == 0) {
         if ((rc = require_key(env, "SPOT_ALERT_EMAIL", 0)) != 0) {
             return rc;
         }
-    } else if (spot_email != NULL) {
-        return cfg_error(
-            EINVAL,
-            "SPOT_ALERT_EMAIL is only valid when ENABLE_SPOT_ALERTS=true");
     }
 
     /* DDNS: on-box install needs a host/domain pair; the pair travels together. */
@@ -427,8 +428,8 @@ static int validate_config(const config_envfile *env, int region_explicit,
         "PROJECT",          "ARCH",        "SPOT_DEFAULT",
         "AMI_POLICY",       "INSTANCE_TYPES_AMD64", "ROOT_VOLUME_SIZE",
         "KEY_NAME",         "SSH_IDENTITY", "BUCKET_MODULES",
-        "ENABLE_IMAGE_BUILDER", "SETUP_ENTRYPOINT", "SSH_PORT",
-        "RELEASE_TARGETS",  "RELEASE_PREFIXES", NULL,
+        "ENABLE_IMAGE_BUILDER", "RELEASE_TARGETS", "RELEASE_PREFIXES",
+        NULL,
     };
     static const char *const required_present[] = {
         "OPERATOR_CIDR", "INGRESS_TCP", "INGRESS_UDP", NULL,
@@ -514,7 +515,8 @@ static int validate_config(const config_envfile *env, int region_explicit,
     if (!parse_uint(config_envfile_get(env, "ROOT_VOLUME_SIZE"), 1, 65536, &number)) {
         return cfg_error(EINVAL, "ROOT_VOLUME_SIZE must be an integer in 1..65536");
     }
-    if (!parse_uint(config_envfile_get(env, "SSH_PORT"), 1, 65535, &number)) {
+    if (config_envfile_get(env, "SSH_PORT") != NULL &&
+        !parse_uint(config_envfile_get(env, "SSH_PORT"), 1, 65535, &number)) {
         return cfg_error(EINVAL, "SSH_PORT must be an integer in 1..65535");
     }
     if (config_envfile_get(env, "ROOT_VOLUME_TYPE") != NULL &&
@@ -524,6 +526,10 @@ static int validate_config(const config_envfile *env, int region_explicit,
     if (config_envfile_get(env, "SSH_USER") != NULL &&
         config_envfile_get(env, "SSH_USER")[0] == '\0') {
         return cfg_error(EINVAL, "SSH_USER must not be empty");
+    }
+    if (config_envfile_get(env, "SETUP_ENTRYPOINT") != NULL &&
+        config_envfile_get(env, "SETUP_ENTRYPOINT")[0] == '\0') {
+        return cfg_error(EINVAL, "SETUP_ENTRYPOINT must not be empty");
     }
     if (config_envfile_get(env, "SERVICE_UNIT") != NULL &&
         config_envfile_get(env, "SERVICE_UNIT")[0] == '\0') {
@@ -894,6 +900,10 @@ const char *config_region(const stackctl_config *cfg) {
 
 const char *config_project(const stackctl_config *cfg) {
     return cfg == NULL ? NULL : cfg->project;
+}
+
+const char *config_dir(const stackctl_config *cfg) {
+    return cfg == NULL ? NULL : cfg->dir;
 }
 
 const char *const *config_arch_list(const stackctl_config *cfg) {

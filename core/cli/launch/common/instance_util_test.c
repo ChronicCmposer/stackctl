@@ -1,15 +1,22 @@
 /*
  * instance_util_test.c — unit tests for the pure instance-verb helpers:
  * base64, host-key fingerprints, manifest selection, arch/type resolution,
- * state classification and small utilities. No network, filesystem or AWS.
+ * state classification and small utilities, plus the production services
+ * wiring's abort-hook installation. No network; the services test uses a fake
+ * credentials file under a temporary HOME.
  */
 
 #include "instance.h"
 
+#include "aws_internal.h"
+
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -108,27 +115,75 @@ static void test_manifest(void) {
         "app-deployment-c-amd64.tar\n";
     char member[128];
     char sha[68];
+    char choices[256];
 
     CHECK(instance_manifest_select(manifest, "go", "amd64", member,
-                                   sizeof member, sha, sizeof sha) == 0,
+                                   sizeof member, sha, sizeof sha, NULL, 0) ==
+              0,
           "manifest selects explicit variant");
     CHECK(strcmp(member, "app-deployment-go-amd64.tar") == 0,
           "selected go/amd64 member");
     CHECK(strncmp(sha, "aaaaaaaa", 8) == 0, "selected go/amd64 sha");
 
     CHECK(instance_manifest_select(manifest, NULL, "arm64", member,
-                                   sizeof member, sha, sizeof sha) == 0,
+                                   sizeof member, sha, sizeof sha, NULL, 0) ==
+              0,
           "manifest selects single arch match");
     CHECK(strcmp(member, "app-deployment-go-arm64.tar") == 0,
           "arm64 unambiguous");
 
+    memset(choices, 0, sizeof choices);
     CHECK(instance_manifest_select(manifest, NULL, "amd64", member,
-                                   sizeof member, sha, sizeof sha) == EINVAL,
+                                   sizeof member, sha, sizeof sha, choices,
+                                   sizeof choices) == EINVAL,
           "ambiguous arch without variant rejected");
+    CHECK(strstr(choices, "app-deployment-go-amd64.tar") != NULL &&
+              strstr(choices, "app-deployment-c-amd64.tar") != NULL,
+          "ambiguity choices name every matching member");
 
     CHECK(instance_manifest_select(manifest, "c", "arm64", member,
-                                   sizeof member, sha, sizeof sha) == ENOENT,
+                                   sizeof member, sha, sizeof sha, NULL, 0) ==
+              ENOENT,
           "missing variant/arch combo is ENOENT");
+}
+
+static void test_tool_available(void) {
+    char template[] = "/tmp/stackctl-tool-XXXXXX";
+    char *dir = mkdtemp(template);
+    char path[PATH_MAX];
+    char *saved = getenv("PATH") != NULL ? strdup(getenv("PATH")) : NULL;
+    FILE *file;
+
+    CHECK(dir != NULL, "tool test temp dir");
+    if (dir == NULL) {
+        free(saved);
+        return;
+    }
+    snprintf(path, sizeof path, "%s/stackctl-fake-tool", dir);
+    file = fopen(path, "w");
+    CHECK(file != NULL, "tool test file created");
+    if (file != NULL) {
+        fputs("#!/bin/sh\nexit 0\n", file);
+        fclose(file);
+    }
+    CHECK(chmod(path, 0755) == 0, "tool test file executable");
+
+    CHECK(setenv("PATH", dir, 1) == 0, "tool test PATH set");
+    CHECK(instance_tool_available("stackctl-fake-tool") == 1,
+          "tool_available finds an executable on PATH");
+    CHECK(instance_tool_available("stackctl-missing-tool") == 0,
+          "tool_available rejects a missing tool");
+    CHECK(instance_tool_available(NULL) == 0,
+          "tool_available rejects a NULL name");
+
+    if (saved != NULL) {
+        CHECK(setenv("PATH", saved, 1) == 0, "tool test PATH restored");
+        free(saved);
+    } else {
+        unsetenv("PATH");
+    }
+    unlink(path);
+    rmdir(dir);
 }
 
 static void test_arch(void) {
@@ -225,11 +280,72 @@ static void test_misc(void) {
     CHECK(instance_find(&list, "i-x") == NULL, "missing id is NULL");
 }
 
+static char *make_credentials_home(void) {
+    char *home = strdup("/tmp/stackctl-services-XXXXXX");
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+    FILE *file;
+
+    if (home == NULL || mkdtemp(home) == NULL) {
+        perror("mkdtemp");
+        exit(2);
+    }
+    if (snprintf(dir, sizeof dir, "%s/.aws", home) >= (int)sizeof dir ||
+        mkdir(dir, 0700) != 0) {
+        perror("mkdir .aws");
+        exit(2);
+    }
+    if (snprintf(path, sizeof path, "%s/credentials", dir) >= (int)sizeof path) {
+        exit(2);
+    }
+    file = fopen(path, "w");
+    if (file == NULL) {
+        perror("fopen credentials");
+        exit(2);
+    }
+    fputs("[prod-abort]\n"
+          "aws_access_key_id = AKIAFAKEFAKEFAKEFAKE\n"
+          "aws_secret_access_key = fake-secret\n",
+          file);
+    if (fclose(file) != 0) {
+        exit(2);
+    }
+    return home;
+}
+
+static void test_services_install_abort_hook(void) {
+    char *home = make_credentials_home();
+    const char *saved_home = getenv("HOME");
+    char *saved = saved_home != NULL ? strdup(saved_home) : NULL;
+    instance_services svc;
+    int rc;
+
+    CHECK(setenv("HOME", home, 1) == 0, "HOME points at fake credentials");
+    rc = instance_services_open(&svc, "prod-abort", "us-east-1");
+    CHECK(rc == 0, "production services open");
+    if (rc == 0) {
+        CHECK(svc.aws != NULL, "production services expose a client");
+        CHECK(svc.aws != NULL && svc.aws->abort_fn == cli_abort_check,
+              "production services install the CLI abort hook");
+        CHECK(svc.aws != NULL && svc.aws->abort_ud == NULL,
+              "abort hook has no user data");
+        instance_services_close(&svc);
+    }
+    if (saved != NULL) {
+        CHECK(setenv("HOME", saved, 1) == 0, "HOME restored");
+        free(saved);
+    } else {
+        unsetenv("HOME");
+    }
+}
+
 int main(void) {
+    test_services_install_abort_hook();
     test_base64();
     test_fingerprint();
     test_console_fingerprints();
     test_manifest();
+    test_tool_available();
     test_arch();
     test_types();
     test_misc();

@@ -25,6 +25,7 @@
 #include "core/s3/s3.h"
 #include "core/ssm/ssm.h"
 #include "iam.h"
+#include "template_check.h"
 #include "yyjson.h"
 
 /* ------------------------------------------------------------------------- */
@@ -304,6 +305,7 @@ static int ssm_fetch(const char *profile, const char *region, const char *name,
     if (rc != 0) {
         return rc;
     }
+    aws_set_abort_hook(aws, cli_abort_check, NULL);
     rc = ssm_client_init(&client, aws, region);
     if (rc == 0) {
         rc = ssm_get_parameter(client, name, 0, &parameter);
@@ -328,6 +330,7 @@ static int s3_open(const char *profile, const char *region, aws_ctx **aws_out,
     if (rc != 0) {
         return rc;
     }
+    aws_set_abort_hook(aws, cli_abort_check, NULL);
     rc = s3_client_init(&client, aws, region);
     if (rc != 0) {
         aws_free(aws);
@@ -549,6 +552,7 @@ static int prod_bucket(void *ud, const char *project, const char *region,
     if (rc != 0) {
         return rc;
     }
+    aws_set_abort_hook(aws, cli_abort_check, NULL);
     rc = iam_get_caller_identity(aws, &account, &arn, &user_id);
     if (rc == 0) {
         snprintf(out, cap, "%s-artifacts-%s-%s", project,
@@ -615,6 +619,7 @@ static int prod_ami_exists(void *ud, const char *region, const char *ami,
     if (rc != 0) {
         return rc;
     }
+    aws_set_abort_hook(aws, cli_abort_check, NULL);
     rc = ec2_client_init(&client, aws, region);
     if (rc == 0) {
         rc = ec2_describe_images(client, ids, 1, &images);
@@ -933,8 +938,20 @@ static int prod_publish_release(void *ud, const char *bucket, const char *tag,
 /* ------------------------------------------------------------------------- */
 
 static int prod_aws_init(void *ud, const char *profile, aws_ctx **out) {
+    int rc;
+
     (void)ud;
-    return aws_init(out, profile);
+    rc = aws_init(out, profile);
+    if (rc != 0) {
+        return rc;
+    }
+    aws_set_abort_hook(*out, cli_abort_check, NULL);
+    return 0;
+}
+
+/* Test-only entry point for the production init seam. */
+int deploy_prod_aws_init_for_test(const char *profile, aws_ctx **out) {
+    return prod_aws_init(NULL, profile, out);
 }
 
 static void prod_aws_free(void *ud, aws_ctx *aws) {
@@ -1016,19 +1033,39 @@ static int prod_delete_stack(void *ud, cfn_client *client, const char *region,
     return cfn_delete_stack(client, region, stack);
 }
 
-static int prod_read_template(void *ud, const char *repo_root, char **body_out) {
-    char path[PATH_MAX];
+/*
+ * Resolve TEMPLATE_OVERRIDE to an absolute path. Absolute overrides are used
+ * verbatim; relative overrides are anchored at the repository root, matching
+ * the canonical `deploy/stackctl-*.yaml` location. A NULL override selects the
+ * canonical infra template.
+ */
+static int resolve_template_path(const char *repo_root, const char *override,
+                                 char *out, size_t cap) {
+    int written;
+
+    if (repo_root == NULL || out == NULL || cap == 0) {
+        return EINVAL;
+    }
+    if (override == NULL || override[0] == '\0') {
+        written = snprintf(out, cap, "%s/deploy/stackctl-infra.yaml", repo_root);
+    } else if (override[0] == '/') {
+        written = snprintf(out, cap, "%s", override);
+    } else {
+        written = snprintf(out, cap, "%s/%s", repo_root, override);
+    }
+    if (written < 0 || (size_t)written >= cap) {
+        return ENAMETOOLONG;
+    }
+    return 0;
+}
+
+static int prod_read_template_path(void *ud, const char *path,
+                                   char **body_out) {
     FILE *file;
     long size;
     char *body;
-    int rc;
 
     (void)ud;
-    rc = snprintf(path, sizeof(path), "%s/deploy/stackctl-infra.yaml",
-                  repo_root);
-    if (rc < 0 || (size_t)rc >= sizeof(path)) {
-        return ENAMETOOLONG;
-    }
     file = fopen(path, "rb");
     if (file == NULL) {
         return errno != 0 ? errno : ENOENT;
@@ -1059,6 +1096,17 @@ static int prod_read_template(void *ud, const char *repo_root, char **body_out) 
     return 0;
 }
 
+static int prod_read_template(void *ud, const char *repo_root,
+                              char **body_out) {
+    char path[PATH_MAX];
+
+    if (repo_root == NULL) {
+        return EINVAL;
+    }
+    snprintf(path, sizeof(path), "%s/deploy/stackctl-infra.yaml", repo_root);
+    return prod_read_template_path(ud, path, body_out);
+}
+
 static int prod_count_live(void *ud, const char *region, int *count) {
     const struct prod_context *ctx = ud;
     aws_ctx *aws = NULL;
@@ -1073,6 +1121,7 @@ static int prod_count_live(void *ud, const char *region, int *count) {
     if (rc != 0) {
         return rc;
     }
+    aws_set_abort_hook(aws, cli_abort_check, NULL);
     rc = ec2_client_init(&client, aws, region);
     if (rc != 0) {
         aws_free(aws);
@@ -1234,6 +1283,7 @@ static const deploy_ops complete_ops = {
     .wait_stack = prod_wait_stack,
     .delete_stack = prod_delete_stack,
     .read_template = prod_read_template,
+    .read_template_path = prod_read_template_path,
 };
 
 /* ------------------------------------------------------------------------- */
@@ -1405,6 +1455,22 @@ static void add_param(cfn_parameter *params, size_t *count, const char *key,
     (*count)++;
 }
 
+static int add_release_tags(cfn_tag *tags, size_t *count, const char *tag,
+                            const char *sha) {
+    if (tags == NULL || count == NULL || tag == NULL || sha == NULL) {
+        return EINVAL;
+    }
+    snprintf(tags[*count].key, sizeof(tags[*count].key),
+             "stackctl:release-tag");
+    snprintf(tags[*count].value, sizeof(tags[*count].value), "%s", tag);
+    (*count)++;
+    snprintf(tags[*count].key, sizeof(tags[*count].key),
+             "stackctl:release-sha");
+    snprintf(tags[*count].value, sizeof(tags[*count].value), "%s", sha);
+    (*count)++;
+    return 0;
+}
+
 static int deploy_run_impl(deploy_env *env) {
     const deploy_ops *ops;
     void *ud;
@@ -1413,9 +1479,12 @@ static int deploy_run_impl(deploy_env *env) {
     const char *region;
     const char *targets;
     char repo_root[PATH_MAX];
+    char template_path[PATH_MAX];
     char *allocated_root = NULL;
     char *template_body = NULL;
     const char *template_source = "";
+    const char *template_override;
+    int ami_pinned;
     char bucket[256];
     char stack[CFN_STACK_NAME_MAX];
     char change_set_name[CFN_CHANGE_SET_NAME_MAX];
@@ -1432,6 +1501,8 @@ static int deploy_run_impl(deploy_env *env) {
     int prior_review = 0;
     cfn_parameter params[12] = {0};
     size_t param_count = 0;
+    cfn_tag tags[2] = {0};
+    size_t tag_count = 0;
     cfn_change_set_spec spec = {0};
     cfn_change_set_result result = {0};
     cfn_change_set change_set = {0};
@@ -1461,6 +1532,7 @@ static int deploy_run_impl(deploy_env *env) {
     project = config_project(env->cfg);
     region = config_region(env->cfg);
     targets = config_get(env->cfg, "RELEASE_TARGETS");
+    ami_pinned = strcmp(config_get(env->cfg, "AMI_POLICY"), "pinned") == 0;
     snprintf(stack, sizeof(stack), "%s-infra", project);
     snprintf(change_set_name, sizeof(change_set_name), "%s-infra-deploy",
              project);
@@ -1476,7 +1548,32 @@ static int deploy_run_impl(deploy_env *env) {
         snprintf(repo_root, sizeof(repo_root), "%s", bwd != NULL ? bwd : ".");
     }
 
-    if (ops->read_template != NULL) {
+    template_override = config_get(env->cfg, "TEMPLATE_OVERRIDE");
+    if (ops->read_template_path != NULL) {
+        rc = resolve_template_path(repo_root, template_override, template_path,
+                                   sizeof(template_path));
+        if (rc != 0) {
+            fprintf(env->err, "stackctl: cannot resolve the infra template path\n");
+            return CLI_EXIT_USAGE;
+        }
+        rc = ops->read_template_path(ud, template_path, &template_body);
+        if (rc != 0) {
+            fprintf(env->err, "stackctl: cannot read the infra template %s\n",
+                    template_path);
+            return CLI_EXIT_USAGE;
+        }
+        template_source = template_body;
+        /* §6.3 structural contract, fail-closed before any AWS call. */
+        rc = tc_check_buffer(template_path, template_source,
+                             strlen(template_source), TC_MODE_INFRA);
+        if (rc != 0) {
+            fprintf(env->err,
+                    "stackctl: template %s violates the §6.3 contract\n",
+                    template_path);
+            return CLI_EXIT_USAGE;
+        }
+    } else if (ops->read_template != NULL) {
+        /* Legacy test seam: no real path to name in diagnostics. */
         rc = ops->read_template(ud, repo_root, &template_body);
         if (rc != 0) {
             fprintf(env->err, "stackctl: cannot read the infra template\n");
@@ -1646,6 +1743,27 @@ static int deploy_run_impl(deploy_env *env) {
         } else if (status == CFN_STACK_STATUS_REVIEW_IN_PROGRESS) {
             type = CFN_CHANGE_SET_TYPE_CREATE;
             prior_review = 1;
+        } else if (status == CFN_STACK_STATUS_ROLLBACK_COMPLETE) {
+            fprintf(env->err,
+                    "stackctl: %s is in ROLLBACK_COMPLETE (failed create); "
+                    "delete the stack, then re-run deploy\n",
+                    stack);
+            rc = CLI_EXIT_AWS;
+            goto done;
+        } else if (status == CFN_STACK_STATUS_UPDATE_ROLLBACK_FAILED) {
+            fprintf(env->err,
+                    "stackctl: %s is in UPDATE_ROLLBACK_FAILED; run "
+                    "`aws cloudformation continue-update-rollback` (manual)\n",
+                    stack);
+            rc = CLI_EXIT_AWS;
+            goto done;
+        } else if (status == CFN_STACK_STATUS_DELETE_FAILED) {
+            fprintf(env->err,
+                    "stackctl: %s is in DELETE_FAILED; inspect and remove the "
+                    "failed resources, then re-run deploy\n",
+                    stack);
+            rc = CLI_EXIT_AWS;
+            goto done;
         } else {
             fprintf(env->err, "stackctl: %s is in %s; refusing to proceed\n",
                     stack, cfn_stack_status_string(status));
@@ -1676,11 +1794,14 @@ static int deploy_run_impl(deploy_env *env) {
     add_param(params, &param_count, "ReleaseManifestSha256", env->manifest_sha);
     add_param(params, &param_count, "AmiPolicy",
               config_get(env->cfg, "AMI_POLICY"));
-    for (size_t i = 0; i < ami_count; i++) {
-        char key[32];
+    /* Spec §6.2: per-arch AmiId parameters exist only under pinned policy. */
+    if (ami_pinned) {
+        for (size_t i = 0; i < ami_count; i++) {
+            char key[32];
 
-        if (make_camel_arch(ami_arches[i], key, sizeof(key)) == 0) {
-            add_param(params, &param_count, key, ami_ids[i]);
+            if (make_camel_arch(ami_arches[i], key, sizeof(key)) == 0) {
+                add_param(params, &param_count, key, ami_ids[i]);
+            }
         }
     }
     add_param(params, &param_count, "OperatorCidr",
@@ -1699,12 +1820,22 @@ static int deploy_run_impl(deploy_env *env) {
     add_param(params, &param_count, "EnableImageBuilder",
               config_get(env->cfg, "ENABLE_IMAGE_BUILDER"));
 
+    rc = add_release_tags(tags, &tag_count, env->tag, env->manifest_sha);
+    if (rc != 0) {
+        fprintf(env->err,
+                "stackctl: cannot determine release identity for tagging\n");
+        rc = CLI_EXIT_USAGE;
+        goto done;
+    }
+
     spec.stack_name = stack;
     spec.change_set_name = change_set_name;
     spec.template_body = template_source;
     spec.type = type;
     spec.parameters = params;
     spec.parameter_count = param_count;
+    spec.tags = tags;
+    spec.tag_count = tag_count;
     spec.description = "stackctl deploy";
     spec.capabilities = 0;
 
@@ -1876,31 +2007,6 @@ int deploy_run(deploy_env *env) { return deploy_run_impl(env); }
 /* Public entry point                                                        */
 /* ------------------------------------------------------------------------- */
 
-static int derive_config_dir(char *out, size_t cap) {
-    const char *base = config_build_working_directory();
-    char candidate[PATH_MAX];
-    char *real;
-    int rc;
-
-    if (base == NULL || base[0] == '\0') {
-        base = ".";
-    }
-    rc = snprintf(candidate, sizeof(candidate), "%s/deploy/aws", base);
-    if (rc < 0 || (size_t)rc >= sizeof(candidate)) {
-        return ENAMETOOLONG;
-    }
-    if (access(candidate, F_OK) != 0) {
-        snprintf(candidate, sizeof(candidate), "%s", base);
-    }
-    real = realpath(candidate, NULL);
-    if (real == NULL) {
-        return errno != 0 ? errno : ENOENT;
-    }
-    snprintf(out, cap, "%s", real);
-    free(real);
-    return 0;
-}
-
 static int confirm_with_ctx(void *ud, const char *prompt) {
     return cli_confirm((cli_ctx *)ud, prompt);
 }
@@ -1973,7 +2079,6 @@ int cli_cmd_deploy(cli_ctx *ctx) {
     };
     cli_args args = {0};
     deploy_env env = {0};
-    char config_dir[PATH_MAX];
     int rc;
 
     if (ctx == NULL) {
@@ -1993,15 +2098,13 @@ int cli_cmd_deploy(cli_ctx *ctx) {
     env.allow_dirty = cli_args_flag(&args, "allow-dirty");
     env.skip_build = cli_args_flag(&args, "skip-build");
     /* Keep the tag pointer valid until after deploy_run(). */
-    rc = derive_config_dir(config_dir, sizeof(config_dir));
-    if (rc != 0) {
+    env.cfg = cli_ctx_config(ctx);
+    env.config_dir = config_dir(env.cfg);
+    if (env.config_dir == NULL) {
         cli_args_free(&args);
         return cli_fail(ctx, CLI_EXIT_USAGE,
                         "deploy: cannot locate the project config directory");
     }
-
-    env.cfg = cli_ctx_config(ctx);
-    env.config_dir = config_dir;
     env.yes = cli_ctx_yes(ctx);
     env.dry_run = cli_ctx_dry_run(ctx);
     env.json = cli_ctx_json(ctx);

@@ -10,11 +10,14 @@
 
 #include "status_internal.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "yyjson.h"
@@ -26,6 +29,10 @@
 #define STATUS_MAX_GARBAGE 16
 #define STATUS_MEMBER_NAME_MAX 256
 #define STATUS_PREFIX_LEN 128
+#define STATUS_VERSION_MAX 256
+#define STATUS_PATH_MAX 4096
+#define STATUS_VERSION_MAX_ANCESTORS 6
+#define STATUS_MULTI_WRITER_WINDOW 3600
 
 typedef struct status_binding {
     char instance_id[STATE_INSTANCE_ID_MAX];
@@ -49,6 +56,18 @@ typedef struct status_report {
     size_t member_count;
     char garbage[STATUS_MAX_GARBAGE][STATUS_PREFIX_LEN];
     size_t garbage_count;
+    /* Resolved release identity (same probe the dispatcher's --version uses). */
+    char version[STATUS_VERSION_MAX];
+    /* Bazel preflight: availability is checked, bazel is never executed. */
+    int bazel_checked;
+    int bazel_found;
+    char bazel_command[STATUS_PATH_MAX];
+    int repo_checked;
+    int repo_resolved;
+    char repo_root[STATUS_PATH_MAX];
+    /* Pinned tag vs newest manifest-bearing release prefix in the bucket. */
+    char latest_release[STATUS_MEMBER_NAME_MAX];
+    int release_is_latest; /* 1 latest, 0 behind, -1 unknown/not applicable */
 } status_report;
 
 static void add_warning(status_report *report, const char *fmt, ...) {
@@ -62,6 +81,198 @@ static void add_warning(status_report *report, const char *fmt, ...) {
               args);
     va_end(args);
     report->warning_count++;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Version identity                                                          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The dispatcher resolves the release tag for `--version` from
+ * STACKCTL_VERSION_FILE, the Bazel runfiles tree, cwd and the executable's
+ * ancestors. status must report the same identity, but it cannot call into
+ * core/cli/dispatch (dispatch depends on the verbs). This is a deliberately
+ * small mirror of that probe: same sources, same order, same "unknown"
+ * fallback. It never executes bazel or any external command.
+ */
+
+static void trim_version(char *text) {
+    size_t len = strlen(text);
+
+    while (len > 0) {
+        char last = text[len - 1];
+
+        if (last != '\n' && last != '\r' && last != ' ' && last != '\t') {
+            break;
+        }
+        text[--len] = '\0';
+    }
+}
+
+static int read_version_tag(const char *path, char *buffer, size_t capacity) {
+    FILE *file;
+
+    if (path == NULL || buffer == NULL || capacity == 0) {
+        return 0;
+    }
+    file = fopen(path, "r");
+    if (file == NULL) {
+        return 0;
+    }
+    buffer[0] = '\0';
+    if (fgets(buffer, (int)capacity, file) != NULL) {
+        trim_version(buffer);
+    }
+    fclose(file);
+    return buffer[0] != '\0';
+}
+
+static int version_join(char *out, size_t capacity, const char *dir,
+                        const char *leaf) {
+    int written;
+
+    if (dir == NULL || dir[0] == '\0') {
+        return 0;
+    }
+    written = snprintf(out, capacity, "%s/%s", dir, leaf);
+    return written >= 0 && (size_t)written < capacity;
+}
+
+static int version_in_dir(const char *dir, char *buffer, size_t capacity) {
+    char path[STATUS_PATH_MAX];
+
+    return version_join(path, sizeof path, dir, "VERSION") &&
+           read_version_tag(path, buffer, capacity);
+}
+
+static void strip_last_path_component(char *path) {
+    char *slash = strrchr(path, '/');
+
+    if (slash == NULL) {
+        path[0] = '\0';
+    } else if (slash == path) {
+        path[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+}
+
+/* Probe <dir>, <dir>/.., ... up to `stop` (inclusive) for a VERSION file. */
+static int version_walk_up(const char *dir, const char *stop, char *buffer,
+                           size_t capacity) {
+    char current[STATUS_PATH_MAX];
+    size_t stop_length;
+
+    if (dir == NULL || dir[0] == '\0' || stop == NULL) {
+        return 0;
+    }
+    stop_length = strlen(stop);
+    if (strlen(dir) >= sizeof current ||
+        strncmp(dir, stop, stop_length) != 0) {
+        return 0;
+    }
+    snprintf(current, sizeof current, "%s", dir);
+    for (int level = 0; level <= STATUS_VERSION_MAX_ANCESTORS; level++) {
+        if (version_in_dir(current, buffer, capacity)) {
+            return 1;
+        }
+        if (strlen(current) <= stop_length) {
+            break;
+        }
+        strip_last_path_component(current);
+    }
+    return 0;
+}
+
+/* Bzlmod materialises the module as `stackctl+` or `stackctl+<version>`. */
+static int version_from_canonical_dirs(const char *root, char *buffer,
+                                       size_t capacity) {
+    char best[STATUS_PATH_MAX] = {0};
+    char path[STATUS_PATH_MAX];
+    DIR *dir;
+    struct dirent *entry;
+
+    if (root == NULL || root[0] == '\0') {
+        return 0;
+    }
+    dir = opendir(root);
+    if (dir == NULL) {
+        return 0;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "stackctl+", 9) != 0) {
+            continue;
+        }
+        if (best[0] == '\0' || strcmp(entry->d_name, best) < 0) {
+            snprintf(best, sizeof best, "%s", entry->d_name);
+        }
+    }
+    closedir(dir);
+    if (best[0] == '\0') {
+        return 0;
+    }
+    return version_join(path, sizeof path, root, best) &&
+           version_in_dir(path, buffer, capacity);
+}
+
+static int version_from_runfiles(const char *root, const char *exe_dir,
+                                 char *buffer, size_t capacity) {
+    const char *const candidates[] = {"_main", "stackctl"};
+
+    if (root == NULL || root[0] == '\0') {
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof candidates / sizeof candidates[0]; i++) {
+        char path[STATUS_PATH_MAX];
+
+        if (version_join(path, sizeof path, root, candidates[i]) &&
+            version_in_dir(path, buffer, capacity)) {
+            return 1;
+        }
+    }
+    if (version_from_canonical_dirs(root, buffer, capacity)) {
+        return 1;
+    }
+    return version_walk_up(exe_dir, root, buffer, capacity);
+}
+
+static const char *resolve_version(char *buffer, size_t capacity) {
+    const char *override = getenv("STACKCTL_VERSION_FILE");
+    const char *runfiles = getenv("RUNFILES_DIR");
+    char exe[STATUS_PATH_MAX];
+    char exe_dir[STATUS_PATH_MAX] = {0};
+    char cwd[STATUS_PATH_MAX];
+    ssize_t exe_len;
+
+    if (buffer == NULL || capacity == 0) {
+        return "unknown";
+    }
+    buffer[0] = '\0';
+
+    if (override != NULL && override[0] != '\0') {
+        return read_version_tag(override, buffer, capacity) ? buffer
+                                                            : "unknown";
+    }
+
+    exe_len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (exe_len > 0) {
+        exe[exe_len] = '\0';
+        snprintf(exe_dir, sizeof exe_dir, "%s", exe);
+        strip_last_path_component(exe_dir);
+    }
+    if (version_from_runfiles(runfiles, exe_dir[0] != '\0' ? exe_dir : NULL,
+                              buffer, capacity)) {
+        return buffer;
+    }
+    if (getcwd(cwd, sizeof cwd) != NULL &&
+        version_in_dir(cwd, buffer, capacity)) {
+        return buffer;
+    }
+    if (exe_dir[0] != '\0' &&
+        version_walk_up(exe_dir, "/", buffer, capacity)) {
+        return buffer;
+    }
+    return "unknown";
 }
 
 /* Scan PATH for an executable named `name` (operator-workstation prereq). */
@@ -93,6 +304,17 @@ static int tool_present(const char *name) {
     }
     free(copy);
     return found;
+}
+
+/* BAZEL_COMMAND may be a bare name (PATH lookup) or an explicit path. */
+static int command_available(const char *command) {
+    if (command == NULL || command[0] == '\0') {
+        return 0;
+    }
+    if (strchr(command, '/') != NULL) {
+        return access(command, X_OK) == 0;
+    }
+    return tool_present(command);
 }
 
 /* IPv4 helpers for the operator-CIDR containment warning. */
@@ -338,6 +560,52 @@ static void load_bindings(instance_runtime *rt, status_report *report) {
     fclose(file);
 }
 
+/*
+ * Compare release tags `vX.Y.Z` numerically, falling back to a byte compare
+ * when either side is not a dotted numeric tag. Returns <0, 0 or >0.
+ */
+static int next_release_component(const char **cursor, unsigned long *value) {
+    char *end;
+
+    if (**cursor < '0' || **cursor > '9') {
+        return 0;
+    }
+    *value = strtoul(*cursor, &end, 10);
+    *cursor = end;
+    if (**cursor == '.') {
+        (*cursor)++;
+    }
+    return 1;
+}
+
+static int release_tag_order(const char *left, const char *right) {
+    const char *a = left[0] == 'v' ? left + 1 : left;
+    const char *b = right[0] == 'v' ? right + 1 : right;
+
+    for (;;) {
+        unsigned long av;
+        unsigned long bv;
+        int have_a = next_release_component(&a, &av);
+        int have_b = next_release_component(&b, &bv);
+
+        if (!have_a && !have_b) {
+            return strcmp(left, right);
+        }
+        if (!have_a) {
+            return -1;
+        }
+        if (!have_b) {
+            return 1;
+        }
+        if (av != bv) {
+            return av < bv ? -1 : 1;
+        }
+        if (*a == '\0' && *b == '\0') {
+            return 0;
+        }
+    }
+}
+
 /* List the pinned release's manifest members and manifest-less prefixes. */
 static void release_health(instance_runtime *rt, const cfn_stack *stack,
                            status_report *report) {
@@ -481,15 +749,215 @@ static void release_health(instance_runtime *rt, const cfn_stack *stack,
                     add_warning(report,
                                 "garbage prefix %s has no release manifest",
                                 prefixes[p]);
+                } else if (has_manifest) {
+                    size_t prefix_len = strlen(prefixes[p]);
+                    size_t tag_len = prefix_len > 10 ? prefix_len - 10 : 0;
+                    char candidate[STATUS_MEMBER_NAME_MAX];
+
+                    if (tag_len > 0 && tag_len < sizeof candidate) {
+                        memcpy(candidate, prefixes[p] + 9, tag_len);
+                        candidate[tag_len] = '\0';
+                        if (report->latest_release[0] == '\0' ||
+                            release_tag_order(candidate,
+                                              report->latest_release) > 0) {
+                            snprintf(report->latest_release,
+                                     sizeof report->latest_release, "%s",
+                                     candidate);
+                        }
+                    }
                 }
             }
         }
         s3_object_list_free(&list);
     }
+
+    if (report->latest_release[0] != '\0') {
+        report->release_is_latest =
+            release_tag_order(tag, report->latest_release) >= 0 ? 1 : 0;
+        if (!report->release_is_latest) {
+            add_warning(report,
+                        "stack release %s is not the latest release %s in "
+                        "bucket %s (run deploy to publish and apply)",
+                        tag, report->latest_release, bucket);
+        }
+    }
 }
 
-static void check_prerequisites(instance_runtime *rt, status_report *report,
-                                int *fatal) {
+/* Under `pinned`, the stack is the AMI source of truth; config drift warns. */
+static void ami_drift(instance_runtime *rt, const cfn_stack *stack,
+                      status_report *report) {
+    struct {
+        const char *arch;
+        const char *configured;
+        const char *parameter;
+    } checks[] = {
+        {"amd64", rt->cfg.ami_id_amd64, "AmiIdAmd64"},
+        {"arm64", rt->cfg.ami_id_arm64, "AmiIdArm64"},
+    };
+
+    if (stack == NULL || strcmp(rt->cfg.ami_policy, "pinned") != 0) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof checks / sizeof checks[0]; i++) {
+        const char *stack_ami;
+
+        if (checks[i].configured[0] == '\0') {
+            continue;
+        }
+        stack_ami = cfn_stack_parameter(stack, checks[i].parameter);
+        if (stack_ami == NULL || stack_ami[0] == '\0' ||
+            strcmp(checks[i].configured, stack_ami) == 0) {
+            continue;
+        }
+        add_warning(report,
+                    "AMI drift for %s: config %s differs from stack %s "
+                    "(run deploy to apply)",
+                    checks[i].arch, checks[i].configured, stack_ami);
+    }
+}
+
+/* --- multi-writer detection --------------------------------------------- */
+
+static int parse_record_epoch(const char *stamp, long long *out) {
+    struct tm tm = {0};
+
+    if (sscanf(stamp, "%4d-%2d-%2dT%2d:%2d:%2d", &tm.tm_year, &tm.tm_mon,
+               &tm.tm_mday, &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) {
+        return 0;
+    }
+    tm.tm_year -= 1900;
+    tm.tm_mon -= 1;
+    *out = (long long)timegm(&tm);
+    return *out >= 0;
+}
+
+/* Newest launch-record timestamp for `nonce`; returns 0 when none exists. */
+static int launch_record_epoch(instance_runtime *rt, const char *nonce,
+                               long long *out) {
+    FILE *file;
+    char line[1024];
+    int found = 0;
+    long long newest = 0;
+
+    if (rt->state == NULL) {
+        return 0;
+    }
+    file = fopen(state_launch_records_path(rt->state), "r");
+    if (file == NULL) {
+        return 0;
+    }
+    while (fgets(line, sizeof line, file) != NULL) {
+        char *fields[3];
+        int count = 0;
+        char *save = NULL;
+        char *token = strtok_r(line, "\t\n", &save);
+        long long epoch;
+
+        while (token != NULL && count < 3) {
+            fields[count++] = token;
+            token = strtok_r(NULL, "\t\n", &save);
+        }
+        if (count < 3 || strcmp(fields[2], nonce) != 0 ||
+            !parse_record_epoch(fields[0], &epoch)) {
+            continue;
+        }
+        if (!found || epoch > newest) {
+            newest = epoch;
+            found = 1;
+        }
+    }
+    fclose(file);
+    if (found) {
+        *out = newest;
+    }
+    return found;
+}
+
+static int file_modified_within(const char *path, long long window) {
+    struct stat status;
+    time_t now = time(NULL);
+
+    if (path == NULL || stat(path, &status) != 0) {
+        return 0;
+    }
+    return status.st_mtime <= now && (long long)now - status.st_mtime <= window;
+}
+
+/* A writer other than this process leaves recent lock/operations activity. */
+static int state_activity_recent(instance_runtime *rt) {
+    if (rt->state == NULL) {
+        return 0;
+    }
+    return file_modified_within(state_operations_log_path(rt->state),
+                                STATUS_MULTI_WRITER_WINDOW) ||
+           file_modified_within(state_release_history_path(rt->state),
+                                STATUS_MULTI_WRITER_WINDOW) ||
+           file_modified_within(state_lock_path(rt->state),
+                                STATUS_MULTI_WRITER_WINDOW);
+}
+
+static int nonce_is_recent(instance_runtime *rt, const char *nonce) {
+    long long epoch;
+
+    if (launch_record_epoch(rt, nonce, &epoch)) {
+        long long now = (long long)time(NULL);
+
+        return epoch <= now + 300 &&
+               now - epoch <= STATUS_MULTI_WRITER_WINDOW;
+    }
+    /* Unknown provenance (another operator machine): fall back to activity. */
+    return state_activity_recent(rt);
+}
+
+/*
+ * Spec §4: warn when more than one live launch-nonce is younger than 1 h.
+ * Independent of DDNS; this detects concurrent operator machines.
+ */
+static void check_multi_writer(instance_runtime *rt,
+                               const ec2_instance_list *instances,
+                               status_report *report) {
+    char nonces[STATUS_MAX_BINDINGS][STATE_NONCE_MAX];
+    size_t nonce_count = 0;
+    size_t recent = 0;
+
+    for (size_t i = 0; i < instances->count; i++) {
+        const ec2_instance *instance = &instances->items[i];
+        const char *nonce = ec2_instance_tag(instance,
+                                             "stackctl:launch-nonce");
+        int seen = 0;
+
+        if (nonce == NULL || nonce[0] == '\0' ||
+            !instance_state_active(instance->state)) {
+            continue;
+        }
+        for (size_t n = 0; n < nonce_count; n++) {
+            if (strcmp(nonces[n], nonce) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (seen || nonce_count >= STATUS_MAX_BINDINGS) {
+            continue;
+        }
+        snprintf(nonces[nonce_count], sizeof nonces[nonce_count], "%s", nonce);
+        nonce_count++;
+    }
+
+    for (size_t n = 0; n < nonce_count; n++) {
+        if (nonce_is_recent(rt, nonces[n])) {
+            recent++;
+        }
+    }
+    if (recent > 1) {
+        add_warning(report,
+                    "multiple live launch nonces younger than 1 h "
+                    "(multi-writer risk)");
+    }
+}
+
+static void check_prerequisites(instance_runtime *rt,
+                                const status_options *opts,
+                                status_report *report, int *fatal) {
     *fatal = 0;
     if (rt->cfg.key_name[0] == '\0') {
         instance_fail(rt, CLI_EXIT_USAGE, "missing KEY_NAME in config");
@@ -512,6 +980,34 @@ static void check_prerequisites(instance_runtime *rt, status_report *report,
     if (!tool_present("ssh-keyscan")) {
         add_warning(report, "ssh-keyscan not found on PATH (launch cannot pin "
                             "host keys)");
+    }
+    if (opts->bazel_command != NULL && opts->bazel_command[0] != '\0') {
+        report->bazel_checked = 1;
+        snprintf(report->bazel_command, sizeof report->bazel_command, "%s",
+                 opts->bazel_command);
+        report->bazel_found = command_available(opts->bazel_command);
+        if (!report->bazel_found) {
+            instance_fail(rt, CLI_EXIT_USAGE,
+                          "BAZEL_COMMAND %s not found on PATH",
+                          opts->bazel_command);
+            *fatal = 1;
+            return;
+        }
+    }
+    if (opts->config_dir != NULL && opts->config_dir[0] != '\0') {
+        char *root = NULL;
+
+        report->repo_checked = 1;
+        if (config_repo_root(opts->config_dir, &root) != 0) {
+            instance_fail(rt, CLI_EXIT_USAGE,
+                          "cannot resolve the repository root above %s",
+                          opts->config_dir);
+            *fatal = 1;
+            return;
+        }
+        report->repo_resolved = 1;
+        snprintf(report->repo_root, sizeof report->repo_root, "%s", root);
+        free(root);
     }
     if (rt->state != NULL) {
         const char *dir = state_dir(rt->state);
@@ -545,6 +1041,26 @@ static void json_report(instance_runtime *rt, const cfn_stack *stack,
     yyjson_mut_obj_add_str(doc, root, "verb", "status");
     yyjson_mut_obj_add_str(doc, root, "project", rt->cfg.project);
     yyjson_mut_obj_add_str(doc, root, "region", rt->cfg.region);
+    yyjson_mut_obj_add_str(doc, root, "version",
+                           report->version[0] != '\0' ? report->version
+                                                      : "unknown");
+
+    {
+        yyjson_mut_val *bazel = yyjson_mut_obj(doc);
+
+        yyjson_mut_obj_add_str(doc, bazel, "command",
+                               report->bazel_command);
+        yyjson_mut_obj_add_bool(doc, bazel, "command_found",
+                                report->bazel_found);
+        if (report->repo_resolved) {
+            yyjson_mut_obj_add_str(doc, bazel, "repo_root",
+                                   report->repo_root);
+        } else {
+            yyjson_mut_obj_add_val(doc, bazel, "repo_root",
+                                   yyjson_mut_null(doc));
+        }
+        yyjson_mut_obj_add_val(doc, root, "bazel", bazel);
+    }
 
     if (stack != NULL) {
         yyjson_mut_val *node = yyjson_mut_obj(doc);
@@ -552,6 +1068,22 @@ static void json_report(instance_runtime *rt, const cfn_stack *stack,
         yyjson_mut_obj_add_str(doc, node, "name", stack->stack_name);
         yyjson_mut_obj_add_str(doc, node, "status",
                                cfn_stack_status_string(stack->status));
+        {
+            yyjson_mut_val *params = yyjson_mut_obj(doc);
+            yyjson_mut_val *tags = yyjson_mut_obj(doc);
+
+            for (size_t i = 0; i < stack->parameter_count; i++) {
+                yyjson_mut_obj_add_str(doc, params,
+                                       stack->parameters[i].key,
+                                       stack->parameters[i].value);
+            }
+            for (size_t i = 0; i < stack->tag_count; i++) {
+                yyjson_mut_obj_add_str(doc, tags, stack->tags[i].key,
+                                       stack->tags[i].value);
+            }
+            yyjson_mut_obj_add_val(doc, node, "parameters", params);
+            yyjson_mut_obj_add_val(doc, node, "tags", tags);
+        }
         yyjson_mut_obj_add_val(doc, root, "stack", node);
     } else {
         yyjson_mut_obj_add_val(doc, root, "stack", yyjson_mut_null(doc));
@@ -606,6 +1138,19 @@ static void json_report(instance_runtime *rt, const cfn_stack *stack,
 
         yyjson_mut_obj_add_str(doc, node, "tag", tag != NULL ? tag : "");
         yyjson_mut_obj_add_str(doc, node, "sha", sha != NULL ? sha : "");
+        if (report->latest_release[0] != '\0') {
+            yyjson_mut_obj_add_str(doc, node, "latest",
+                                   report->latest_release);
+        } else {
+            yyjson_mut_obj_add_val(doc, node, "latest", yyjson_mut_null(doc));
+        }
+        if (report->release_is_latest >= 0) {
+            yyjson_mut_obj_add_bool(doc, node, "is_latest",
+                                    report->release_is_latest);
+        } else {
+            yyjson_mut_obj_add_val(doc, node, "is_latest",
+                                   yyjson_mut_null(doc));
+        }
         {
             yyjson_mut_val *members = yyjson_mut_arr(doc);
 
@@ -674,15 +1219,38 @@ static void text_report(instance_runtime *rt, const cfn_stack *stack,
                         const ec2_instance_list *instances,
                         const char *record_ip, int record_present,
                         const status_report *report) {
-    instance_out(rt, "project: %s  region: %s\n", rt->cfg.project,
-                 rt->cfg.region);
+    instance_out(rt, "project: %s  region: %s  version: %s\n",
+                 rt->cfg.project, rt->cfg.region,
+                 report->version[0] != '\0' ? report->version : "unknown");
+    if (report->bazel_checked) {
+        instance_out(rt, "bazel: %s %s\n", report->bazel_command,
+                     report->bazel_found ? "(found)" : "(missing)");
+    }
+    if (report->repo_resolved) {
+        instance_out(rt, "repo-root: %s\n", report->repo_root);
+    }
     if (stack != NULL) {
         instance_out(rt, "stack: %s %s\n", stack->stack_name,
                      cfn_stack_status_string(stack->status));
+        for (size_t i = 0; i < stack->parameter_count; i++) {
+            instance_out(rt, "stack-parameter: %s=%s\n",
+                         stack->parameters[i].key,
+                         stack->parameters[i].value);
+        }
+        for (size_t i = 0; i < stack->tag_count; i++) {
+            instance_out(rt, "stack-tag: %s=%s\n", stack->tags[i].key,
+                         stack->tags[i].value);
+        }
         instance_out(rt, "release: %s\n",
                      cfn_stack_tag(stack, "stackctl:release-tag") != NULL
                          ? cfn_stack_tag(stack, "stackctl:release-tag")
                          : "(none)");
+        if (report->latest_release[0] != '\0') {
+            instance_out(rt, "release-latest: %s%s\n",
+                         report->latest_release,
+                         report->release_is_latest == 1 ? " (up to date)"
+                                                        : " (stack behind)");
+        }
     } else {
         instance_out(rt, "stack: (not deployed)\n");
     }
@@ -723,15 +1291,16 @@ int status_execute(instance_runtime *rt, const status_options *opts) {
     int fatal = 0;
     int rc;
 
-    (void)opts;
     if (rt == NULL) {
         return CLI_EXIT_USAGE;
     }
     memset(&report, 0, sizeof report);
     memset(&stacks, 0, sizeof stacks);
     memset(&instances, 0, sizeof instances);
+    report.release_is_latest = -1;
+    (void)resolve_version(report.version, sizeof report.version);
 
-    check_prerequisites(rt, &report, &fatal);
+    check_prerequisites(rt, opts, &report, &fatal);
     if (fatal) {
         return CLI_EXIT_USAGE;
     }
@@ -827,25 +1396,11 @@ int status_execute(instance_runtime *rt, const status_options *opts) {
 
         {
             int matched = parked;
-            const char *recorded_nonce = NULL;
 
             for (size_t i = 0; i < instances.count; i++) {
-                const char *nonce =
-                    ec2_instance_tag(&instances.items[i],
-                                     "stackctl:launch-nonce");
-
                 if (strcmp(instances.items[i].public_ip, record_ip) == 0 &&
                     instance_state_active(instances.items[i].state)) {
                     matched = 1;
-                }
-                if (nonce != NULL && nonce[0] != '\0' && !parked) {
-                    if (recorded_nonce == NULL) {
-                        recorded_nonce = nonce;
-                    } else if (strcmp(recorded_nonce, nonce) != 0) {
-                        add_warning(&report,
-                                    "multiple live launch nonces (multi-writer "
-                                    "risk)");
-                    }
                 }
             }
             if (!matched) {
@@ -873,6 +1428,10 @@ int status_execute(instance_runtime *rt, const status_options *opts) {
 
     /* Release health: members present and manifest-less garbage prefixes. */
     release_health(rt, stack, &report);
+
+    /* Pinned AMI drift (config vs stack) and concurrent-writer detection. */
+    ami_drift(rt, stack, &report);
+    check_multi_writer(rt, &instances, &report);
 
     /* Operator public IP vs OPERATOR_CIDR (warning only). */
     if (rt->cfg.ip_echo_url[0] != '\0' && rt->svc.ddns_ip_echo != NULL &&
@@ -912,6 +1471,8 @@ int cli_cmd_status(cli_ctx *ctx) {
     if (ctx == NULL) {
         return CLI_EXIT_USAGE;
     }
+    opts.config_dir = config_dir(cli_ctx_config(ctx));
+    opts.bazel_command = config_get(cli_ctx_config(ctx), "BAZEL_COMMAND");
     rc = cli_ctx_parse_args(ctx, NULL, 0, &args);
     if (rc != 0) {
         return cli_fail(ctx, CLI_EXIT_USAGE, "invalid status arguments");

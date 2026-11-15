@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "core/crypto/crypto.h"
@@ -304,7 +305,8 @@ static int token_matches(const char *member, const char *token) {
 
 int instance_manifest_select(const char *manifest, const char *variant,
                              const char *arch, char *member, size_t member_size,
-                             char *sha256_hex, size_t sha_size) {
+                             char *sha256_hex, size_t sha_size, char *choices,
+                             size_t choices_size) {
     char picked_member[512] = {0};
     char picked_sha[INST_SHA_MAX] = {0};
     size_t matches = 0;
@@ -316,6 +318,9 @@ int instance_manifest_select(const char *manifest, const char *variant,
     }
     member[0] = '\0';
     sha256_hex[0] = '\0';
+    if (choices != NULL && choices_size > 0) {
+        choices[0] = '\0';
+    }
     line = manifest;
     while (*line != '\0') {
         char copy[1024];
@@ -334,16 +339,23 @@ int instance_manifest_select(const char *manifest, const char *variant,
         name = strtok_r(NULL, " \t\r", &save);
         if (sha != NULL && name != NULL && token_matches(name, arch) &&
             (variant == NULL || token_matches(name, variant))) {
+            if (matches == 0) {
+                if (strlen(name) + 1 > sizeof picked_member ||
+                    strlen(sha) + 1 > sizeof picked_sha) {
+                    return ENAMETOOLONG;
+                }
+                memcpy(picked_member, name, strlen(name) + 1);
+                memcpy(picked_sha, sha, strlen(sha) + 1);
+            }
+            if (choices != NULL && choices_size > 0) {
+                size_t used = strlen(choices);
+
+                if (used < choices_size) {
+                    (void)snprintf(choices + used, choices_size - used, "%s%s",
+                                   used > 0 ? ", " : "", name);
+                }
+            }
             matches++;
-            if (matches > 1) {
-                return EINVAL; /* ambiguous */
-            }
-            if (strlen(name) + 1 > sizeof picked_member ||
-                strlen(sha) + 1 > sizeof picked_sha) {
-                return ENAMETOOLONG;
-            }
-            memcpy(picked_member, name, strlen(name) + 1);
-            memcpy(picked_sha, sha, strlen(sha) + 1);
         }
         if (newline == NULL) {
             break;
@@ -353,12 +365,53 @@ int instance_manifest_select(const char *manifest, const char *variant,
     if (matches == 0) {
         return ENOENT;
     }
+    if (matches > 1) {
+        return EINVAL; /* ambiguous; choices names every candidate */
+    }
     if (strlen(picked_member) + 1 > member_size ||
         strlen(picked_sha) + 1 > sha_size) {
         return ENAMETOOLONG;
     }
     memcpy(member, picked_member, strlen(picked_member) + 1);
     memcpy(sha256_hex, picked_sha, strlen(picked_sha) + 1);
+    return 0;
+}
+
+int instance_tool_available(const char *name) {
+    const char *path;
+    const char *start;
+
+    if (name == NULL || name[0] == '\0' || strchr(name, '/') != NULL) {
+        return 0;
+    }
+    path = getenv("PATH");
+    if (path == NULL) {
+        return 0;
+    }
+    start = path;
+    for (;;) {
+        const char *end = strchr(start, ':');
+        size_t dir_len = end != NULL ? (size_t)(end - start) : strlen(start);
+        char candidate[PATH_MAX];
+        struct stat info;
+        int written;
+
+        if (dir_len == 0) {
+            written = snprintf(candidate, sizeof candidate, "./%s", name);
+        } else {
+            written = snprintf(candidate, sizeof candidate, "%.*s/%s",
+                               (int)dir_len, start, name);
+        }
+        if (written > 0 && (size_t)written < sizeof candidate &&
+            stat(candidate, &info) == 0 && S_ISREG(info.st_mode) &&
+            access(candidate, X_OK) == 0) {
+            return 1;
+        }
+        if (end == NULL) {
+            break;
+        }
+        start = end + 1;
+    }
     return 0;
 }
 

@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "core/ssh/ssh.h"
 
@@ -308,7 +309,8 @@ static int resolve_release(instance_runtime *rt, const cfn_stack *stack,
                            const char *arch, const char *variant,
                            char *tag_out, size_t tag_cap, char *member_out,
                            size_t member_cap, char *sha_out, size_t sha_cap,
-                           char *member_sha_out, size_t member_sha_cap) {
+                           char *member_sha_out, size_t member_sha_cap,
+                           char *choices_out, size_t choices_cap) {
     const char *tag = cfn_stack_tag(stack, "stackctl:release-tag");
     const char *sha = cfn_stack_tag(stack, "stackctl:release-sha");
     const char *bucket = cfn_stack_output(stack, "ArtifactBucketName");
@@ -338,7 +340,8 @@ static int resolve_release(instance_runtime *rt, const cfn_stack *stack,
         return rc;
     }
     rc = instance_manifest_select(manifest, variant, arch, member_out,
-                                  member_cap, member_sha_out, member_sha_cap);
+                                  member_cap, member_sha_out, member_sha_cap,
+                                  choices_out, choices_cap);
     free(manifest);
     if (rc != 0) {
         return rc;
@@ -416,7 +419,13 @@ static int build_setup_script(char *out, size_t cap, const char *stage_dir,
     }
     if (rc == 0) {
         rc = append_text(out, cap, &used,
-                         "\n  rc=$?\nfi\n"
+                         " >\"$d/setup.log\" 2>&1\n"
+                         "  rc=$?\nfi\n"
+                         /* Surface the entrypoint's tail on the operator's
+                          * stderr (the ssh child inherits it). */
+                         "if [ -f \"$d/setup.log\" ]; then\n"
+                         "  tail -n 150 \"$d/setup.log\" >&2\n"
+                         "fi\n"
                          /* Success: remove the staging dir; the rc file is no
                           * longer needed because ssh returns 0. Failure: keep
                           * the rc file so the reconnect-once reader can report
@@ -488,6 +497,15 @@ static int build_setup_command(instance_runtime *rt, const cfn_stack *stack,
     if (rc == 0) {
         rc = append_env(out, cap, &used, "STACKCTL_BUCKET_ARTIFACT", bucket);
     }
+    if (rc == 0) {
+        const char *cert_bucket = cfn_stack_output(stack, "CertBucketName");
+
+        /* An absent/empty output means the cert bucket module is disabled. */
+        if (cert_bucket != NULL && cert_bucket[0] != '\0') {
+            rc = append_env(out, cap, &used, "STACKCTL_BUCKET_CERT",
+                            cert_bucket);
+        }
+    }
     if (rc == 0 && rt->cfg.ddns_onbox) {
         char path[INST_PATH_MAX];
 
@@ -501,6 +519,171 @@ static int build_setup_command(instance_runtime *rt, const cfn_stack *stack,
         rc = append_quoted(out, cap, &used, script);
     }
     return rc;
+}
+
+/*
+ * DDNS_ONBOX password delivery (spec §8, §9): the password was read from the
+ * SSM SecureString operator-side; when the box must own it, scp it to a
+ * user-writable remote staging path, then install it as a 0600 file at
+ * /etc/<project>-ddns/password via sudo and remove the staging copy. The local
+ * temp file is 0600 (mkstemp) and is always unlinked. Never argv: the secret
+ * only travels through the temp file and the scp data channel.
+ *
+ * Returns CLI_EXIT_OK or the launch-failure class (7 for an ssh transport
+ * failure, 4 otherwise); the caller owns termination/DNS cleanup.
+ */
+static int deliver_ddns_password(instance_runtime *rt, const char *ip,
+                                 const char *instance_id, const char *nonce,
+                                 int strict_yes, int timeout_sec) {
+    char password[INST_PATH_MAX];
+    char target[INST_PATH_MAX];
+    char remote_tmp[INST_PATH_MAX];
+    char local_tmp[64];
+    char destination[INST_PATH_MAX + 64];
+    char command[INST_PATH_MAX * 3];
+    sshc_options ssh_opts;
+    const char *scp_operands[2];
+    const char *install_operands[2];
+    char **argv = NULL;
+    size_t command_used = 0;
+    int fd = -1;
+    int remote_rc = 0;
+    int rc;
+
+    memset(password, 0, sizeof password);
+    if (snprintf(target, sizeof target, "/etc/%s-ddns/password",
+                 rt->cfg.project) >= (int)sizeof target) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "DDNS password path is too long");
+    }
+    if (snprintf(remote_tmp, sizeof remote_tmp, "/tmp/.stackctl-ddns-%s",
+                 nonce) >= (int)sizeof remote_tmp) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "DDNS staging path is too long");
+    }
+    if (snprintf(destination, sizeof destination, "%s:%s", ip, remote_tmp) >=
+        (int)sizeof destination) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "DDNS scp destination is too long");
+    }
+    rc = instance_ddns_password(rt, password, sizeof password);
+    if (rc != 0) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot read the DDNS password for on-box "
+                             "delivery");
+    }
+
+    snprintf(local_tmp, sizeof local_tmp, "/tmp/stackctl-ddns-XXXXXX");
+    fd = mkstemp(local_tmp);
+    if (fd < 0) {
+        memset(password, 0, sizeof password);
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot create the local DDNS password temp file");
+    }
+    {
+        size_t len = strlen(password);
+        size_t written = 0;
+
+        while (written < len) {
+            ssize_t chunk = write(fd, password + written, len - written);
+
+            if (chunk > 0) {
+                written += (size_t)chunk;
+                continue;
+            }
+            if (chunk < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        rc = written == len && close(fd) == 0 ? 0 : EIO;
+        fd = -1;
+    }
+    memset(password, 0, sizeof password);
+    if (rc != 0) {
+        (void)unlink(local_tmp);
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot write the local DDNS password temp file");
+    }
+
+    memset(&ssh_opts, 0, sizeof ssh_opts);
+    ssh_opts.identity = rt->cfg.ssh_identity;
+    ssh_opts.known_hosts = known_hosts_path(rt);
+    ssh_opts.instance_id = instance_id;
+    ssh_opts.strict_yes = strict_yes;
+    ssh_opts.port = rt->cfg.ssh_port;
+    ssh_opts.user = rt->cfg.ssh_user;
+    ssh_opts.server_alive_interval = 15;
+    ssh_opts.server_alive_count_max = 3;
+
+    scp_operands[0] = local_tmp;
+    scp_operands[1] = destination;
+    rc = sshc_build_argv(SSHC_KIND_SCP, &ssh_opts, scp_operands, 2, &argv);
+    if (rc != 0 || rt->svc.scp_exec == NULL) {
+        sshc_argv_free(argv);
+        (void)unlink(local_tmp);
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot prepare the DDNS password transfer");
+    }
+    rc = rt->svc.scp_exec(argv, timeout_sec, NULL, &remote_rc);
+    sshc_argv_free(argv);
+    (void)unlink(local_tmp);
+    if (rc == ENOTCONN) {
+        return instance_fail(
+            rt, CLI_EXIT_SSH,
+            "SSH transport failure delivering the DDNS password; verify your "
+            "current public IP is within OPERATOR_CIDR (`stackctl status` "
+            "checks this)");
+    }
+    if (rc != 0 || remote_rc != 0) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot deliver the DDNS password to %s", ip);
+    }
+
+    rc = append_text(command, sizeof command, &command_used,
+                     "umask 077; sudo install -D -m 600 ");
+    if (rc == 0) {
+        rc = append_quoted(command, sizeof command, &command_used, remote_tmp);
+    }
+    if (rc == 0) {
+        rc = append_text(command, sizeof command, &command_used, " ");
+    }
+    if (rc == 0) {
+        rc = append_quoted(command, sizeof command, &command_used, target);
+    }
+    if (rc == 0) {
+        rc = append_text(command, sizeof command, &command_used, " && rm -f ");
+    }
+    if (rc == 0) {
+        rc = append_quoted(command, sizeof command, &command_used, remote_tmp);
+    }
+    if (rc != 0) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "DDNS password install command is too long");
+    }
+
+    install_operands[0] = ip;
+    install_operands[1] = command;
+    rc = sshc_build_argv(SSHC_KIND_SSH, &ssh_opts, install_operands, 2, &argv);
+    if (rc != 0 || rt->svc.ssh_exec == NULL) {
+        sshc_argv_free(argv);
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot prepare the DDNS password install");
+    }
+    rc = rt->svc.ssh_exec(argv, timeout_sec, NULL, &remote_rc);
+    sshc_argv_free(argv);
+    if (rc == ENOTCONN) {
+        return instance_fail(
+            rt, CLI_EXIT_SSH,
+            "SSH transport failure installing the DDNS password; verify your "
+            "current public IP is within OPERATOR_CIDR (`stackctl status` "
+            "checks this)");
+    }
+    if (rc != 0 || remote_rc != 0) {
+        return instance_fail(rt, CLI_EXIT_LAUNCH,
+                             "cannot install the DDNS password at %s", target);
+    }
+    return CLI_EXIT_OK;
 }
 
 int launch_execute(instance_runtime *rt, const launch_options *opts) {
@@ -524,6 +707,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
     char release_sha[INST_SHA_MAX] = {0};
     char member[512] = {0};
     char member_sha[INST_SHA_MAX] = {0};
+    char choices[1024] = {0};
     char replaced[STATE_REPLACED_MAX] = {0};
     size_t replaced_used = 0;
     int spot;
@@ -541,6 +725,23 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
 
     if (rt->cfg.project[0] == '\0') {
         return instance_fail(rt, CLI_EXIT_USAGE, "missing project");
+    }
+    /*
+     * Local tool preflight: host-key pinning requires ssh-keyscan. Fail before
+     * any AWS call or spend rather than midway through the launch.
+     */
+    if (rt->svc.tool_available != NULL &&
+        !rt->svc.tool_available("ssh-keyscan")) {
+        return instance_fail(
+            rt, CLI_EXIT_USAGE,
+            "ssh-keyscan not found on PATH; install the OpenSSH client tools "
+            "(host-key pinning requires ssh-keyscan)");
+    }
+
+    /* Identity guard: never spend or mutate as the wrong project identity. */
+    rc = instance_identity_guard(rt);
+    if (rc != CLI_EXIT_OK) {
+        return rc;
     }
 
     /* Infra stack outputs (missing stack = hard error, run deploy first). */
@@ -630,7 +831,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
      */
     rc = resolve_release(rt, stack, arch, opts->variant, release_tag,
                          sizeof release_tag, member, sizeof member, release_sha,
-                         sizeof release_sha, member_sha, sizeof member_sha);
+                         sizeof release_sha, member_sha, sizeof member_sha,
+                         choices, sizeof choices);
     if (rc == ENOENT) {
         cfn_stack_list_free(&stacks);
         return instance_fail(
@@ -650,7 +852,9 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
         cfn_stack_list_free(&stacks);
         return instance_fail(
             rt, CLI_EXIT_USAGE,
-            "release manifest member for %s is ambiguous; pass --variant", arch);
+            "release manifest member for %s is ambiguous (choices: %s); pass "
+            "--variant",
+            arch, choices[0] != '\0' ? choices : "unknown");
     }
     if (rc != 0) {
         cfn_stack_list_free(&stacks);
@@ -895,6 +1099,23 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             result = launch_fail(rt, opts, run_result.instance_id, snapshot_ip,
                                  failure);
             return result;
+        }
+
+        /*
+         * DDNS_ONBOX: deliver the SSM-read password to the instance only now
+         * that the host key is pinned and the connection is authenticated.
+         */
+        if (rt->cfg.ddns_onbox) {
+            int delivered = deliver_ddns_password(
+                rt, new_ip, run_result.instance_id, nonce, strict_yes,
+                opts->ssh_timeout > 0 ? opts->ssh_timeout
+                                      : LAUNCH_DEFAULT_SSH_TIMEOUT);
+
+            if (delivered != CLI_EXIT_OK) {
+                cfn_stack_list_free(&stacks);
+                return launch_fail(rt, opts, run_result.instance_id,
+                                   snapshot_ip, delivered);
+            }
         }
 
         /* Setup SSH session. */

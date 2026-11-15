@@ -169,6 +169,14 @@ int aws_clock_skew(const aws_resp *resp, long *delta_sec);
 typedef int (*aws_waiter_fn)(aws_ctx *ctx, void *ud, int *done);
 
 /*
+ * Abort callback polled before each waiter poll. Returns non-zero when the
+ * wait should stop (for example because a SIGINT/SIGTERM was recorded).
+ * `user` is the caller-supplied context from aws_set_abort_hook() or
+ * aws_wait_interruptible().
+ */
+typedef int (*aws_abort_fn)(void *user);
+
+/*
  * Generic bounded polling loop (waiters: instance running, IP assigned, stack
  * CREATE_COMPLETE).
  *
@@ -176,9 +184,32 @@ typedef int (*aws_waiter_fn)(aws_ctx *ctx, void *ud, int *done);
  * `interval_sec` seconds between polls. Returns 0 with `*timed_out == 0` when
  * the callback reports done, 0 with `*timed_out == 1` when attempts exhaust,
  * and propagates a non-zero callback return.
+ *
+ * Before each poll the abort hook installed on `ctx` (see
+ * aws_set_abort_hook()) is consulted; a non-zero return stops the loop with
+ * EINTR so callers take their normal failure path. Waiters built on this
+ * function therefore inherit cancellation once the client's hook is set.
  */
 int aws_wait(aws_ctx *ctx, aws_waiter_fn fn, void *ud, int attempts,
              int interval_sec, int *timed_out);
+
+/*
+ * As aws_wait(), but with an explicit abort hook for this wait only. A NULL
+ * `abort_fn` disables cancellation (the per-client hook is not consulted).
+ * A non-zero `abort_fn(abort_ud)` return stops the loop with EINTR before the
+ * next poll; `*timed_out` stays 0.
+ */
+int aws_wait_interruptible(aws_ctx *ctx, aws_waiter_fn fn, void *ud,
+                           aws_abort_fn abort_fn, void *abort_ud, int attempts,
+                           int interval_sec, int *timed_out);
+
+/*
+ * Install (or clear, with NULL) the abort hook consulted by aws_wait() for this
+ * client. The CLI sets it to `cli_abort_check` so a first SIGINT/SIGTERM
+ * interrupts every cfn/ec2 waiter built on aws_wait() without per-waiter
+ * changes. Safe on NULL (no-op).
+ */
+void aws_set_abort_hook(aws_ctx *ctx, aws_abort_fn abort_fn, void *abort_ud);
 
 #ifdef __cplusplus
 }

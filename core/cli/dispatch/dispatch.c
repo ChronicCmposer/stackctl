@@ -83,13 +83,44 @@ int cli_dispatch_check_globals(const cli_command *command,
 }
 
 int cli_dispatch_normalize_rc(int rc) {
-    if (rc >= CLI_EXIT_OK && rc <= CLI_EXIT_SSH) {
+    /*
+     * Verbs must return one of the frozen CLI_EXIT_* values; those pass through
+     * unchanged. Compare against the enum members explicitly rather than a bare
+     * 0..7 range check, so adding/reordering the frozen codes cannot silently
+     * widen the accepted set. Everything else is an errno-style library value
+     * and is classified by cli_rc_to_exit().
+     *
+     * Note: the frozen values occupy 0..7 and therefore numerically overlap the
+     * first errno values (EPERM..E2BIG). That overlap is unavoidable in the
+     * frozen ABI, so the guard against a verb leaking a raw errno is the verb
+     * audit (cli_cmd_* must only return CLI_EXIT_*), not this mapper.
+     */
+    switch (rc) {
+    case CLI_EXIT_OK:
+    case CLI_EXIT_USAGE:
+    case CLI_EXIT_AWS:
+    case CLI_EXIT_VERIFY:
+    case CLI_EXIT_LAUNCH:
+    case CLI_EXIT_CLEANUP:
+    case CLI_EXIT_FRESHNESS:
+    case CLI_EXIT_SSH:
         return rc;
+    default:
+        break;
     }
     if (rc < 0) {
         return cli_rc_to_exit(-rc);
     }
     return cli_rc_to_exit(rc);
+}
+
+int cli_dispatch_verb_exit(int verb_rc) {
+    int exit_code = cli_dispatch_normalize_rc(verb_rc);
+
+    if (exit_code == CLI_EXIT_OK && cli_signal_received() != 0) {
+        return CLI_EXIT_AWS;
+    }
+    return exit_code;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -541,14 +572,14 @@ int cli_dispatch_run(int argc, char **argv) {
     }
 
     /*
-     * The first signal is not classified here: spec §4 routes it to the verb's
-     * standard failure path, which restores DDNS/lock state and returns the
-     * appropriate frozen exit code (0-7). Synthesizing `128+signo` would step
-     * outside the stable exit-code contract, so dispatch only maps what the
-     * verb returned. The second signal is handled in cli_ctx.c with immediate
-     * death.
+     * The first signal is routed to the verb's standard failure path. If the
+     * verb still reports success after a signal was recorded, it must not be
+     * reported as success: cli_dispatch_verb_exit() maps that to the frozen
+     * AWS failure class (2), matching the CFN-wait rule in spec §4 without
+     * synthesizing 128+signo. The second signal is immediate death in
+     * cli_ctx.c.
      */
     rc = command->run(ctx);
     cli_ctx_free(ctx);
-    return cli_dispatch_normalize_rc(rc);
+    return cli_dispatch_verb_exit(rc);
 }

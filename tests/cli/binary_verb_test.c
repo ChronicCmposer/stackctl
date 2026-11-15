@@ -400,6 +400,9 @@ static void fixture_init(fixture *fx) {
     make_executable(path);
     snprintf(path, sizeof path, "%s/ssh-keyscan", fx->bin_dir);
     make_executable(path);
+    /* status runs the bazel preflight; the fake PATH needs it present. */
+    snprintf(path, sizeof path, "%s/bazel", fx->bin_dir);
+    make_executable(path);
     if (mkdir(fx->state, 0700) != 0 && errno != EEXIST) {
         perror(fx->state);
         exit(1);

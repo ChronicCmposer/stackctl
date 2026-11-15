@@ -1,7 +1,7 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 
-# core/ssm — AWS Systems Manager (Parameter Store + Run Command) request
-# builders and response parsers over core/aws (spec §3/§4, CONTRACT §core/ssm).
+# core/ssm — AWS Systems Manager Parameter Store ("GetParameter only", spec §5)
+# request builders and response parsers over core/aws (CONTRACT §core/ssm).
 #
 # The AWS SSM API is JSON-1.1; every call carries signed `X-Amz-Target` and
 # `Content-Type` extra headers (CONTRACT Amendment 5). No sockets of its own:

@@ -145,3 +145,42 @@ void instance_audit(instance_runtime *rt, const char *verb, const char *args,
         instance_warn(rt, "could not append to the operations log");
     }
 }
+
+int instance_identity_guard(instance_runtime *rt) {
+    char *arn = NULL;
+    char suffix[INST_PROJECT_MAX + 16];
+    size_t arn_len;
+    size_t suffix_len;
+    int rc;
+
+    if (rt == NULL) {
+        return CLI_EXIT_USAGE;
+    }
+    /* Mirrors provision/status: without the seam the guard is not exercised. */
+    if (rt->svc.iam_get_caller_identity == NULL) {
+        return CLI_EXIT_OK;
+    }
+    rc = rt->svc.iam_get_caller_identity(rt->svc.aws, NULL, &arn, NULL);
+    if (rc != 0) {
+        free(arn);
+        return instance_fail(rt, CLI_EXIT_AWS,
+                             "cannot verify the caller identity");
+    }
+    if (arn == NULL) {
+        return instance_fail(rt, CLI_EXIT_VERIFY,
+                             "identity guard: no caller ARN returned");
+    }
+    snprintf(suffix, sizeof suffix, ":user/%s", rt->cfg.project);
+    arn_len = strlen(arn);
+    suffix_len = strlen(suffix);
+    if (arn_len < suffix_len ||
+        strcmp(arn + (arn_len - suffix_len), suffix) != 0) {
+        rc = instance_fail(rt, CLI_EXIT_VERIFY,
+                           "identity guard: %s does not end with %s", arn,
+                           suffix);
+    } else {
+        rc = CLI_EXIT_OK;
+    }
+    free(arn);
+    return rc;
+}

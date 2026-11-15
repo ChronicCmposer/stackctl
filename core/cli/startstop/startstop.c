@@ -139,6 +139,15 @@ int startstop_execute(instance_runtime *rt, const startstop_options *opts,
         return instance_fail(rt, CLI_EXIT_USAGE,
                              "SERVICE_UNIT is required for start/stop");
     }
+    if (rt->cfg.operator_cidr[0] == '\0') {
+        return instance_fail(rt, CLI_EXIT_USAGE,
+                             "SSH impossible; set OPERATOR_CIDR and redeploy");
+    }
+    /* Identity guard: re-assert the project identity before the state change. */
+    rc = instance_identity_guard(rt);
+    if (rc != CLI_EXIT_OK) {
+        return rc;
+    }
     if (rt->svc.ec2_describe_instances == NULL) {
         return instance_fail(rt, CLI_EXIT_USAGE, "EC2 unavailable");
     }

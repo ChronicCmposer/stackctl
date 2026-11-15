@@ -22,6 +22,9 @@ typedef enum {
 } tc_mode;
 
 int tc_check_string(const char *text, size_t length, tc_mode mode);
+/* Same as tc_check_string but labels diagnostics with the source path. */
+int tc_check_buffer(const char *path, const char *text, size_t length,
+                    tc_mode mode);
 int tc_check_file(const char *path, tc_mode mode);
 
 #endif /* STACKCTL_DEPLOY_CHECK_TEMPLATE_CHECK_H_ */

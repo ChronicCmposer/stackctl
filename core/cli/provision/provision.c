@@ -22,8 +22,10 @@
 #include <unistd.h>
 
 #include "aws.h"
+#include "core/config/envfile.h"
 #include "core/ini/ini.h"
 #include "iam.h"
+#include "template_check.h"
 #include "yyjson.h"
 
 /* ------------------------------------------------------------------------- */
@@ -43,8 +45,20 @@ void provision_set_ops_for_test(const provision_ops *ops, void *ud) {
 /* ------------------------------------------------------------------------- */
 
 static int prod_aws_init(void *ud, const char *profile, aws_ctx **out) {
+    int rc;
+
     (void)ud;
-    return aws_init(out, profile);
+    rc = aws_init(out, profile);
+    if (rc != 0) {
+        return rc;
+    }
+    aws_set_abort_hook(*out, cli_abort_check, NULL);
+    return 0;
+}
+
+/* Test-only entry point for the production init seam. */
+int provision_prod_aws_init_for_test(const char *profile, aws_ctx **out) {
+    return prod_aws_init(NULL, profile, out);
 }
 
 static void prod_aws_free(void *ud, aws_ctx *aws) {
@@ -293,19 +307,28 @@ static void prod_retry_pause(void *ud) {
     (void)usleep(500 * 1000);
 }
 
+static int prod_read_template_path(void *ud, const char *path,
+                                   char **body_out);
+
 static int prod_read_template(void *ud, const char *repo_root, char **body_out) {
     char path[PATH_MAX];
-    FILE *file;
-    long size;
-    char *body;
     int rc;
 
-    (void)ud;
     rc = snprintf(path, sizeof(path), "%s/deploy/stackctl-operator.yaml",
                   repo_root);
     if (rc < 0 || (size_t)rc >= sizeof(path)) {
         return ENAMETOOLONG;
     }
+    return prod_read_template_path(ud, path, body_out);
+}
+
+static int prod_read_template_path(void *ud, const char *path,
+                                   char **body_out) {
+    FILE *file;
+    long size;
+    char *body;
+
+    (void)ud;
     file = fopen(path, "rb");
     if (file == NULL) {
         return errno != 0 ? errno : ENOENT;
@@ -361,6 +384,7 @@ static const provision_ops production_ops = {
     .credentials_write = prod_credentials_write,
     .retry_pause = prod_retry_pause,
     .read_template = prod_read_template,
+    .read_template_path = prod_read_template_path,
 };
 
 /* ------------------------------------------------------------------------- */
@@ -431,35 +455,6 @@ static void union_merge_kv(operator_union *u, const char *key,
     }
 }
 
-static void parse_env_line(operator_union *u, char *line) {
-    char *equals = strchr(line, '=');
-    char *end;
-
-    if (equals == NULL || equals == line || line[0] == '#') {
-        return;
-    }
-    *equals = '\0';
-    end = line + strlen(line);
-    while (end > line && (end[-1] == ' ' || end[-1] == '\t')) {
-        *--end = '\0';
-    }
-    {
-        char *value = equals + 1;
-        char *value_end;
-
-        while (*value == ' ' || *value == '\t') {
-            value++;
-        }
-        value_end = value + strlen(value);
-        while (value_end > value &&
-               (value_end[-1] == '\n' || value_end[-1] == '\r' ||
-                value_end[-1] == ' ' || value_end[-1] == '\t')) {
-            *--value_end = '\0';
-        }
-        union_merge_kv(u, line, value);
-    }
-}
-
 static void collect_union(const provision_env *env, operator_union *u) {
     DIR *dir;
 
@@ -496,8 +491,8 @@ static void collect_union(const provision_env *env, operator_union *u) {
     for (struct dirent *entry = readdir(dir); entry != NULL;
          entry = readdir(dir)) {
         char path[PATH_MAX];
-        FILE *file;
-        char line[1024];
+        char err[256];
+        config_envfile *variant = NULL;
 
         if (strncmp(entry->d_name, ".env.", 5) != 0 ||
             strstr(entry->d_name, ".example") != NULL) {
@@ -507,14 +502,15 @@ static void collect_union(const provision_env *env, operator_union *u) {
                      entry->d_name) >= (int)sizeof(path)) {
             continue;
         }
-        file = fopen(path, "r");
-        if (file == NULL) {
+        /* Consume the config module's parser, never a private .env reader. */
+        if (config_envfile_load(path, &variant, err, sizeof err) != 0) {
             continue;
         }
-        while (fgets(line, sizeof(line), file) != NULL) {
-            parse_env_line(u, line);
+        for (size_t i = 0; i < config_envfile_count(variant); i++) {
+            union_merge_kv(u, config_envfile_key_at(variant, i),
+                           config_envfile_value_at(variant, i));
         }
-        fclose(file);
+        config_envfile_free(variant);
     }
     closedir(dir);
 }
@@ -817,6 +813,7 @@ int provision_run(const provision_env *env) {
     char stack[CFN_STACK_NAME_MAX];
     char change_set_name[CFN_CHANGE_SET_NAME_MAX];
     char repo_root[PATH_MAX];
+    char template_path[PATH_MAX];
     char *allocated_root = NULL;
     char *template_body = NULL;
     aws_ctx *aws = NULL;
@@ -863,10 +860,43 @@ int provision_run(const provision_env *env) {
         snprintf(repo_root, sizeof(repo_root), "%s", ".");
     }
 
-    rc = ops->read_template(ud, repo_root, &template_body);
-    if (rc != 0) {
-        fprintf(env->err, "stackctl: cannot read the operator template\n");
-        return CLI_EXIT_USAGE;
+    /*
+     * §6.3 structural contract, fail-closed before any AWS call. TEMPLATE_OVERRIDE
+     * is infra-only (deploy); provision always validates the canonical operator
+     * template, so there is no operator override path to resolve.
+     */
+    if (ops->read_template_path != NULL) {
+        int written = snprintf(template_path, sizeof(template_path),
+                               "%s/deploy/stackctl-operator.yaml", repo_root);
+
+        if (written < 0 || (size_t)written >= sizeof(template_path)) {
+            fprintf(env->err,
+                    "stackctl: cannot resolve the operator template path\n");
+            return CLI_EXIT_USAGE;
+        }
+        rc = ops->read_template_path(ud, template_path, &template_body);
+        if (rc != 0) {
+            fprintf(env->err,
+                    "stackctl: cannot read the operator template %s\n",
+                    template_path);
+            return CLI_EXIT_USAGE;
+        }
+        rc = tc_check_buffer(template_path, template_body,
+                             strlen(template_body), TC_MODE_OPERATOR);
+        if (rc != 0) {
+            fprintf(env->err,
+                    "stackctl: template %s violates the §6.3 contract\n",
+                    template_path);
+            free(template_body);
+            return CLI_EXIT_USAGE;
+        }
+    } else {
+        /* Legacy test seam: no real path to name in diagnostics. */
+        rc = ops->read_template(ud, repo_root, &template_body);
+        if (rc != 0) {
+            fprintf(env->err, "stackctl: cannot read the operator template\n");
+            return CLI_EXIT_USAGE;
+        }
     }
 
     rc = ops->aws_init(ud, "default", &aws);
@@ -1109,35 +1139,6 @@ done:
 /* Public entry point                                                        */
 /* ------------------------------------------------------------------------- */
 
-static int is_regular(const char *path) {
-    return access(path, F_OK) == 0;
-}
-
-static int derive_config_dir(char *out, size_t cap) {
-    const char *base = config_build_working_directory();
-    char candidate[PATH_MAX];
-    char *real;
-    int rc;
-
-    if (base == NULL || base[0] == '\0') {
-        base = ".";
-    }
-    rc = snprintf(candidate, sizeof(candidate), "%s/deploy/aws", base);
-    if (rc < 0 || (size_t)rc >= sizeof(candidate)) {
-        return ENAMETOOLONG;
-    }
-    if (!is_regular(candidate)) {
-        snprintf(candidate, sizeof(candidate), "%s", base);
-    }
-    real = realpath(candidate, NULL);
-    if (real == NULL) {
-        return errno != 0 ? errno : ENOENT;
-    }
-    snprintf(out, cap, "%s", real);
-    free(real);
-    return 0;
-}
-
 static int confirm_with_ctx(void *ud, const char *prompt) {
     return cli_confirm((cli_ctx *)ud, prompt);
 }
@@ -1168,7 +1169,6 @@ int cli_cmd_provision(cli_ctx *ctx) {
     };
     cli_args args = {0};
     provision_env env = {0};
-    char config_dir[PATH_MAX];
     int rc;
 
     if (ctx == NULL) {
@@ -1188,15 +1188,14 @@ int cli_cmd_provision(cli_ctx *ctx) {
     env.rotate_ci = cli_args_flag(&args, "rotate-ci");
     cli_args_free(&args);
 
-    rc = derive_config_dir(config_dir, sizeof(config_dir));
-    if (rc != 0) {
+    env.cfg = cli_ctx_config(ctx);
+    env.config_dir = config_dir(env.cfg);
+    if (env.config_dir == NULL) {
         return cli_fail(ctx, CLI_EXIT_USAGE,
                         "provision: cannot locate the project config "
                         "directory");
     }
-    env.cfg = cli_ctx_config(ctx);
-    env.config_dir = config_dir;
-    env.region_variant = provision_region_variant(config_dir, env.cfg);
+    env.region_variant = provision_region_variant(env.config_dir, env.cfg);
     env.yes = cli_ctx_yes(ctx);
     env.dry_run = cli_ctx_dry_run(ctx);
     env.json = cli_ctx_json(ctx);

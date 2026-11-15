@@ -60,6 +60,24 @@ static int call_index(const char *name) {
 
 static ec2_instance fixtures[8];
 static size_t fixture_count;
+static char identity_arn[256];
+static int identity_fail;
+
+static int fake_identity(aws_ctx *ctx, char **account, char **arn,
+                         char **user_id) {
+    (void)ctx;
+    if (account != NULL) {
+        *account = NULL;
+    }
+    if (user_id != NULL) {
+        *user_id = NULL;
+    }
+    if (identity_fail) {
+        return EIO;
+    }
+    *arn = strdup(identity_arn);
+    return *arn != NULL ? 0 : ENOMEM;
+}
 
 static int fake_describe(ec2_client *client, const ec2_filter *filters,
                          size_t filter_count, ec2_instance_list *out) {
@@ -224,6 +242,9 @@ static void reset_all(void) {
     ssm_fail = 0;
     memset(forgot_ids, 0, sizeof forgot_ids);
     forgot_count = 0;
+    snprintf(identity_arn, sizeof identity_arn, "%s",
+             "arn:aws:iam::123456789012:user/demo");
+    identity_fail = 0;
 }
 
 static void add_instance(const char *id, const char *state, const char *ip) {
@@ -255,6 +276,7 @@ static void make_runtime(instance_runtime *rt, instance_services *svc) {
     svc->ddns_update = fake_ddns;
     svc->ssm_get_parameter = fake_ssm;
     svc->kh_forget = fake_kh_forget;
+    svc->iam_get_caller_identity = fake_identity;
 
     instance_runtime_init(rt, &cfg, NULL, svc, 0, 0, 0);
     rt->dns_attempts = 2;
@@ -492,6 +514,44 @@ static void test_terminate_api_error(void) {
     free_runtime(&rt);
 }
 
+
+static void test_identity_mismatch_is_exit3(void) {
+    instance_runtime rt;
+    instance_services svc;
+    terminate_options opts = {.instance_id = NULL};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    add_instance("i-1", "running", "198.51.100.1");
+    snprintf(identity_arn, sizeof identity_arn, "%s",
+             "arn:aws:iam::123456789012:user/other-project");
+
+    rc = terminate_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_VERIFY, "identity mismatch is exit 3");
+    CHECK(!called("terminate"), "no termination after an identity mismatch");
+    free_runtime(&rt);
+}
+
+static void test_identity_api_error_is_exit2(void) {
+    instance_runtime rt;
+    instance_services svc;
+    terminate_options opts = {.instance_id = NULL};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    add_instance("i-1", "running", "198.51.100.1");
+    identity_fail = 1;
+
+    rc = terminate_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_AWS, "identity API error is exit 2");
+    CHECK(!called("terminate"), "no termination when identity is unverifiable");
+    free_runtime(&rt);
+}
+
 int main(void) {
     test_argv();
     test_single_instance_parks_when_record_matches();
@@ -504,6 +564,8 @@ int main(void) {
     test_dns_verify_failure_is_exit5();
     test_single_instance_record_elsewhere_is_not_parked();
     test_terminate_api_error();
+    test_identity_mismatch_is_exit3();
+    test_identity_api_error_is_exit2();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

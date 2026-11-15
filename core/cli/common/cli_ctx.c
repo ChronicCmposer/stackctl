@@ -239,3 +239,20 @@ void cli_signal_install(void) {
 int cli_signal_received(void) { return signal_count != 0; }
 
 int cli_signal_number(void) { return (int)signal_seen; }
+
+int cli_abort_check(void *user) {
+    (void)user;
+    return cli_signal_received();
+}
+
+void cli_signal_test_fire(int number) {
+    if (signal_seen == 0) {
+        signal_seen = number;
+    }
+    signal_count++;
+}
+
+void cli_signal_test_reset(void) {
+    signal_count = 0;
+    signal_seen = 0;
+}

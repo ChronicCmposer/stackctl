@@ -206,6 +206,7 @@ Parameters:
     Default: ""
     Description: Email address subscribed to spot-interruption warnings.
 Conditions:
+  AmiPinned: !Equals [!Ref AmiPolicy, "pinned"]
   CertBucketEnabledCondition: !Equals [!Ref CertBucketEnabled, "true"]
   HasOperatorCidr: !Not [!Equals [!Ref OperatorCidr, ""]]
   HasDdnsHost: !Not [!Equals [!Ref DdnsHost, ""]]
@@ -234,8 +235,8 @@ Resources:
       stackctl:release-tag: !Ref ReleaseTag
       stackctl:release-sha: !Ref ReleaseManifestSha256
       stackctl:ami-policy: !Ref AmiPolicy
-      stackctl:ami-amd64: !Ref AmiIdAmd64
-      stackctl:ami-arm64: !Ref AmiIdArm64
+      stackctl:ami-amd64: !If [AmiPinned, !Ref AmiIdAmd64, ""]
+      stackctl:ami-arm64: !If [AmiPinned, !Ref AmiIdArm64, ""]
       stackctl:ddns-host: !Ref DdnsHost
       stackctl:ddns-domain: !Ref DdnsDomain
     Properties:
@@ -624,6 +625,8 @@ Outputs:
     Value: !Sub ${ProjectName}-instance-profile
   ArtifactBucketName:
     Value: !Ref ArtifactBucket
+  CertBucketName:
+    Value: !If [CertBucketEnabledCondition, !Ref CertBucket, ""]
   DdnsHost:
     Value: !If [HasDdnsHost, !Ref DdnsHost, "-"]
   ReleaseTag:

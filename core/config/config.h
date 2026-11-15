@@ -54,7 +54,8 @@ void config_free(stackctl_config *cfg);
  * key is unset; optional keys with documented defaults return their default
  * (ROOT_VOLUME_TYPE=gp3, SSH_USER=ec2-user, ENABLE_SPOT_ALERTS=false,
  * DDNS_ONBOX=false, IP_ECHO_URL=https://checkip.amazonaws.com,
- * BAZEL_COMMAND=bazel). REGION, PROJECT and ARCH return the validated values.
+ * BAZEL_COMMAND=bazel, SETUP_ENTRYPOINT=deploy.sh, SSH_PORT=22). REGION,
+ * PROJECT and ARCH return the validated values.
  */
 const char *config_get(const stackctl_config *cfg, const char *key);
 const char *config_region(const stackctl_config *cfg);
@@ -66,6 +67,15 @@ const char *config_project(const stackctl_config *cfg);
  * cfg and remain valid until config_free().
  */
 const char *const *config_arch_list(const stackctl_config *cfg);
+
+/*
+ * The real path of the config directory this config was loaded from. Every
+ * verb that needs project-relative files (`.env`, `.env.example`, sibling
+ * region variants) must use this rather than re-deriving `$PWD/deploy/aws`, so
+ * an explicit `--project` elsewhere is honoured. The string is owned by cfg
+ * and remains valid until config_free(); NULL when cfg is NULL.
+ */
+const char *config_dir(const stackctl_config *cfg);
 
 /*
  * Resolve the repo root for a config directory: realpath(config_dir) then walk

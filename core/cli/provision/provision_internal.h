@@ -69,6 +69,11 @@ typedef struct provision_ops {
     /* Retry back-off hook; tests make this a no-op. */
     void (*retry_pause)(void *ud);
     int (*read_template)(void *ud, const char *repo_root, char **body_out);
+    /*
+     * Path-labelled template read. When set, provision loads the canonical
+     * operator template through this seam and names it in §6.3 diagnostics.
+     */
+    int (*read_template_path)(void *ud, const char *path, char **body_out);
 } provision_ops;
 
 typedef struct provision_env {
@@ -112,6 +117,10 @@ int provision_ensure_keys(const provision_env *env, const provision_ops *ops,
 
 /* Test-only override consumed by cli_cmd_provision(). */
 void provision_set_ops_for_test(const provision_ops *ops, void *ud);
+
+/* Test-only: the production aws_init seam, so tests can assert the signal
+ * abort hook is installed on a real client. */
+int provision_prod_aws_init_for_test(const char *profile, aws_ctx **out);
 
 #ifdef __cplusplus
 }

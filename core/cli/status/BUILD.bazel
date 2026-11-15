@@ -22,6 +22,7 @@ cc_library(
         "//core/cfn",
         "//core/cli/common:cli",
         "//core/cli/launch/common:instance_common",
+        "//core/config",
         "//core/ec2",
         "//core/s3",
         "//core/ssm",

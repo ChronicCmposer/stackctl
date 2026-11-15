@@ -51,11 +51,23 @@ int cli_dispatch_check_globals(const cli_command *command,
                                const cli_globals *globals, FILE *err);
 
 /*
- * Map a verb return value to a frozen process exit code. Values already in
- * 0..7 (CLI_EXIT_*) pass through unchanged; other errno-style or negative
- * values are classified with `cli_rc_to_exit()`.
+ * Map a verb return value to a frozen process exit code. The named frozen
+ * constants (CLI_EXIT_*) pass through unchanged, compared explicitly against
+ * the enum rather than a 0..7 range; other errno-style or negative values are
+ * classified with `cli_rc_to_exit()`. Verbs are audited to return only the
+ * frozen constants, because those values numerically overlap the first errno
+ * values and cannot be distinguished from them by value alone.
  */
 int cli_dispatch_normalize_rc(int rc);
+
+/*
+ * Final exit code for a completed verb. Normalizes `verb_rc` as above, but if
+ * the verb reported success while a first SIGINT/SIGTERM was recorded, reports
+ * CLI_EXIT_AWS (2) instead: spec §4 makes a signal-interrupted wait a failure
+ * (CloudFormation waits explicitly exit 2), never a success. A non-success
+ * verb code is preserved. Never synthesizes 128+signo.
+ */
+int cli_dispatch_verb_exit(int verb_rc);
 
 /* Render top-level help (usage, command list, global flags) to `out`. */
 void cli_dispatch_print_help(FILE *out, const char *program);

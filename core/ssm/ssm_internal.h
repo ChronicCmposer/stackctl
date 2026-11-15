@@ -2,7 +2,7 @@
  * ssm_internal.h — unit-test seams for core/ssm.
  *
  * NOT part of the frozen public surface (ssm.h). Tests include this header to
- * inject a fake transport and to exercise the status/error mappings directly.
+ * inject a fake transport and to exercise the error mapping directly.
  *
  * The SSM API needs a signed `X-Amz-Target` header. `ssm_call` carries the
  * operation target explicitly, and `ssm_build_headers` produces the two

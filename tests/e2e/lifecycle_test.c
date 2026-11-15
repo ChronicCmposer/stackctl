@@ -88,7 +88,11 @@ typedef struct world {
     char last_run_client_token[65];
     char last_run_name[128];
     char last_ssh_command[8192];
+    char last_install_command[8192];
+    char last_scp_command[8192];
+    char last_scp_destination[512];
     int ssh_calls;
+    int scp_calls;
     int keyscan_calls;
     int console_calls;
     int terminate_confirmed;
@@ -397,6 +401,30 @@ static int fake_ssh_exec(char *const argv[], int timeout,
         size_t used = strlen(W.last_ssh_command);
         snprintf(W.last_ssh_command + used, sizeof W.last_ssh_command - used,
                  "%s%s", used > 0 ? " " : "", argv[i]);
+        if (strstr(argv[i], "install -D -m 600") != NULL) {
+            snprintf(W.last_install_command, sizeof W.last_install_command,
+                     "%s", argv[i]);
+        }
+    }
+    return 0;
+}
+
+static int fake_scp_exec(char *const argv[], int timeout,
+                         const sshc_sentinel_spec *sentinel, int *remote_rc) {
+    (void)timeout;
+    (void)sentinel;
+    W.scp_calls++;
+    if (remote_rc != NULL) {
+        *remote_rc = 0;
+    }
+    W.last_scp_command[0] = '\0';
+    W.last_scp_destination[0] = '\0';
+    for (size_t i = 0; argv != NULL && argv[i] != NULL; i++) {
+        size_t used = strlen(W.last_scp_command);
+        snprintf(W.last_scp_command + used, sizeof W.last_scp_command - used,
+                 "%s%s", used > 0 ? " " : "", argv[i]);
+        snprintf(W.last_scp_destination, sizeof W.last_scp_destination, "%s",
+                 argv[i]);
     }
     return 0;
 }
@@ -680,6 +708,7 @@ static void services_init(instance_services *svc) {
     svc->ddns_ip_echo = fake_ip_echo;
     svc->keyscan = fake_keyscan;
     svc->ssh_exec = fake_ssh_exec;
+    svc->scp_exec = fake_scp_exec;
     svc->kh_pin = kh_pin;
     svc->kh_bound = kh_bound;
     svc->kh_forget = kh_forget;
@@ -788,6 +817,7 @@ static void scenario_launch_and_contract(fixture *fx) {
           "env contract: artifact bucket");
     CHECK(strstr(W.last_ssh_command, "STACKCTL_DDNS_PASSWORD_FILE") == NULL,
           "env contract: no DDNS secret when DDNS_ONBOX=false");
+    CHECK(W.scp_calls == 0, "no password scp when DDNS_ONBOX=false");
     CHECK(strstr(W.last_ssh_command, "STACKCTL_MEMBER_SHA='") != NULL,
           "env contract: member sha passed to box");
 
@@ -833,6 +863,15 @@ static void scenario_ddns_onbox_env(fixture *fx) {
           "launch with DDNS_ONBOX");
     CHECK(strstr(W.last_ssh_command, "STACKCTL_DDNS_PASSWORD_FILE='") != NULL,
           "env contract: password file iff DDNS_ONBOX=true");
+    CHECK(W.scp_calls == 1, "one password scp when DDNS_ONBOX=true");
+    CHECK(strncmp(W.last_scp_command, "scp", 3) == 0,
+          "password transfer uses SSHC_KIND_SCP");
+    CHECK(strstr(W.last_scp_destination, ":/tmp/.stackctl-ddns-") != NULL,
+          "scp targets the remote staging path");
+    CHECK(strstr(W.last_install_command, "sudo install -D -m 600") != NULL,
+          "install command writes the password with mode 0600");
+    CHECK(strstr(W.last_install_command, "/etc/demo-ddns/password") != NULL,
+          "install command targets /etc/<project>-ddns/password");
 
     fclose(rt.out);
     fclose(rt.err);

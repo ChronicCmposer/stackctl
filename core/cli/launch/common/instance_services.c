@@ -26,6 +26,8 @@ int instance_services_open(instance_services *svc, const char *project,
     if (rc != 0) {
         return rc;
     }
+    /* Long-running waiters must answer SIGINT/SIGTERM. */
+    aws_set_abort_hook(svc->aws, cli_abort_check, NULL);
     rc = ec2_client_init(&svc->ec2, svc->aws, region);
     if (rc != 0) {
         instance_services_close(svc);
@@ -68,10 +70,12 @@ int instance_services_open(instance_services *svc, const char *project,
 
     svc->keyscan = instance_keyscan_exec;
     svc->ssh_exec = sshc_exec;
+    svc->scp_exec = sshc_exec;
 
     svc->kh_pin = kh_pin;
     svc->kh_bound = kh_bound;
     svc->kh_forget = kh_forget;
+    svc->tool_available = instance_tool_available;
     svc->iam_get_caller_identity = iam_get_caller_identity;
     return 0;
 }

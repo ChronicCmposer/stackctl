@@ -9,6 +9,8 @@
 
 #include "provision_internal.h"
 
+#include "aws_internal.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -59,6 +61,7 @@ typedef struct fake {
     int aws_init_rc;
     int cfn_create_rc;
     int read_rc;
+    int read_templates;
     int stack_present;
     cfn_stack_status status;
     int create_rc;
@@ -449,6 +452,44 @@ static int fake_template(void *ud, const char *repo_root, char **body_out) {
     return *body_out != NULL ? 0 : ENOMEM;
 }
 
+static int fake_read_template_path(void *ud, const char *path,
+                                   char **body_out) {
+    fake *f = ud;
+    FILE *file;
+    long size;
+    char *body;
+
+    trace(f, TRACE_TEMPLATE);
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return errno != 0 ? errno : ENOENT;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return EIO;
+    }
+    size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return EIO;
+    }
+    rewind(file);
+    body = malloc((size_t)size + 1);
+    if (body == NULL) {
+        fclose(file);
+        return ENOMEM;
+    }
+    if (fread(body, 1, (size_t)size, file) != (size_t)size) {
+        free(body);
+        fclose(file);
+        return EIO;
+    }
+    body[size] = '\0';
+    fclose(file);
+    *body_out = body;
+    return 0;
+}
+
 static const provision_ops fake_ops = {
     .aws_init = fake_aws_init,
     .aws_free = fake_aws_free,
@@ -475,6 +516,10 @@ static const provision_ops fake_ops = {
     .retry_pause = fake_retry_pause,
     .read_template = fake_template,
 };
+
+/* Path-loading variant used by the §6.3 template-gate cases; the base fake
+ * keeps the path seam NULL so the orchestration cases stay filesystem-free. */
+static provision_ops configured_ops;
 
 /* ------------------------------------------------------------------------- */
 /* Fixtures                                                                  */
@@ -552,6 +597,113 @@ static void fixture_init(fixture *fx) {
     write_text(path, base_env);
 }
 
+static char *read_text_file(const char *path) {
+    FILE *file = fopen(path, "rb");
+    long size;
+    char *body;
+
+    if (file == NULL) {
+        return NULL;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return NULL;
+    }
+    rewind(file);
+    body = malloc((size_t)size + 1);
+    if (body == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    if (fread(body, 1, (size_t)size, file) != (size_t)size) {
+        free(body);
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    body[size] = '\0';
+    return body;
+}
+
+static char *read_runfile(const char *relative) {
+    const char *srcdir = getenv("TEST_SRCDIR");
+    const char *workspace = getenv("TEST_WORKSPACE");
+    char path[PATH_MAX];
+
+    if (srcdir == NULL || workspace == NULL) {
+        return NULL;
+    }
+    snprintf(path, sizeof(path), "%s/%s/%s", srcdir, workspace, relative);
+    return read_text_file(path);
+}
+
+static void fixture_write_operator(fixture *fx, const char *body) {
+    char path[PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/deploy/stackctl-operator.yaml", fx->root);
+    write_text(path, body);
+}
+
+static void fixture_install_operator(fixture *fx) {
+    char *text = read_runfile("deploy/stackctl-operator.yaml");
+
+    if (text == NULL) {
+        fprintf(stderr, "cannot load the canonical operator template\n");
+        exit(1);
+    }
+    fixture_write_operator(fx, text);
+    free(text);
+}
+
+/*
+ * Install the canonical operator template with an extra policy whose wildcard
+ * action violates §6.3, giving the gate a deterministic failure to report.
+ */
+static void fixture_install_tampered_operator(fixture *fx) {
+    static const char insertion[] =
+        "  TamperedPolicy:\n"
+        "    Type: AWS::IAM::ManagedPolicy\n"
+        "    Properties:\n"
+        "      PolicyDocument:\n"
+        "        Statement:\n"
+        "          - Action: \"*\"\n"
+        "            Resource: \"*\"\n";
+    char *text = read_runfile("deploy/stackctl-operator.yaml");
+    const char *anchor;
+    size_t prefix_len;
+    size_t combined;
+    char *tampered;
+
+    if (text == NULL) {
+        fprintf(stderr, "cannot load the canonical operator template\n");
+        exit(1);
+    }
+    anchor = strstr(text, "Resources:\n");
+    if (anchor == NULL) {
+        fprintf(stderr, "canonical operator template lacks Resources\n");
+        free(text);
+        exit(1);
+    }
+    prefix_len = (size_t)(anchor - text) + strlen("Resources:\n");
+    combined = strlen(text) + sizeof(insertion);
+    tampered = malloc(combined);
+    if (tampered == NULL) {
+        free(text);
+        exit(1);
+    }
+    memcpy(tampered, text, prefix_len);
+    memcpy(tampered + prefix_len, insertion, sizeof(insertion) - 1);
+    strcpy(tampered + prefix_len + sizeof(insertion) - 1, text + prefix_len);
+    fixture_write_operator(fx, tampered);
+    free(tampered);
+    free(text);
+}
+
 static stackctl_config *load_config(const fixture *fx) {
     stackctl_config *cfg = NULL;
 
@@ -576,7 +728,13 @@ static provision_env make_env(fake *f, stackctl_config *cfg, fixture *fx) {
     env.config_dir = fx->config_dir;
     env.out = stdout;
     env.err = stderr;
-    env.ops = &fake_ops;
+    if (f->read_templates != 0) {
+        configured_ops = fake_ops;
+        configured_ops.read_template_path = fake_read_template_path;
+        env.ops = &configured_ops;
+    } else {
+        env.ops = &fake_ops;
+    }
     env.ops_ud = f;
     env.confirm = confirm_yes;
     env.confirm_ud = f;
@@ -848,8 +1006,9 @@ static void test_union_of_region_variants(void) {
     fixture_init(&fx);
     snprintf(path, sizeof(path), "%s/.env.eu-west-1", fx.config_dir);
     write_text(path,
+               "# Region variant parsed by the config envfile rules.\n"
                "REGION=eu-west-1\n"
-               "INSTANCE_TYPES_AMD64=g6.xlarge\n"
+               "export INSTANCE_TYPES_AMD64=g6.xlarge\n"
                "BUCKET_MODULES=artifact\n"
                "ENABLE_IMAGE_BUILDER=true\n"
                "RELEASE_PREFIXES=releases/\n");
@@ -1024,6 +1183,80 @@ static void test_keys_identity_retries_six(void) {
     config_free(cfg);
 }
 
+/* ------------------------------------------------------------------------- */
+/* §6.3 operator-template gate                                               */
+/* ------------------------------------------------------------------------- */
+
+static void test_operator_template_gate_accepts_canonical(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+
+    fixture_init(&fx);
+    fixture_install_operator(&fx);
+    cfg = load_config(&fx);
+    f.read_templates = 1;
+    f.stack_present = 0;
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(provision_run(&env) == CLI_EXIT_OK,
+          "canonical operator template passes the gate");
+    CHECK(f.executed == 1, "provision proceeds after a passing gate");
+    CHECK(trace_index(&f, TRACE_TEMPLATE) < trace_index(&f, TRACE_AWS_INIT),
+          "template gate runs before any AWS call");
+    config_free(cfg);
+}
+
+static void test_operator_template_gate_rejects_tampered(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    FILE *errors;
+    char captured[8192];
+    size_t got;
+    int saved_stderr;
+    int rc;
+
+    fixture_init(&fx);
+    fixture_install_tampered_operator(&fx);
+    cfg = load_config(&fx);
+    f.read_templates = 1;
+    f.stack_present = 0;
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    errors = tmpfile();
+    CHECK(errors != NULL, "stderr capture opens");
+    if (errors == NULL) {
+        config_free(cfg);
+        return;
+    }
+    saved_stderr = dup(STDERR_FILENO);
+    CHECK(saved_stderr >= 0, "stderr can be duplicated");
+    (void)dup2(fileno(errors), STDERR_FILENO);
+    rc = provision_run(&env);
+    fflush(stderr);
+    if (saved_stderr >= 0) {
+        (void)dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
+    rewind(errors);
+    got = fread(captured, 1, sizeof(captured) - 1, errors);
+    captured[got] = '\0';
+    fclose(errors);
+
+    CHECK(rc == CLI_EXIT_USAGE, "tampered operator template exits usage (1)");
+    CHECK(strstr(captured, "wildcard") != NULL,
+          "the violation is named in stderr");
+    CHECK(strstr(captured, "stackctl-operator.yaml") != NULL,
+          "the template path is named in stderr");
+    CHECK(trace_index(&f, TRACE_AWS_INIT) < 0, "no AWS init");
+    CHECK(trace_index(&f, TRACE_CREATE_CS) < 0, "no change set");
+    CHECK(f.executed == 0, "nothing executed");
+    config_free(cfg);
+}
+
 static void test_region_variant_derived_from_config(void) {
     fixture fx;
     stackctl_config *primary = NULL;
@@ -1056,7 +1289,67 @@ static void test_region_variant_derived_from_config(void) {
     config_free(variant);
 }
 
+static char *make_credentials_home(void) {
+    char *home = strdup("/tmp/stackctl-abort-XXXXXX");
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+    FILE *file;
+
+    if (home == NULL || mkdtemp(home) == NULL) {
+        perror("mkdtemp");
+        exit(2);
+    }
+    if (snprintf(dir, sizeof dir, "%s/.aws", home) >= (int)sizeof dir ||
+        mkdir(dir, 0700) != 0) {
+        perror("mkdir .aws");
+        exit(2);
+    }
+    if (snprintf(path, sizeof path, "%s/credentials", dir) >= (int)sizeof path) {
+        exit(2);
+    }
+    file = fopen(path, "w");
+    if (file == NULL) {
+        perror("fopen credentials");
+        exit(2);
+    }
+    fputs("[prod-abort]\n"
+          "aws_access_key_id = AKIAFAKEFAKEFAKEFAKE\n"
+          "aws_secret_access_key = fake-secret\n",
+          file);
+    if (fclose(file) != 0) {
+        exit(2);
+    }
+    return home;
+}
+
+static void test_prod_aws_init_installs_abort_hook(void) {
+    char *home = make_credentials_home();
+    const char *saved_home = getenv("HOME");
+    char *saved = saved_home != NULL ? strdup(saved_home) : NULL;
+    aws_ctx *aws = NULL;
+    int rc;
+
+    CHECK(setenv("HOME", home, 1) == 0, "HOME points at fake credentials");
+    rc = provision_prod_aws_init_for_test("prod-abort", &aws);
+    CHECK(rc == 0, "production aws_init succeeds");
+    if (rc == 0) {
+        CHECK(aws != NULL, "production aws_init returns a client");
+        CHECK(aws != NULL && aws->abort_fn == cli_abort_check,
+              "production aws_init installs the CLI abort hook");
+        CHECK(aws != NULL && aws->abort_ud == NULL,
+              "abort hook has no user data");
+    }
+    aws_free(aws);
+    if (saved != NULL) {
+        CHECK(setenv("HOME", saved, 1) == 0, "HOME restored");
+        free(saved);
+    } else {
+        unsetenv("HOME");
+    }
+}
+
 int main(void) {
+    test_prod_aws_init_installs_abort_hook();
     test_null_context();
     test_region_variant_rejected();
     test_template_failure_is_usage();
@@ -1077,6 +1370,8 @@ int main(void) {
     test_keys_missing_local_mints();
     test_keys_ci_not_auto_minted();
     test_keys_identity_retries_six();
+    test_operator_template_gate_accepts_canonical();
+    test_operator_template_gate_rejects_tampered();
     test_region_variant_derived_from_config();
 
     if (failures != 0) {

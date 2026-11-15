@@ -1,6 +1,10 @@
 /*
  * instances.c — RunInstances, DescribeInstances, TerminateInstances and the
  * aws_wait-based waiters (spec §4 launch/terminate).
+ *
+ * RunInstances always enforces IMDSv2 (spec §9): HttpTokens=required,
+ * HttpEndpoint=enabled and HttpPutResponseHopLimit=2 so a dependent service
+ * running in a bridged container can read the instance tags via IMDS.
  */
 
 #include "ec2_internal.h"
@@ -122,6 +126,12 @@ static int build_run_request(const ec2_run_spec *spec, ec2_params *params)
     rc |= ec2_params_add(params, "SecurityGroupId.1", spec->security_group_id);
     rc |= ec2_params_add(params, "IamInstanceProfile.Name",
                          spec->instance_profile_name);
+
+    /* IMDSv2 launch invariant (spec §9): required tokens, endpoint enabled,
+     * and hop limit 2 so bridged containers can reach IMDS. */
+    rc |= ec2_params_add(params, "MetadataOptions.HttpEndpoint", "enabled");
+    rc |= ec2_params_add(params, "MetadataOptions.HttpTokens", "required");
+    rc |= ec2_params_add_int(params, "MetadataOptions.HttpPutResponseHopLimit", 2);
 
     rc |= ec2_params_add(params, "BlockDeviceMapping.1.DeviceName",
                          spec->root_device_name);

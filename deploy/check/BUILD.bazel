@@ -2,6 +2,12 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
+exports_files([
+    "testdata/bad_infra_bucket.yaml",
+    "testdata/bad_infra_export.yaml",
+    "testdata/bad_infra_literal_cidr.yaml",
+])
+
 # The structural checker is a library so the CLI deploy path can reuse it as
 # the fail-closed runtime gate for TEMPLATE_OVERRIDE files.
 cc_library(
@@ -27,6 +33,10 @@ cc_binary(
         "-Wextra",
         "-Werror",
     ],
+    data = [
+        "//deploy:stackctl-infra.yaml",
+        "//deploy:stackctl-operator.yaml",
+    ],
     linkstatic = True,
     deps = [":template_check_lib"],
 )
@@ -45,6 +55,8 @@ cc_test(
         "testdata/bad_infra_export.yaml",
         "testdata/bad_infra_literal_cidr.yaml",
         "testdata/bad_operator_action_intrinsic.yaml",
+        "testdata/bad_operator_baked_ami_trust.yaml",
+        "testdata/bad_operator_missing_user_policy.yaml",
         "testdata/bad_operator_resource_intrinsic.yaml",
         "testdata/bad_operator_wildcard.yaml",
         "//deploy:stackctl-infra.yaml",

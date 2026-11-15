@@ -87,8 +87,11 @@ typedef struct deploy_ops {
                       int attempts, int interval_sec, int *timed_out);
     int (*delete_stack)(void *ud, cfn_client *client, const char *region,
                         const char *stack_name);
-    /* Optional: read the infra template body from the checkout. NULL => "". */
+    /* Optional: read the canonical template body from the checkout. NULL => "". */
     int (*read_template)(void *ud, const char *repo_root, char **body_out);
+    /* Optional: read a fully resolved template path (canonical or override).
+     * When set, deploy runs the §6.3 structural checker before any AWS call. */
+    int (*read_template_path)(void *ud, const char *path, char **body_out);
 } deploy_ops;
 
 typedef struct deploy_env {
@@ -165,6 +168,10 @@ int deploy_run(deploy_env *env);
 
 /* Test-only override consumed by cli_cmd_deploy(). */
 void deploy_set_ops_for_test(const deploy_ops *ops, void *ud);
+
+/* Test-only: the production aws_init seam, so tests can assert the signal
+ * abort hook is installed on a real client. */
+int deploy_prod_aws_init_for_test(const char *profile, aws_ctx **out);
 
 #ifdef __cplusplus
 }

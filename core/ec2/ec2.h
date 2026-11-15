@@ -152,7 +152,9 @@ void ec2_client_free(ec2_client *client);
  *     Encrypted=true and DeleteOnTermination=true;
  *   - spot => InstanceMarketOptions.MarketType=spot with one-time
  *     InstanceInterruptionBehavior=terminate, and *no* MaxPrice;
- *   - IamInstanceProfile.Name = instance_profile_name.
+ *   - IamInstanceProfile.Name = instance_profile_name;
+ *   - MetadataOptions.HttpEndpoint=enabled, HttpTokens=required and
+ *     HttpPutResponseHopLimit=2 (IMDSv2 launch invariant, spec §9).
  *
  * Returns 0, EC2_ERR_AWS_API on an AWS error (capacity rejections carry the
  * spec §4 hint), EINVAL on invalid input, or another errno-style code.

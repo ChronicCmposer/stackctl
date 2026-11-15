@@ -44,8 +44,9 @@ static int ssm_missing;
 static int manifest_missing;
 static char member_missing[64];
 static int list_garbage;
+static char extra_release[64];
 static char identity_arn[256];
-static char output_buffer[8192];
+static char output_buffer[16384];
 
 static int fake_describe_stacks(cfn_client *client, const char *region,
                                 const char *name, cfn_stack_list *out) {
@@ -68,7 +69,7 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
              "demo-infra");
     out->items[0].status = CFN_STACK_STATUS_CREATE_COMPLETE;
     out->items[0].tags = calloc(2, sizeof(cfn_tag));
-    out->items[0].parameters = calloc(2, sizeof(cfn_parameter));
+    out->items[0].parameters = calloc(4, sizeof(cfn_parameter));
     out->items[0].outputs = calloc(1, sizeof(cfn_output));
     if (out->items[0].tags == NULL || out->items[0].parameters == NULL ||
         out->items[0].outputs == NULL) {
@@ -84,11 +85,26 @@ static int fake_describe_stacks(cfn_client *client, const char *region,
     snprintf(out->items[0].tags[1].value,
              sizeof out->items[0].tags[1].value, "%s",
              "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    out->items[0].parameter_count = 1;
+    out->items[0].parameter_count = 4;
     snprintf(out->items[0].parameters[0].key,
-             sizeof out->items[0].parameters[0].key, "%s", "AmiIdAmd64");
+             sizeof out->items[0].parameters[0].key, "%s", "ReleaseTag");
     snprintf(out->items[0].parameters[0].value,
-             sizeof out->items[0].parameters[0].value, "%s", "ami-stack");
+             sizeof out->items[0].parameters[0].value, "%s", "v1.2.3");
+    snprintf(out->items[0].parameters[1].key,
+             sizeof out->items[0].parameters[1].key, "%s",
+             "ReleaseManifestSha256");
+    snprintf(out->items[0].parameters[1].value,
+             sizeof out->items[0].parameters[1].value, "%s",
+             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    snprintf(out->items[0].parameters[2].key,
+             sizeof out->items[0].parameters[2].key, "%s", "AmiIdAmd64");
+    snprintf(out->items[0].parameters[2].value,
+             sizeof out->items[0].parameters[2].value, "%s", "ami-stack");
+    snprintf(out->items[0].parameters[3].key,
+             sizeof out->items[0].parameters[3].key, "%s", "AmiIdArm64");
+    snprintf(out->items[0].parameters[3].value,
+             sizeof out->items[0].parameters[3].value, "%s",
+             "ami-stack-arm");
     out->items[0].output_count = 1;
     snprintf(out->items[0].outputs[0].key,
              sizeof out->items[0].outputs[0].key, "%s", "ArtifactBucketName");
@@ -214,6 +230,19 @@ static int fake_s3_list(s3_client *client, const char *bucket, const char *prefi
     (void)bucket;
     (void)prefix;
     memset(out, 0, sizeof *out);
+    if (extra_release[0] != '\0') {
+        char key[256];
+
+        out->items = calloc(1, sizeof(s3_object_info));
+        if (out->items == NULL) {
+            return ENOMEM;
+        }
+        out->count = 1;
+        snprintf(key, sizeof key, "releases/%s/release-manifest.txt",
+                 extra_release);
+        out->items[0].key = strdup(key);
+        return out->items[0].key != NULL ? 0 : ENOMEM;
+    }
     if (!list_garbage) {
         return 0;
     }
@@ -266,14 +295,15 @@ static void add_instance(const char *id, const char *state, const char *ip,
 }
 
 static void setup_fake_path(void) {
-    const char *tools[] = {"ssh", "scp", "ssh-keyscan"};
+    const char *tools[] = {"ssh", "scp", "ssh-keyscan", "bazel"};
+    size_t tool_count = sizeof tools / sizeof tools[0];
 
     snprintf(path_dir, sizeof path_dir, "/tmp/stackctl-status-path-XXXXXX");
     if (mkdtemp(path_dir) == NULL) {
         snprintf(path_dir, sizeof path_dir, "%s", "/tmp");
         return;
     }
-    for (size_t i = 0; i < 3; i++) {
+    for (size_t i = 0; i < tool_count; i++) {
         char file[300];
 
         snprintf(file, sizeof file, "%s/%s", path_dir, tools[i]);
@@ -298,8 +328,9 @@ static void cleanup_fake_path(void) {
         unlink(identity_path);
     }
     if (path_dir[0] != '\0' && strstr(path_dir, "XXXXXX") == NULL) {
-        const char *tools[] = {"ssh", "scp", "ssh-keyscan"};
-        for (size_t i = 0; i < 3; i++) {
+        const char *tools[] = {"ssh", "scp", "ssh-keyscan", "bazel"};
+        size_t tool_count = sizeof tools / sizeof tools[0];
+        for (size_t i = 0; i < tool_count; i++) {
             char file[300];
             snprintf(file, sizeof file, "%s/%s", path_dir, tools[i]);
             unlink(file);
@@ -359,7 +390,10 @@ static void reset_all(void) {
     manifest_missing = 0;
     memset(member_missing, 0, sizeof member_missing);
     list_garbage = 0;
+    memset(extra_release, 0, sizeof extra_release);
     memset(identity_arn, 0, sizeof identity_arn);
+    unsetenv("STACKCTL_VERSION_FILE");
+    unsetenv("RUNFILES_DIR");
     memset(output_buffer, 0, sizeof output_buffer);
 }
 
@@ -786,6 +820,270 @@ static void test_state_dir_unwritable_is_exit1(void) {
     close_temp_state(store, root);
 }
 
+static void seed_launch_record(state_store *store, const char *instance_id,
+                               const char *nonce) {
+    state_launch_record record;
+
+    memset(&record, 0, sizeof record);
+    snprintf(record.instance_id, sizeof record.instance_id, "%s", instance_id);
+    snprintf(record.nonce, sizeof record.nonce, "%s", nonce);
+    snprintf(record.fqdn, sizeof record.fqdn, "%s", "box.example.com");
+    snprintf(record.ip, sizeof record.ip, "%s", "198.51.100.7");
+    CHECK(state_launch_record_append(store, &record) == 0,
+          "seed launch record");
+}
+
+static void seed_old_launch_record(state_store *store, const char *instance_id,
+                                   const char *nonce) {
+    FILE *file = fopen(state_launch_records_path(store), "a");
+
+    CHECK(file != NULL, "open launch records for old seed");
+    if (file == NULL) {
+        return;
+    }
+    fprintf(file, "2000-01-01T00:00:00Z\t%s\t%s\tbox.example.com\t198.51.100.7\t\n",
+            instance_id, nonce);
+    fclose(file);
+}
+
+static void test_version_reported(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    char path[] = "/tmp/stackctl-version-XXXXXX";
+    int fd;
+    int rc;
+
+    reset_all();
+    fd = mkstemp(path);
+    CHECK(fd >= 0, "temp VERSION file");
+    if (fd >= 0) {
+        FILE *file = fdopen(fd, "w");
+
+        if (file != NULL) {
+            fputs("v9.9.9\n", file);
+            fclose(file);
+        }
+        CHECK(setenv("STACKCTL_VERSION_FILE", path, 1) == 0,
+              "set VERSION override");
+    }
+    make_runtime(&rt, &svc, 1);
+    snprintf(dns_ip, sizeof dns_ip, "%s", "0.0.0.0");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "status with VERSION override exits 0");
+    CHECK(has("\"version\": \"v9.9.9\""), "JSON reports the resolved version");
+    free_runtime(&rt);
+    unlink(path);
+}
+
+static void test_stack_parameters_and_tags_json(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc, 1);
+    stack_present = 1;
+    snprintf(dns_ip, sizeof dns_ip, "%s", "0.0.0.0");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "status with stack parameters exits 0");
+    CHECK(has("\"parameters\""), "stack parameters reported");
+    CHECK(has("\"ReleaseTag\"") && has("\"AmiIdArm64\""),
+          "key stack parameters reported");
+    CHECK(has("\"tags\""), "stack tags reported alongside parameters");
+    free_runtime(&rt);
+}
+
+static void test_pinned_release_not_latest_warns(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc, 1);
+    stack_present = 1;
+    snprintf(dns_ip, sizeof dns_ip, "%s", "0.0.0.0");
+    snprintf(extra_release, sizeof extra_release, "%s", "v2.0.0");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "pinned release behind latest is a warning");
+    CHECK(has("\"latest\": \"v2.0.0\""), "latest release prefix reported");
+    CHECK(has("not the latest"), "warning names the newer release");
+    free_runtime(&rt);
+}
+
+static void test_ami_drift_warns(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc, 1);
+    stack_present = 1;
+    snprintf(rt.cfg.ami_policy, sizeof rt.cfg.ami_policy, "%s", "pinned");
+    snprintf(rt.cfg.ami_id_amd64, sizeof rt.cfg.ami_id_amd64, "%s",
+             "ami-config");
+    snprintf(dns_ip, sizeof dns_ip, "%s", "0.0.0.0");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "AMI drift is a warning");
+    CHECK(has("AMI drift") && has("run deploy to apply"),
+          "warning explains how to apply the pin");
+    free_runtime(&rt);
+}
+
+static void test_multi_writer_warns_unconditionally(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    state_store *store;
+    char root[256];
+    int rc;
+
+    reset_all();
+    store = open_temp_state(root, sizeof root);
+    CHECK(store != NULL, "temp state store opens");
+    if (store == NULL) {
+        return;
+    }
+    seed_launch_record(store, "i-1", "nonce-1");
+    seed_launch_record(store, "i-2", "nonce-2");
+
+    make_runtime(&rt, &svc, 1);
+    rt.state = store;
+    snprintf(rt.cfg.ddns_host, sizeof rt.cfg.ddns_host, "%s", "");
+    snprintf(rt.cfg.ddns_domain, sizeof rt.cfg.ddns_domain, "%s", "");
+    stack_present = 1;
+    add_instance("i-1", "running", "198.51.100.7", "ami-live", "nonce-1");
+    add_instance("i-2", "running", "198.51.100.8", "ami-live", "nonce-2");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "multi-writer is a warning");
+    CHECK(has("multi-writer"),
+          "multi-writer warns without DDNS configured");
+    free_runtime(&rt);
+    close_temp_state(store, root);
+}
+
+static void test_multi_writer_old_nonces_are_quiet(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    state_store *store;
+    char root[256];
+    int rc;
+
+    reset_all();
+    store = open_temp_state(root, sizeof root);
+    CHECK(store != NULL, "temp state store opens");
+    if (store == NULL) {
+        return;
+    }
+    seed_old_launch_record(store, "i-1", "nonce-1");
+    seed_old_launch_record(store, "i-2", "nonce-2");
+
+    make_runtime(&rt, &svc, 1);
+    rt.state = store;
+    snprintf(rt.cfg.ddns_host, sizeof rt.cfg.ddns_host, "%s", "");
+    snprintf(rt.cfg.ddns_domain, sizeof rt.cfg.ddns_domain, "%s", "");
+    stack_present = 1;
+    add_instance("i-1", "running", "198.51.100.7", "ami-live", "nonce-1");
+    add_instance("i-2", "running", "198.51.100.8", "ami-live", "nonce-2");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "old nonces exit 0");
+    CHECK(!has("multi-writer"),
+          "nonces older than 1 h do not warn");
+    free_runtime(&rt);
+    close_temp_state(store, root);
+}
+
+static void test_bazel_preflight_reports(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    char repo[] = "/tmp/stackctl-status-repo-XXXXXX";
+    char marker[300];
+    FILE *file;
+    int rc;
+
+    reset_all();
+    CHECK(mkdtemp(repo) != NULL, "temp repo root");
+    snprintf(marker, sizeof marker, "%s/MODULE.bazel", repo);
+    file = fopen(marker, "w");
+    if (file != NULL) {
+        fclose(file);
+    }
+
+    opts.config_dir = repo;
+    opts.bazel_command = "bazel";
+    make_runtime(&rt, &svc, 1);
+    snprintf(dns_ip, sizeof dns_ip, "%s", "0.0.0.0");
+
+    rc = status_execute(&rt, &opts);
+    slurp(&rt);
+
+    CHECK(rc == CLI_EXIT_OK, "bazel preflight passes");
+    CHECK(has("\"bazel\"") && has("\"command_found\": true"),
+          "bazel command availability reported");
+    CHECK(has("\"repo_root\"") && has(repo), "repo root reported");
+    free_runtime(&rt);
+    unlink(marker);
+    rmdir(repo);
+}
+
+static void test_missing_bazel_is_exit1(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    int rc;
+
+    reset_all();
+    opts.bazel_command = "definitely-not-a-tool-xyz";
+    make_runtime(&rt, &svc, 1);
+
+    rc = status_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_USAGE, "missing BAZEL_COMMAND is exit 1");
+    free_runtime(&rt);
+}
+
+static void test_missing_repo_root_is_exit1(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    char dir[] = "/tmp/stackctl-status-norepo-XXXXXX";
+    int rc;
+
+    reset_all();
+    CHECK(mkdtemp(dir) != NULL, "temp dir without MODULE.bazel");
+    opts.config_dir = dir;
+    make_runtime(&rt, &svc, 1);
+
+    rc = status_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_USAGE, "unresolvable repo root is exit 1");
+    free_runtime(&rt);
+    rmdir(dir);
+}
+
 int main(void) {
     setup_fake_path();
 
@@ -804,6 +1102,15 @@ int main(void) {
     test_release_member_missing_warns();
     test_garbage_prefix_listed();
     test_state_dir_unwritable_is_exit1();
+    test_version_reported();
+    test_stack_parameters_and_tags_json();
+    test_pinned_release_not_latest_warns();
+    test_ami_drift_warns();
+    test_multi_writer_warns_unconditionally();
+    test_multi_writer_old_nonces_are_quiet();
+    test_bazel_preflight_reports();
+    test_missing_bazel_is_exit1();
+    test_missing_repo_root_is_exit1();
 
     cleanup_fake_path();
     if (failures != 0) {

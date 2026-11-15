@@ -25,6 +25,9 @@ struct aws_ctx {
     unsigned backoff_base_ms;
     void *curl;          /* persistent CURL* for connection reuse */
     int curl_ready;
+    /* Optional cancellation hook polled by aws_wait() before each poll. */
+    int (*abort_fn)(void *user);
+    void *abort_ud;
     /* Set by the transport unit on first use so the credential/context unit
      * needs no link-time reference to libcurl. */
     void (*transport_teardown)(aws_ctx *ctx);

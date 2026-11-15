@@ -74,8 +74,9 @@ checkout nor the runfiles tree, so the tag is resolved in a fixed order:
 
 1. `STACKCTL_VERSION_FILE`, when set. It is authoritative: an unreadable path renders `unknown`.
 2. The Bazel runfiles tree, located through `$RUNFILES_DIR`, then `<argv0>.runfiles`, then
-   `<executable>.runfiles`. Within that root it probes `_main/VERSION`, `stackctl/VERSION`, and
-   the binary's ancestor directories.
+   `<executable>.runfiles`. Within that root it probes `_main/VERSION`, `stackctl/VERSION`, the
+   bzlmod canonical repo directories `stackctl+` and `stackctl+<version>` (for example
+   `stackctl+0.1.0`), then the binary's ancestor directories.
 3. `VERSION` in the process working directory.
 4. `VERSION` in the executable's ancestor directories.
 

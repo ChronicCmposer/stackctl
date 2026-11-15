@@ -639,18 +639,34 @@ static void test_relative_resolution(void) {
 static void test_unknown_and_required(void) {
     static const kv unknown[] = {{"FOO", "bar"}};
     static const kv no_project[] = {{"PROJECT", NULL}};
-    static const kv no_ssh_port[] = {{"SSH_PORT", NULL}};
+    static const kv no_defaults[] = {{"SSH_PORT", NULL},
+                                     {"SETUP_ENTRYPOINT", NULL}};
     static const kv no_cidr[] = {{"OPERATOR_CIDR", NULL}};
     static const kv empty_cidr[] = {{"OPERATOR_CIDR", ""}};
 
     expect_invalid("unknown key rejected", unknown, ARRAY_LEN(unknown));
     expect_invalid("missing PROJECT rejected", no_project,
                    ARRAY_LEN(no_project));
-    expect_invalid("missing SSH_PORT rejected", no_ssh_port,
-                   ARRAY_LEN(no_ssh_port));
     expect_invalid("missing OPERATOR_CIDR rejected", no_cidr,
                    ARRAY_LEN(no_cidr));
 
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg =
+            load_valid_repo("SSH_PORT/SETUP_ENTRYPOINT default when unset",
+                            no_defaults, ARRAY_LEN(no_defaults), &root, &dir);
+        CHECK(cfg != NULL, "optional defaults load");
+        if (cfg != NULL) {
+            CHECK(strcmp(config_get(cfg, "SSH_PORT"), "22") == 0,
+                  "SSH_PORT defaults to 22");
+            CHECK(strcmp(config_get(cfg, "SETUP_ENTRYPOINT"), "deploy.sh") == 0,
+                  "SETUP_ENTRYPOINT defaults to deploy.sh");
+        }
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
     {
         char *root = NULL;
         char *dir = NULL;
@@ -731,8 +747,6 @@ static void test_cross_keys(void) {
                    ARRAY_LEN(ssm_bad_path));
     expect_invalid("spot alerts without email", alerts_no_email,
                    ARRAY_LEN(alerts_no_email));
-    expect_invalid("email with spot alerts off", alerts_off_email,
-                   ARRAY_LEN(alerts_off_email));
     expect_invalid("DDNS_ONBOX without host/domain", ddns_onbox_missing,
                    ARRAY_LEN(ddns_onbox_missing));
     expect_invalid("DDNS_HOST without DDNS_DOMAIN", ddns_half,
@@ -761,6 +775,8 @@ static void test_cross_keys(void) {
             {"arm64 with INSTANCE_TYPES_ARM64", arm64_ok, ARRAY_LEN(arm64_ok)},
             {"ssm with AMI_SSM_AMD64", ssm_ok, ARRAY_LEN(ssm_ok)},
             {"spot alerts with email", alerts_ok, ARRAY_LEN(alerts_ok)},
+            {"spot email accepted while alerts off", alerts_off_email,
+             ARRAY_LEN(alerts_off_email)},
             {"DDNS_ONBOX with pair", ddns_onbox_ok, ARRAY_LEN(ddns_onbox_ok)},
         };
 
@@ -843,6 +859,69 @@ static void test_build_working_directory(void) {
           "unset build working directory is NULL");
 }
 
+/* ------------------------------------------------------------------------- */
+/* config_dir accessor                                                       */
+/* ------------------------------------------------------------------------- */
+
+static void test_config_dir_accessor(void) {
+    static const kv eu_west[] = {{"REGION", "eu-west-1"}};
+    char *root = NULL;
+    char *dir = NULL;
+    char *variant = NULL;
+    char resolved[PATH_MAX];
+    stackctl_config *cfg = NULL;
+
+    cfg = load_valid_repo("config_dir default load", NULL, 0, &root, &dir);
+    CHECK(cfg != NULL, "default config loaded");
+    CHECK(realpath(dir, resolved) != NULL, "realpath default config dir");
+    CHECK(config_dir(cfg) != NULL && strcmp(config_dir(cfg), resolved) == 0,
+          "default accessor returns the loaded directory");
+    config_free(cfg);
+
+    variant = join_path(dir, ".env.eu-west-1");
+    write_env(variant, eu_west, ARRAY_LEN(eu_west));
+    cfg = NULL;
+    CHECK(config_load(dir, 1, "eu-west-1", &cfg) == 0,
+          "region variant config loaded");
+    CHECK(config_dir(cfg) != NULL && strcmp(config_dir(cfg), resolved) == 0,
+          "region variant accessor returns the same directory");
+    config_free(cfg);
+
+    free(root);
+    free(dir);
+    free(variant);
+
+    {
+        /* An explicit --project outside `deploy/aws` must be reported as-is. */
+        char *other_root = make_temp_root();
+        char *other_dir = join_path(other_root, "custom/config");
+        char *marker = join_path(other_root, "MODULE.bazel");
+        char *env = join_path(other_dir, ".env");
+        char other_resolved[PATH_MAX];
+
+        mkdir_p(other_dir);
+        write_text(marker, "");
+        write_env(env, NULL, 0);
+
+        cfg = NULL;
+        CHECK(config_load(other_dir, 0, NULL, &cfg) == 0,
+              "custom --project config loaded");
+        CHECK(realpath(other_dir, other_resolved) != NULL,
+              "realpath custom config dir");
+        CHECK(config_dir(cfg) != NULL &&
+                  strcmp(config_dir(cfg), other_resolved) == 0,
+              "--project override is reported by the accessor");
+        config_free(cfg);
+
+        free(other_root);
+        free(other_dir);
+        free(marker);
+        free(env);
+    }
+
+    CHECK(config_dir(NULL) == NULL, "accessor is NULL-safe");
+}
+
 int main(void) {
     test_parser();
     test_envfile_enumeration();
@@ -857,6 +936,7 @@ int main(void) {
     test_cross_keys();
     test_arch_list_variants();
     test_build_working_directory();
+    test_config_dir_accessor();
 
     if (failures != 0) {
         fprintf(stderr, "%d config test check(s) failed\n", failures);

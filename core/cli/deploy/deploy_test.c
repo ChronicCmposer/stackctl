@@ -8,6 +8,8 @@
 
 #include "deploy_internal.h"
 
+#include "aws_internal.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -30,6 +32,7 @@ static int failures;
 
 enum trace_tag {
     TRACE_PROVENANCE = 1,
+    TRACE_TEMPLATE,
     TRACE_FRESHNESS,
     TRACE_BUCKET,
     TRACE_AMI_RESOLVE,
@@ -94,12 +97,17 @@ typedef struct fake {
     int deleted_change_sets;
     int deleted_stacks;
 
+    int read_templates;
     int last_type;
     unsigned last_caps;
     char last_stack[128];
+    char last_template[512];
     size_t last_param_count;
-    char params[8][128];
-    char param_values[8][256];
+    char params[16][128];
+    char param_values[16][256];
+    size_t last_tag_count;
+    char tag_keys[8][128];
+    char tag_values[8][256];
 
     size_t old_param_count;
     char old_param_keys[8][64];
@@ -122,6 +130,26 @@ static int trace_index(const fake *f, int tag) {
         }
     }
     return -1;
+}
+
+static const char *tag_value(const fake *f, const char *key) {
+    for (size_t i = 0; i < f->last_tag_count; i++) {
+        if (strcmp(f->tag_keys[i], key) == 0) {
+            return f->tag_values[i];
+        }
+    }
+    return NULL;
+}
+
+static void check_release_tags(const fake *f, const char *tag,
+                               const char *sha) {
+    const char *tagged = tag_value(f, "stackctl:release-tag");
+    const char *sha_tagged = tag_value(f, "stackctl:release-sha");
+
+    CHECK(tagged != NULL && strcmp(tagged, tag) == 0,
+          "stack tagged with stackctl:release-tag");
+    CHECK(sha_tagged != NULL && strcmp(sha_tagged, sha) == 0,
+          "stack tagged with stackctl:release-sha");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -261,6 +289,44 @@ static int fake_prune(void *ud, const char *bucket, const char *pinned,
     return f->prune_rc;
 }
 
+static int fake_read_template_path(void *ud, const char *path,
+                                   char **body_out) {
+    fake *f = ud;
+    FILE *file;
+    long size;
+    char *body;
+
+    trace(f, TRACE_TEMPLATE);
+    file = fopen(path, "rb");
+    if (file == NULL) {
+        return errno != 0 ? errno : ENOENT;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return EIO;
+    }
+    size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return EIO;
+    }
+    rewind(file);
+    body = malloc((size_t)size + 1);
+    if (body == NULL) {
+        fclose(file);
+        return ENOMEM;
+    }
+    if (fread(body, 1, (size_t)size, file) != (size_t)size) {
+        free(body);
+        fclose(file);
+        return EIO;
+    }
+    fclose(file);
+    body[size] = '\0';
+    *body_out = body;
+    return 0;
+}
+
 static int fake_aws_init(void *ud, const char *profile, aws_ctx **out) {
     fake *f = ud;
 
@@ -356,12 +422,21 @@ static int fake_create_cs(void *ud, cfn_client *client, const char *region,
     f->last_type = (int)spec->type;
     f->last_caps = spec->capabilities;
     snprintf(f->last_stack, sizeof(f->last_stack), "%s", spec->stack_name);
+    snprintf(f->last_template, sizeof(f->last_template), "%.*s", 511,
+             spec->template_body != NULL ? spec->template_body : "");
     f->last_param_count = spec->parameter_count;
-    for (size_t i = 0; i < spec->parameter_count && i < 8; i++) {
+    for (size_t i = 0; i < spec->parameter_count && i < 16; i++) {
         snprintf(f->params[i], sizeof(f->params[i]), "%s",
                  spec->parameters[i].key);
         snprintf(f->param_values[i], sizeof(f->param_values[i]), "%s",
                  spec->parameters[i].value);
+    }
+    f->last_tag_count = spec->tag_count;
+    for (size_t i = 0; i < spec->tag_count && i < 8; i++) {
+        snprintf(f->tag_keys[i], sizeof(f->tag_keys[i]), "%s",
+                 spec->tags[i].key);
+        snprintf(f->tag_values[i], sizeof(f->tag_values[i]), "%s",
+                 spec->tags[i].value);
     }
     snprintf(out->change_set_id, sizeof(out->change_set_id), "cs-1");
     return f->create_rc;
@@ -459,7 +534,7 @@ static int fake_delete_stack(void *ud, cfn_client *client, const char *region,
     return f->delete_stack_rc;
 }
 
-static const deploy_ops fake_ops = {
+static deploy_ops fake_ops = {
     .git_provenance = fake_provenance,
     .freshness = fake_freshness,
     .resolve_bucket = fake_bucket,
@@ -485,6 +560,10 @@ static const deploy_ops fake_ops = {
     .wait_stack = fake_wait_stack,
     .delete_stack = fake_delete_stack,
 };
+
+/* Variant that exercises template loading; the base fake keeps the seam NULL
+ * so the existing pipeline tests do not need a filesystem template. */
+static deploy_ops configured_ops;
 
 /* ------------------------------------------------------------------------- */
 /* Fixture                                                                   */
@@ -543,6 +622,115 @@ static void write_text(const char *path, const char *text) {
     fclose(file);
 }
 
+static void append_text(const char *path, const char *text) {
+    FILE *file = fopen(path, "a");
+
+    if (file == NULL) {
+        perror(path);
+        exit(1);
+    }
+    fputs(text, file);
+    fclose(file);
+}
+
+static char *read_text_file(const char *path) {
+    FILE *file = fopen(path, "rb");
+    long size;
+    char *body;
+
+    if (file == NULL) {
+        return NULL;
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        return NULL;
+    }
+    rewind(file);
+    body = malloc((size_t)size + 1);
+    if (body == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    if (fread(body, 1, (size_t)size, file) != (size_t)size) {
+        free(body);
+        fclose(file);
+        return NULL;
+    }
+    fclose(file);
+    body[size] = '\0';
+    return body;
+}
+
+static char *read_runfile(const char *relative) {
+    const char *srcdir = getenv("TEST_SRCDIR");
+    const char *workspace = getenv("TEST_WORKSPACE");
+    char path[PATH_MAX];
+
+    if (srcdir == NULL || workspace == NULL) {
+        return NULL;
+    }
+    snprintf(path, sizeof(path), "%s/%s/%s", srcdir, workspace, relative);
+    return read_text_file(path);
+}
+
+static void fixture_install_canonical(fixture *fx) {
+    char path[PATH_MAX];
+    char *text = read_runfile("deploy/stackctl-infra.yaml");
+
+    if (text == NULL) {
+        fprintf(stderr, "cannot load the canonical infra template\n");
+        exit(1);
+    }
+    snprintf(path, sizeof(path), "%s/deploy/stackctl-infra.yaml", fx->root);
+    write_text(path, text);
+    free(text);
+}
+
+static void fixture_install_override(fixture *fx, const char *relative,
+                                     const char *runfile_relative,
+                                     const char *prefix) {
+    char path[PATH_MAX];
+    char *text = read_runfile(runfile_relative);
+    char *body;
+
+    if (text == NULL) {
+        fprintf(stderr, "cannot load fixture %s\n", runfile_relative);
+        exit(1);
+    }
+    snprintf(path, sizeof(path), "%s/%s", fx->root, relative);
+    body = malloc((prefix != NULL ? strlen(prefix) : 0) + strlen(text) + 1);
+    if (body == NULL) {
+        exit(1);
+    }
+    body[0] = '\0';
+    if (prefix != NULL) {
+        strcpy(body, prefix);
+    }
+    strcat(body, text);
+    write_text(path, body);
+    free(body);
+    free(text);
+}
+
+static void fixture_append_env(fixture *fx, const char *line) {
+    char path[PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/.env", fx->config_dir);
+    append_text(path, line);
+}
+
+static void fixture_write_env(fixture *fx, const char *text) {
+    char path[PATH_MAX];
+
+    snprintf(path, sizeof(path), "%s/.env", fx->config_dir);
+    write_text(path, text);
+}
+
 static void fixture_init(fixture *fx) {
     char template[] = "/tmp/stackctl-deploy-XXXXXX";
     char *root = mkdtemp(template);
@@ -586,7 +774,13 @@ static deploy_env make_env(fake *f, stackctl_config *cfg, fixture *fx) {
     env.config_dir = fx->config_dir;
     env.out = stdout;
     env.err = stderr;
-    env.ops = &fake_ops;
+    if (f->read_templates != 0) {
+        configured_ops = fake_ops;
+        configured_ops.read_template_path = fake_read_template_path;
+        env.ops = &configured_ops;
+    } else {
+        env.ops = &fake_ops;
+    }
     env.ops_ud = f;
     env.confirm = confirm_yes;
     env.confirm_ud = f;
@@ -605,6 +799,21 @@ static deploy_env make_env(fake *f, stackctl_config *cfg, fixture *fx) {
 /* ------------------------------------------------------------------------- */
 /* Cases                                                                     */
 /* ------------------------------------------------------------------------- */
+
+static int stream_contains(FILE *stream, const char *needle) {
+    char buffer[8192];
+    size_t got;
+
+    if (stream == NULL) {
+        return 0;
+    }
+    fflush(stream);
+    rewind(stream);
+    got = fread(buffer, 1, sizeof buffer - 1, stream);
+    buffer[got] = '\0';
+    clearerr(stream);
+    return strstr(buffer, needle) != NULL;
+}
 
 static void test_null_env(void) {
     CHECK(deploy_run(NULL) == CLI_EXIT_USAGE, "NULL env is usage");
@@ -705,6 +914,44 @@ static void test_in_progress_stack_is_aws(void) {
     config_free(cfg);
 }
 
+static void test_stack_state_recovery_guidance(void) {
+    struct {
+        cfn_stack_status status;
+        const char *needle;
+        const char *label;
+    } cases[] = {
+        {CFN_STACK_STATUS_ROLLBACK_COMPLETE, "delete the stack",
+         "ROLLBACK_COMPLETE names the delete-stack recovery"},
+        {CFN_STACK_STATUS_UPDATE_ROLLBACK_FAILED, "continue-update-rollback",
+         "UPDATE_ROLLBACK_FAILED names continue-update-rollback"},
+        {CFN_STACK_STATUS_DELETE_FAILED, "DELETE_FAILED",
+         "DELETE_FAILED names the failed stack state"},
+    };
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        fixture fx;
+        fake f = {0};
+        stackctl_config *cfg;
+        deploy_env env;
+        FILE *err;
+
+        fixture_init(&fx);
+        cfg = load_config(&fx);
+        f.stack_present = 1;
+        f.status = cases[i].status;
+        env = make_env(&f, cfg, &fx);
+        err = tmpfile();
+        env.err = err;
+        CHECK(deploy_run(&env) == CLI_EXIT_AWS, cases[i].label);
+        CHECK(stream_contains(err, cases[i].needle), cases[i].label);
+        CHECK(f.executed == 0, "no change-set execution on a bad stack state");
+        if (err != NULL) {
+            fclose(err);
+        }
+        config_free(cfg);
+    }
+}
+
 static void test_new_release_publishes_then_updates_in_order(void) {
     fixture fx;
     fake f = {0};
@@ -746,6 +993,25 @@ static void test_new_release_publishes_then_updates_in_order(void) {
         }
     }
     CHECK(ami_param, "pinned AmiId parameter present");
+    check_release_tags(&f, "v1.2.3", f.publish_sha);
+    config_free(cfg);
+}
+
+static void test_update_tags_release_identity(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.rel_exists = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "existing release update succeeds");
+    CHECK(f.last_type == CFN_CHANGE_SET_TYPE_UPDATE, "UPDATE change set");
+    check_release_tags(&f, "v1.2.3", f.verify_sha);
     config_free(cfg);
 }
 
@@ -769,6 +1035,7 @@ static void test_rollback_existing_tag_skips_gates_and_publish(void) {
     CHECK(f.verified_count == 1, "rollback verifies the manifest");
     CHECK(strcmp(env.tag, "v1.0.0") == 0, "rollback tag retained");
     CHECK(f.executed == 1, "stack update executed");
+    check_release_tags(&f, "v1.0.0", f.verify_sha);
     config_free(cfg);
 }
 
@@ -1215,7 +1482,213 @@ static void test_json_preview_has_structured_param_diff(void) {
     config_free(cfg);
 }
 
+/* ------------------------------------------------------------------------- */
+/* TEMPLATE_OVERRIDE and AMI policy                                          */
+/* ------------------------------------------------------------------------- */
+
+static void test_template_override_valid_is_used_and_checked(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    fixture_install_override(&fx, "deploy/custom.yaml",
+                             "deploy/stackctl-infra.yaml",
+                             "# override-marker\n");
+    fixture_append_env(&fx, "TEMPLATE_OVERRIDE=deploy/custom.yaml\n");
+    cfg = load_config(&fx);
+    f.read_templates = 1;
+    f.stack_present = 0;
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK,
+          "valid TEMPLATE_OVERRIDE deploy succeeds");
+    CHECK(strstr(f.last_template, "override-marker") != NULL,
+          "override template is used in the change-set body");
+    CHECK(trace_index(&f, TRACE_TEMPLATE) < trace_index(&f, TRACE_BUCKET),
+          "template load and check before bucket preflight");
+    config_free(cfg);
+}
+
+static void test_template_override_invalid_aborts_before_aws(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+    FILE *errors;
+    char captured[4096];
+    size_t got;
+    int saved_stderr;
+    int rc;
+
+    fixture_init(&fx);
+    fixture_install_override(&fx, "deploy/bad.yaml",
+                             "deploy/check/testdata/bad_infra_bucket.yaml",
+                             NULL);
+    fixture_append_env(&fx, "TEMPLATE_OVERRIDE=deploy/bad.yaml\n");
+    cfg = load_config(&fx);
+    f.read_templates = 1;
+    env = make_env(&f, cfg, &fx);
+    errors = tmpfile();
+    CHECK(errors != NULL, "stderr capture opens");
+    if (errors == NULL) {
+        config_free(cfg);
+        return;
+    }
+    saved_stderr = dup(STDERR_FILENO);
+    CHECK(saved_stderr >= 0, "stderr can be duplicated");
+    (void)dup2(fileno(errors), STDERR_FILENO);
+    rc = deploy_run(&env);
+    fflush(stderr);
+    if (saved_stderr >= 0) {
+        (void)dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
+    rewind(errors);
+    got = fread(captured, 1, sizeof(captured) - 1, errors);
+    captured[got] = '\0';
+    fclose(errors);
+
+    CHECK(rc == CLI_EXIT_USAGE, "invalid override exits usage (1)");
+    CHECK(trace_index(&f, TRACE_BUCKET) < 0, "no bucket preflight");
+    CHECK(trace_index(&f, TRACE_AMI_RESOLVE) < 0, "no AMI preflight");
+    CHECK(trace_index(&f, TRACE_AWS_INIT) < 0, "no AWS init");
+    CHECK(trace_index(&f, TRACE_CREATE_CS) < 0, "no change set");
+    CHECK(f.published_count == 0, "nothing published");
+    CHECK(strstr(captured, "DeletionPolicy") != NULL,
+          "violation is named in stderr");
+    CHECK(strstr(captured, "bad.yaml") != NULL, "filename is named in stderr");
+    config_free(cfg);
+}
+
+static void test_no_override_uses_canonical_template(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    fixture_install_canonical(&fx);
+    cfg = load_config(&fx);
+    f.read_templates = 1;
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "canonical template deploy succeeds");
+    CHECK(strncmp(f.last_template, "AWSTemplateFormatVersion", 24) == 0,
+          "canonical template is used in the change-set body");
+    config_free(cfg);
+}
+
+static void test_ami_params_only_when_pinned(void) {
+    static const char *ssm_env =
+        "PROJECT=demo\n"
+        "REGION=us-east-1\n"
+        "ARCH=amd64\n"
+        "SPOT_DEFAULT=false\n"
+        "AMI_POLICY=ssm\n"
+        "AMI_SSM_AMD64=/aws/service/ami-amazon-linux-latest/al2023-ami\n"
+        "INSTANCE_TYPES_AMD64=g4dn.xlarge\n"
+        "ROOT_VOLUME_SIZE=100\n"
+        "KEY_NAME=demo-key\n"
+        "SSH_IDENTITY=/home/operator/.ssh/demo\n"
+        "BUCKET_MODULES=artifact,cert\n"
+        "ENABLE_IMAGE_BUILDER=false\n"
+        "SETUP_ENTRYPOINT=deploy.sh\n"
+        "SSH_PORT=22\n"
+        "OPERATOR_CIDR=203.0.113.0/24\n"
+        "INGRESS_TCP=443\n"
+        "INGRESS_UDP=\n"
+        "RELEASE_TARGETS=//app:deploy.tar.gz\n"
+        "RELEASE_PREFIXES=releases/\n";
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+    int ami_param = 0;
+    int policy_param = 0;
+
+    fixture_init(&fx);
+    fixture_write_env(&fx, ssm_env);
+    cfg = load_config(&fx);
+    CHECK(cfg != NULL, "ssm config loads");
+    if (cfg == NULL) {
+        return;
+    }
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "ssm deploy succeeds");
+    for (size_t i = 0; i < f.last_param_count && i < 16; i++) {
+        if (strncmp(f.params[i], "AmiId", 5) == 0) {
+            ami_param = 1;
+        }
+        if (strcmp(f.params[i], "AmiPolicy") == 0) {
+            policy_param = strcmp(f.param_values[i], "ssm") == 0;
+        }
+    }
+    CHECK(ami_param == 0, "non-pinned deploy passes no AmiId parameters");
+    CHECK(policy_param, "AmiPolicy parameter is ssm");
+    config_free(cfg);
+}
+
+static char *make_credentials_home(void) {
+    char *home = strdup("/tmp/stackctl-abort-XXXXXX");
+    char dir[PATH_MAX];
+    char path[PATH_MAX];
+    FILE *file;
+
+    if (home == NULL || mkdtemp(home) == NULL) {
+        perror("mkdtemp");
+        exit(2);
+    }
+    if (snprintf(dir, sizeof dir, "%s/.aws", home) >= (int)sizeof dir ||
+        mkdir(dir, 0700) != 0) {
+        perror("mkdir .aws");
+        exit(2);
+    }
+    if (snprintf(path, sizeof path, "%s/credentials", dir) >= (int)sizeof path) {
+        exit(2);
+    }
+    file = fopen(path, "w");
+    if (file == NULL) {
+        perror("fopen credentials");
+        exit(2);
+    }
+    fputs("[prod-abort]\n"
+          "aws_access_key_id = AKIAFAKEFAKEFAKEFAKE\n"
+          "aws_secret_access_key = fake-secret\n",
+          file);
+    if (fclose(file) != 0) {
+        exit(2);
+    }
+    return home;
+}
+
+static void test_prod_aws_init_installs_abort_hook(void) {
+    char *home = make_credentials_home();
+    const char *saved_home = getenv("HOME");
+    char *saved = saved_home != NULL ? strdup(saved_home) : NULL;
+    aws_ctx *aws = NULL;
+    int rc;
+
+    CHECK(setenv("HOME", home, 1) == 0, "HOME points at fake credentials");
+    rc = deploy_prod_aws_init_for_test("prod-abort", &aws);
+    CHECK(rc == 0, "production aws_init succeeds");
+    if (rc == 0) {
+        CHECK(aws != NULL, "production aws_init returns a client");
+        CHECK(aws != NULL && aws->abort_fn == cli_abort_check,
+              "production aws_init installs the CLI abort hook");
+        CHECK(aws != NULL && aws->abort_ud == NULL,
+              "abort hook has no user data");
+    }
+    aws_free(aws);
+    if (saved != NULL) {
+        CHECK(setenv("HOME", saved, 1) == 0, "HOME restored");
+        free(saved);
+    } else {
+        unsetenv("HOME");
+    }
+}
+
 int main(void) {
+    test_prod_aws_init_installs_abort_hook();
     test_null_env();
     test_provenance_failure();
     test_ambiguous_tag_is_usage();
@@ -1223,7 +1696,9 @@ int main(void) {
     test_skip_build_bypasses_freshness();
     test_ami_preflight_failure_is_usage();
     test_in_progress_stack_is_aws();
+    test_stack_state_recovery_guidance();
     test_new_release_publishes_then_updates_in_order();
+    test_update_tags_release_identity();
     test_rollback_existing_tag_skips_gates_and_publish();
     test_rollback_missing_tag_is_verify();
     test_existing_release_verify_failure_is_verify();
@@ -1243,6 +1718,10 @@ int main(void) {
     test_live_instance_count_queried();
     test_param_diff_listing();
     test_json_preview_has_structured_param_diff();
+    test_template_override_valid_is_used_and_checked();
+    test_template_override_invalid_aborts_before_aws();
+    test_no_override_uses_canonical_template();
+    test_ami_params_only_when_pinned();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

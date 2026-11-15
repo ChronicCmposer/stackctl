@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
+#include "aws.h"
 #include "cli.h"
 #include "refresh_ami.h"
 
@@ -61,6 +62,10 @@ int refresh_ami_run(const refresh_ami_env *env);
 
 /* Test-only seam: override the resolver used by cli_cmd_refresh_ami(). */
 void refresh_ami_set_ops_for_test(const refresh_ami_ops *ops, void *ud);
+
+/* Test-only: the production aws_init seam, so tests can assert the signal
+ * abort hook is installed on a real client. */
+int refresh_ami_prod_aws_init_for_test(const char *profile, aws_ctx **out);
 
 /* Test-only seam: override file operations. */
 void refresh_ami_set_file_ops_for_test(const refresh_ami_file_ops *ops,
