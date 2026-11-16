@@ -1150,6 +1150,45 @@ static int cert_policy_is_conditional(const node *role) {
     return 0;
 }
 
+/*
+ * The operator policy may grant bucket-lifecycle actions on the cert bucket
+ * because CloudFormation's S3 handlers create and configure it under the
+ * caller's identity, but it must never grant object-level access: the cert
+ * store is written only by the conditional instance-role policy.
+ */
+static int grants_cert_object_access(const node *n) {
+    if (n == NULL) {
+        return 0;
+    }
+    if (n->kind == NODE_SEQ) {
+        for (size_t i = 0; i < n->nitems; i++) {
+            if (grants_cert_object_access(n->items[i])) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (n->kind != NODE_MAP) {
+        return 0;
+    }
+    const node *action = map_get(n, "Action");
+    const node *resource = map_get(n, "Resource");
+    if (action != NULL && resource != NULL && node_contains(resource, "-certs-")) {
+        if (action_list_contains(action, "s3:GetObject") ||
+            action_list_contains(action, "s3:PutObject") ||
+            action_list_contains(action, "s3:DeleteObject") ||
+            action_list_contains(action, "s3:ListBucket")) {
+            return 1;
+        }
+    }
+    for (size_t i = 0; i < n->npairs; i++) {
+        if (grants_cert_object_access(n->pairs[i].value)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void check_operator_role_resources(checker *c, const node *root) {
     const node *resources = template_resources(root);
     const node *role = map_get(resources, "InstanceRole");
@@ -1181,8 +1220,8 @@ static void check_operator_role_resources(checker *c, const node *root) {
     const node *policy = map_get(resources, "OperatorPolicy");
     if (policy == NULL) {
         violation(c, "missing OperatorPolicy resource");
-    } else if (node_contains(policy, "-certs-")) {
-        violation(c, "OperatorPolicy must never grant the cert bucket");
+    } else if (grants_cert_object_access(policy)) {
+        violation(c, "OperatorPolicy must never grant object access to the cert bucket");
     }
 }
 
@@ -1370,6 +1409,36 @@ static void check_operator_image_builder_permissions(checker *c, const node *roo
     }
 }
 
+/*
+ * The infra stack always creates its artifact bucket (and conditionally the
+ * cert bucket) through CloudFormation's S3 handlers, which run under the
+ * caller's identity. Object-level release access is therefore insufficient:
+ * the operator policy must also grant bucket create/delete on the artifacts
+ * bucket pattern, or a first deploy rolls back with s3:CreateBucket denied.
+ * Fail closed on both actions in one violation.
+ */
+static int statement_grants_on_artifacts(const node *statement, const char *action) {
+    return statement != NULL &&
+           action_list_contains(map_get(statement, "Action"), action) &&
+           node_contains(map_get(statement, "Resource"),
+                         "${ProjectName}-artifacts-");
+}
+
+static void check_operator_bucket_lifecycle(checker *c, const node *root) {
+    const node *policy = map_get(template_resources(root), "OperatorPolicy");
+    if (policy == NULL) {
+        /* Missing OperatorPolicy is reported by check_operator_role_resources. */
+        return;
+    }
+    if (!statement_grants_on_artifacts(find_statement(policy, "s3:CreateBucket"),
+                                       "s3:CreateBucket") ||
+        !statement_grants_on_artifacts(find_statement(policy, "s3:DeleteBucket"),
+                                       "s3:DeleteBucket")) {
+        violation(c, "OperatorPolicy must grant s3:CreateBucket and s3:DeleteBucket "
+                     "on the ${ProjectName}-artifacts- bucket pattern");
+    }
+}
+
 static void check_operator(checker *c, const node *root) {
     check_required_params(c, root, OPERATOR_PARAMS,
                           sizeof(OPERATOR_PARAMS) / sizeof(OPERATOR_PARAMS[0]));
@@ -1436,6 +1505,7 @@ static void check_operator(checker *c, const node *root) {
     check_operator_user(c, root);
     check_imagebuilder_execution_role(c, root);
     check_operator_image_builder_permissions(c, root);
+    check_operator_bucket_lifecycle(c, root);
     check_operator_s3_scope(c, map_get(resources, "OperatorPolicy"));
 }
 

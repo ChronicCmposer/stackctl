@@ -78,6 +78,8 @@ int main(void) {
                 TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_operator_missing_imagebuilder_perms.yaml",
                 TC_MODE_OPERATOR);
+    expect_file(1, "deploy/check/testdata/bad_operator_missing_bucket_lifecycle.yaml",
+                TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_operator_ib_execution_trust.yaml",
                 TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_infra_baked_distribution.yaml",
