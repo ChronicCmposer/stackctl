@@ -67,8 +67,8 @@ typedef struct provision_ops {
     int (*credentials_key_id)(void *ud, const char *profile, char **out);
     int (*credentials_write)(void *ud, const char *profile, const char *key_id,
                              const char *secret, char **backup_out);
-    /* Retry back-off hook; tests make this a no-op. */
-    void (*retry_pause)(void *ud);
+    /* Retry back-off hook; `attempt` is the 0-based index just failed. */
+    void (*retry_pause)(void *ud, int attempt);
     int (*read_template)(void *ud, const char *repo_root, char **body_out);
     /*
      * Path-labelled template read. When set, provision loads the canonical
@@ -115,6 +115,13 @@ int provision_region_variant(const char *config_dir,
 int provision_ensure_keys(const provision_env *env, const provision_ops *ops,
                           void *ud, aws_ctx *admin_aws,
                           int *identity_mismatch);
+
+/*
+ * Pure back-off schedule in milliseconds: 2 s, 4 s, then 8 s capped. Shared by
+ * the production pause seam and unit tests so the schedule is asserted without
+ * sleeping.
+ */
+int retry_pause_ms(int attempt);
 
 /* Test-only override consumed by cli_cmd_provision(). */
 void provision_set_ops_for_test(const provision_ops *ops, void *ud);

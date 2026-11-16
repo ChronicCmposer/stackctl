@@ -96,6 +96,8 @@ typedef struct fake {
     char written_secret[64];
     int identity_attempts;
     int identity_eacces_attempts;
+    int pause_attempts[16];
+    int pause_count;
 
     int last_type;
     unsigned last_caps;
@@ -475,7 +477,15 @@ static int fake_credentials_write(void *ud, const char *profile,
     return f->write_rc;
 }
 
-static void fake_retry_pause(void *ud) { (void)ud; }
+static void fake_retry_pause(void *ud, int attempt) {
+    fake *f = ud;
+
+    if (f->pause_count < (int)(sizeof(f->pause_attempts) /
+                               sizeof(f->pause_attempts[0]))) {
+        f->pause_attempts[f->pause_count] = attempt;
+    }
+    f->pause_count++;
+}
 
 static int fake_template(void *ud, const char *repo_root, char **body_out) {
     fake *f = ud;
@@ -1398,7 +1408,40 @@ static void test_keys_ci_not_auto_minted(void) {
     config_free(cfg);
 }
 
-static void test_keys_identity_retries_six(void) {
+static void test_keys_identity_backoff_schedule(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    f.ci_key_count = 1;
+    snprintf(f.ci_key_ids[0], sizeof(f.ci_key_ids[0]), "AKIACIOLD");
+    f.have_local_ci = 1;
+    snprintf(f.local_ci_key, sizeof(f.local_ci_key), "AKIACIOLD");
+    f.identity_eacces_attempts = 7;
+    CHECK(run_keys(&f, cfg, &fx) == 0, "fresh key verifies on a late attempt");
+    CHECK(f.create_count == 1, "fresh operator key minted");
+    CHECK(f.identity_attempts == 8, "succeeded on the eighth attempt");
+    CHECK(f.pause_count == 7, "one pause per failed attempt");
+    for (int i = 0; i < 7; i++) {
+        CHECK(f.pause_attempts[i] == i, "pause attempt index grows");
+    }
+    CHECK(f.write_count == 1, "credentials written for the fresh key");
+    CHECK(strcmp(f.written_key, "AKIANEW1") == 0, "new key id written");
+    config_free(cfg);
+}
+
+static void test_retry_pause_schedule(void) {
+    CHECK(retry_pause_ms(0) == 2000, "first pause is 2 s");
+    CHECK(retry_pause_ms(1) == 4000, "second pause is 4 s");
+    CHECK(retry_pause_ms(2) == 8000, "third pause caps at 8 s");
+    CHECK(retry_pause_ms(3) == 8000, "subsequent pauses stay capped");
+    CHECK(retry_pause_ms(8) == 8000, "final attempt pause stays capped");
+    CHECK(retry_pause_ms(-1) == 2000, "negative attempt clamps to first pause");
+}
+
+static void test_keys_identity_retries_nine(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
@@ -1411,7 +1454,7 @@ static void test_keys_identity_retries_six(void) {
     snprintf(f.local_ci_key, sizeof(f.local_ci_key), "AKIACIOLD");
     f.identity_eacces_attempts = 5;
     CHECK(run_keys(&f, cfg, &fx) == 0, "eventual consistency succeeds");
-    CHECK(f.identity_attempts == 6, "retried InvalidClientTokenId up to 6");
+    CHECK(f.identity_attempts == 6, "retried InvalidClientTokenId through 5 failures");
 
     fixture_init(&fx);
     cfg = load_config(&fx);
@@ -1422,7 +1465,7 @@ static void test_keys_identity_retries_six(void) {
     snprintf(f.local_ci_key, sizeof(f.local_ci_key), "AKIACIOLD");
     f.identity_eacces_attempts = 100;
     CHECK(run_keys(&f, cfg, &fx) == EACCES, "persistent failure propagates");
-    CHECK(f.identity_attempts == 6, "bounded at six attempts");
+    CHECK(f.identity_attempts == 9, "bounded at nine fresh-key attempts");
     config_free(cfg);
 }
 
@@ -1721,7 +1764,9 @@ int main(void) {
     test_keys_prune_before_create_and_rotate();
     test_keys_missing_local_mints();
     test_keys_ci_not_auto_minted();
-    test_keys_identity_retries_six();
+    test_keys_identity_retries_nine();
+    test_keys_identity_backoff_schedule();
+    test_retry_pause_schedule();
     test_operator_template_gate_accepts_canonical();
     test_operator_template_gate_rejects_tampered();
     test_region_variant_derived_from_config();

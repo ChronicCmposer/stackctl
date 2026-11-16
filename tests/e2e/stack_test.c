@@ -545,7 +545,10 @@ static int p_cred_write(void *ud, const char *profile, const char *key_id,
     return 0;
 }
 
-static void p_retry_pause(void *ud) { (void)ud; }
+static void p_retry_pause(void *ud, int attempt) {
+    (void)ud;
+    (void)attempt;
+}
 
 static int p_template(void *ud, const char *repo_root, char **body_out) {
     (void)ud;

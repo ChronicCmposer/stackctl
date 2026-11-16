@@ -302,9 +302,23 @@ static int prod_credentials_write(void *ud, const char *profile,
     return rc;
 }
 
-static void prod_retry_pause(void *ud) {
+/*
+ * Back-off budget for IAM eventual consistency: a freshly minted access key
+ * typically needs 5-60 s before GetCallerIdentity accepts it. Pauses grow
+ * 2 s, 4 s, then cap at 8 s per attempt.
+ */
+int retry_pause_ms(int attempt) {
+    int shift = attempt < 0 ? 0 : attempt;
+
+    if (shift > 2) {
+        shift = 2;
+    }
+    return 2000 << shift;
+}
+
+static void prod_retry_pause(void *ud, int attempt) {
     (void)ud;
-    (void)usleep(500 * 1000);
+    (void)usleep((useconds_t)retry_pause_ms(attempt) * 1000);
 }
 
 static int prod_read_template_path(void *ud, const char *path,
@@ -638,10 +652,12 @@ static int arn_matches_user(const char *arn, const char *project) {
 
 /*
  * Verify the project caller identity, retrying InvalidClientTokenId (mapped to
- * EACCES by core/iam) up to 6 times for fresh-key eventual consistency.
+ * EACCES by core/iam) while a freshly minted key propagates through IAM. The
+ * attempt budget and back-off together span roughly a minute.
  */
 static int verify_project_identity(const provision_ops *ops, void *ud,
                                    const char *project, int attempts,
+                                   int fresh_key, FILE *err,
                                    int *identity_mismatch) {
     int rc = 0;
 
@@ -664,10 +680,17 @@ static int verify_project_identity(const provision_ops *ops, void *ud,
         }
         free(arn);
         if (rc != EACCES || attempt + 1 >= attempts) {
+            if (rc == EACCES && fresh_key && err != NULL) {
+                fprintf(err,
+                        "stackctl: newly minted key for %s is not active yet "
+                        "(IAM propagation can take up to a minute); wait ~1 "
+                        "minute and re-run provision (it is safe to re-run)\n",
+                        project);
+            }
             return rc;
         }
         if (ops->retry_pause != NULL) {
-            ops->retry_pause(ud);
+            ops->retry_pause(ud, attempt);
         }
     }
     return rc;
@@ -741,8 +764,10 @@ static int ensure_user_key(const provision_env *env, const provision_ops *ops,
             ops->iam_key_free(ud, &created);
         }
         if (rc == 0 && is_operator) {
-            rc = verify_project_identity(ops, ud, project,
-                                         created_count != 0 ? 6 : 1,
+            int fresh_key = created_count != 0;
+
+            rc = verify_project_identity(ops, ud, project, fresh_key ? 9 : 1,
+                                         fresh_key, env->err,
                                          identity_mismatch);
         }
         /* Under rotation the previous local key is deleted only after the
