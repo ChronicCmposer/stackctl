@@ -1,12 +1,14 @@
 # Hermetic lint entry points (CONTRACT Amendment 3 + 4).
 #
-# Every target is runnable with `bazel run`:
-#   bazel run //tools/lint:lint-c
+# C sources are checked by the per-target aspect in cppcheck_aspect.bzl, run as:
+#   bazel build --config=lint-c //...
+#
+# The remaining linters are `bazel run` targets:
 #   bazel run //tools/lint:lint-starlark
 #   bazel run //tools/lint:lint-shell
 #   bazel run //tools/lint:lint-yaml
 #   bazel run //tools/lint:lint-markdown
-#   bazel run //tools/lint:lint          # aggregate
+#   bazel run //tools/lint:lint          # aggregate (the four non-C modes)
 #
 # The tools are Bazel-fetched pinned artifacts from MODULE.bazel; the driver
 # (lint.sh) only receives their runfiles paths, so nothing is read from PATH or
@@ -67,19 +69,6 @@ cc_binary(
 )
 
 sh_binary(
-    name = "lint-c",
-    srcs = ["lint.sh"],
-    args = [
-        "--mode=c",
-        "--cppcheck=$(rootpath @cppcheck//:cppcheck)",
-    ],
-    data = [
-        "@cppcheck",
-        "@cppcheck//:cfg",
-    ],
-)
-
-sh_binary(
     name = "lint-starlark",
     srcs = ["lint.sh"],
     args = [
@@ -124,7 +113,6 @@ sh_binary(
     srcs = ["lint.sh"],
     args = [
         "--mode=all",
-        "--cppcheck=$(rootpath @cppcheck//:cppcheck)",
         "--buildifier=$(rootpath :buildifier_bin)",
         "--shellcheck=$(rootpath :shellcheck_bin)",
         "--yaml-check=$(rootpath :yaml_check)",
@@ -135,7 +123,5 @@ sh_binary(
         ":markdown_check",
         ":shellcheck_bin",
         ":yaml_check",
-        "@cppcheck",
-        "@cppcheck//:cfg",
     ],
 )

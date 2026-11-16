@@ -6,6 +6,10 @@
 # `args` attribute, so the tools themselves are always the Bazel-fetched,
 # sha256-pinned artifacts (see MODULE.bazel) and never host-installed copies.
 #
+# C sources are not handled here: cppcheck runs as a per-target Bazel aspect
+# (tools/lint/cppcheck_aspect.bzl) via `bazel build --config=lint-c //...`, so
+# each target is checked in parallel and cached independently.
+#
 # The workspace source tree is discovered under BUILD_WORKSPACE_DIRECTORY (set
 # by `bazel run`). Vendored upstream sources live in Bazel external repositories
 # and are therefore never part of the workspace walk; only our overlay files in
@@ -17,7 +21,6 @@
 set -euo pipefail
 
 mode=""
-cppcheck_tool=""
 buildifier_tool=""
 shellcheck_tool=""
 yaml_check_tool=""
@@ -26,7 +29,6 @@ markdown_check_tool=""
 for argument in "$@"; do
     case "$argument" in
         --mode=*) mode="${argument#*=}" ;;
-        --cppcheck=*) cppcheck_tool="${argument#*=}" ;;
         --buildifier=*) buildifier_tool="${argument#*=}" ;;
         --shellcheck=*) shellcheck_tool="${argument#*=}" ;;
         --yaml-check=*) yaml_check_tool="${argument#*=}" ;;
@@ -116,39 +118,6 @@ require_tool() {
     printf '%s\n' "$resolved"
 }
 
-run_c() {
-    local tool cfgdir work rc
-    tool="$(require_tool cppcheck "$cppcheck_tool")" || return 2
-    # cppcheck locates std.cfg relative to /proc/self/exe, so run a copy of the
-    # binary beside a copy of its (pinned, Bazel-fetched) cfg/ directory.
-    cfgdir="$(dirname "$tool")/cfg"
-    if [[ ! -d "$cfgdir" ]]; then
-        printf 'lint-c: cppcheck cfg directory missing: %s\n' "$cfgdir" >&2
-        return 2
-    fi
-    load_files "$(find_root)" '*.c' '*.h'
-    if (( ${#files[@]} == 0 )); then
-        printf 'lint-c: no C sources found\n'
-        return 0
-    fi
-    work="$(mktemp -d)"
-    trap 'rm -rf "$work"' EXIT
-    cp "$tool" "$work/cppcheck"
-    cp -RL "$cfgdir" "$work/cfg"
-    printf 'lint-c: %d file(s) via cppcheck\n' "${#files[@]}"
-    rc=0
-    "$work/cppcheck" \
-        --quiet \
-        --error-exitcode=1 \
-        --enable=warning,performance,portability \
-        --inline-suppr \
-        --suppress=missingIncludeSystem \
-        "${files[@]}" || rc=$?
-    rm -rf "$work"
-    trap - EXIT
-    return "$rc"
-}
-
 run_starlark() {
     local tool
     tool="$(require_tool buildifier "$buildifier_tool")" || return 2
@@ -199,7 +168,6 @@ run_markdown() {
 
 run_all() {
     local status=0
-    run_c || status=$?
     run_starlark || status=$?
     run_shell || status=$?
     run_yaml || status=$?
@@ -208,7 +176,6 @@ run_all() {
 }
 
 case "$mode" in
-    c) run_c ;;
     starlark) run_starlark ;;
     shell) run_shell ;;
     yaml) run_yaml ;;

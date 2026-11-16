@@ -1,0 +1,10 @@
+# Shared build configuration.
+#
+# `lint-c` attaches the per-target cppcheck aspect and adds its `lint` output
+# group to the default outputs. Run it over the build graph, e.g.:
+#
+#   bazel build --config=lint-c //...
+#
+# Each C/C++ target gets its own Cppcheck action, so checks run in parallel and
+# are cached individually.
+build:lint-c --aspects=//tools/lint:cppcheck_aspect.bzl%cppcheck_aspect --output_groups=+lint

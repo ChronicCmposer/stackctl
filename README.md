@@ -768,25 +768,26 @@ command list. The canonical commands are:
 ```bash
 bazel build //...
 bazel test //...
-bazel run //tools/lint:lint
+bazel build --config=lint-c //... && bazel run //tools/lint:lint
 ```
 
 Run an individual linter while iterating:
 
 ```bash
-bazel run //tools/lint:lint-c          # cppcheck over C sources and headers
+bazel build --config=lint-c //...      # cppcheck per-target aspect over C sources
 bazel run //tools/lint:lint-starlark   # buildifier over BUILD/MODULE/*.bzl
 bazel run //tools/lint:lint-shell      # shellcheck over shell scripts
 bazel run //tools/lint:lint-yaml       # yaml_check over *.yaml/*.yml
 bazel run //tools/lint:lint-markdown   # markdown_check over *.md
 ```
 
-Lint is part of every verification step. The aggregate target globs the workspace, so new
-modules are covered automatically; vendored upstream sources are never linted, only the overlay
-files under `third_party/`. Tooling is fetched and pinned by `MODULE.bazel`: cppcheck is built
-from its pinned release source, while buildifier and shellcheck are pinned prebuilt release
-binaries (sha256-verified, fetched per-CPU via Bazel `select()`). The `markdown_check` and
-`yaml_check` C programs live in-repo. No host-installed compiler, linter or test runner is used.
+Lint is part of every verification step. C sources are checked by a per-target aspect, so each
+target's cppcheck action runs in parallel and caches independently; the aggregate target covers
+the remaining linters. Vendored upstream sources are never linted, only the overlay files under
+`third_party/`. Tooling is fetched and pinned by `MODULE.bazel`: cppcheck is built from its pinned
+release source, while buildifier and shellcheck are pinned prebuilt release binaries
+(sha256-verified, fetched per-CPU via Bazel `select()`). The `markdown_check` and `yaml_check` C
+programs live in-repo. No host-installed compiler, linter or test runner is used.
 
 Conventions:
 

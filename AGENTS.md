@@ -5,12 +5,13 @@ pinned in `MODULE.bazel`. All build, test, and lint commands run through Bazel;
 nothing depends on a host-installed compiler, linter, or test runner (CONTRACT
 Amendment 4).
 
-Lint is part of the gate at every verification step (CONTRACT Amendment 3). The
-aggregate target `//tools/lint:lint` discovers files by glob over the workspace
-(pruning `.git/`, `.parallel-implement/`, and `bazel-*` output symlinks), so new
-modules are covered automatically without editing a file list. Vendored upstream
-sources come from Bazel external repositories and are never linted; only our
-overlay files under `third_party/` are.
+Lint is part of the gate at every verification step (CONTRACT Amendment 3). C
+sources are checked by a per-target aspect over the build graph, and the
+aggregate target `//tools/lint:lint` runs the remaining linters by glob over the
+workspace (pruning `.git/`, `.parallel-implement/`, and `bazel-*` output
+symlinks), so new modules are covered automatically without editing a file list.
+Vendored upstream sources come from Bazel external repositories and are never
+linted; only our overlay files under `third_party/` are.
 
 Tooling is fetched and pinned by `MODULE.bazel`: cppcheck 2.22.0 (built from its
 sha256-pinned release source with the hermetic C++ toolchain), buildifier
@@ -25,18 +26,23 @@ configuration dotfiles (`.shellcheckrc`, `.markdownlint.json`, `.yamllint`,
 [verify]
 build = "bazel build //..."
 test = "bazel test //..."
-lint = "bazel run //tools/lint:lint"
+lint = "bazel build --config=lint-c //... && bazel run //tools/lint:lint"
 ```
 
 Run the individual linters while iterating:
 
 ```bash
-bazel run //tools/lint:lint-c          # cppcheck over C sources and headers
+bazel build --config=lint-c //...     # cppcheck per-target aspect over C sources
 bazel run //tools/lint:lint-starlark   # buildifier over BUILD/MODULE/*.bzl
 bazel run //tools/lint:lint-shell      # shellcheck over shell scripts
 bazel run //tools/lint:lint-yaml       # yaml_check over *.yaml/*.yml
 bazel run //tools/lint:lint-markdown   # markdown_check over *.md
 ```
+
+C sources are checked by a per-target aspect (`tools/lint/cppcheck_aspect.bzl`)
+applied with `--config=lint-c`, so each C/C++ target gets its own parallel,
+independently cached cppcheck action. The remaining linters use the workspace
+glob driver.
 
 The block above is the authoritative command list; do not duplicate or reword it
 elsewhere in this file.
