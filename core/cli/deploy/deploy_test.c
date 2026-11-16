@@ -2616,7 +2616,8 @@ static void test_prune_all_unverifiable_still_exit_ok(void) {
  * per element) to `capture` and prints a synthetic artifact path, so the real
  * shell command construction can be asserted without invoking bazel.
  */
-static int write_capture_bazel(const char *path, const char *capture) {
+static int write_capture_bazel_output(const char *path, const char *capture,
+                                      const char *output) {
     FILE *script = fopen(path, "w");
     int rc = 0;
 
@@ -2628,9 +2629,9 @@ static int write_capture_bazel(const char *path, const char *capture) {
             "for arg in \"$@\"; do\n"
             "  printf 'ARG:%%s\\n' \"$arg\" >> '%s'\n"
             "done\n"
-            "printf '/tmp/fake-artifact\\n'\n"
+            "printf '%%s' '%s'\n"
             "exit 0\n",
-            capture);
+            capture, output);
     if (ferror(script)) {
         rc = -1;
     }
@@ -2641,6 +2642,10 @@ static int write_capture_bazel(const char *path, const char *capture) {
         rc = -1;
     }
     return rc;
+}
+
+static int write_capture_bazel(const char *path, const char *capture) {
+    return write_capture_bazel_output(path, capture, "/tmp/fake-artifact\n");
 }
 
 static void test_prod_freshness_builds_valid_bazel_commands(void) {
@@ -2731,6 +2736,94 @@ static void test_prod_publish_cquery_uses_set_expr(void) {
 
     (void)unlink(capture_path);
     (void)unlink(bazel_path);
+    (void)rmdir(repo_root);
+    (void)rmdir(dir);
+}
+
+/*
+ * cquery prints workspace-relative paths, but under `bazel run` the binary's
+ * cwd is the runfiles tree, not the workspace. The publish path must anchor
+ * every relative path at the repo root; absolute paths stay verbatim.
+ */
+static void test_prod_cquery_resolves_paths_against_repo_root(void) {
+    char template[] = "/tmp/stackctl-cquery-resolve-XXXXXX";
+    char *dir = mkdtemp(template);
+    char bazel_path[PATH_MAX];
+    char capture_path[PATH_MAX];
+    char repo_root[PATH_MAX];
+    char relative[PATH_MAX];
+    char rel_dir[PATH_MAX];
+    char rel_artifact[PATH_MAX];
+    char abs_artifact[PATH_MAX];
+    char output[PATH_MAX * 2];
+    char expected[PATH_MAX * 2];
+    char *paths = NULL;
+    char sha[65] = {0};
+    publish_transport t = {0};
+    s3_client *client = NULL;
+    FILE *err = NULL;
+    int rc;
+
+    CHECK(dir != NULL, "cquery resolve fixture dir");
+    if (dir == NULL) {
+        return;
+    }
+    snprintf(bazel_path, sizeof(bazel_path), "%s/bazel", dir);
+    snprintf(capture_path, sizeof(capture_path), "%s/capture.txt", dir);
+    snprintf(repo_root, sizeof(repo_root), "%s/repo", dir);
+    CHECK(mkdir(repo_root, 0700) == 0, "cquery resolve repo root created");
+
+    /* The relative artifact exists only beneath the temp repo root. */
+    snprintf(relative, sizeof(relative),
+             "bazel-out/aarch64-fastbuild/bin/artifact-%ld.tar", (long)getpid());
+    snprintf(rel_dir, sizeof(rel_dir), "%s/bazel-out/aarch64-fastbuild/bin",
+             repo_root);
+    mkdir_p(rel_dir);
+    snprintf(rel_artifact, sizeof(rel_artifact), "%s/%s", repo_root, relative);
+    write_text(rel_artifact, "relative payload");
+    snprintf(abs_artifact, sizeof(abs_artifact), "%s/absolute-%ld.tar", dir,
+             (long)getpid());
+    write_text(abs_artifact, "absolute payload");
+
+    snprintf(output, sizeof(output), "%s\n%s\n", relative, abs_artifact);
+    CHECK(write_capture_bazel_output(bazel_path, capture_path, output) == 0,
+          "cquery resolve fake bazel script writes");
+
+    rc = deploy_prod_cquery_files_for_test(repo_root, bazel_path, "//:tar",
+                                           &paths);
+    CHECK(rc == 0, "cquery enumeration succeeds");
+    snprintf(expected, sizeof(expected), "%s/%s\n%s\n", repo_root, relative,
+             abs_artifact);
+    CHECK(paths != NULL && strcmp(paths, expected) == 0,
+          "relative cquery paths resolve against the repo root and absolute "
+          "paths pass through");
+
+    err = tmpfile();
+    CHECK(err != NULL, "cquery resolve stderr capture opens");
+    CHECK(s3_client_init_with_transport(&client, "us-east-1",
+                                        publish_transport_send, &t) == 0,
+          "cquery resolve fake S3 client initializes");
+    if (paths != NULL && err != NULL && client != NULL) {
+        rc = deploy_prod_publish_paths_for_test(client, "bkt", "v1.2.3", paths,
+                                                err, sha, sizeof(sha));
+        CHECK(rc == 0,
+              "publish reads an artifact that exists only relative to repo "
+              "root");
+        CHECK(t.puts == 5,
+              "publish uploads sidecar, object, and manifest for both "
+              "artifacts");
+    }
+    s3_client_free(client);
+    if (err != NULL) {
+        fclose(err);
+    }
+
+    free(paths);
+    (void)unlink(capture_path);
+    (void)unlink(bazel_path);
+    (void)unlink(rel_artifact);
+    (void)unlink(abs_artifact);
+    (void)rmdir(rel_dir);
     (void)rmdir(repo_root);
     (void)rmdir(dir);
 }
@@ -2922,6 +3015,7 @@ int main(void) {
     test_prod_aws_init_installs_abort_hook();
     test_prod_freshness_builds_valid_bazel_commands();
     test_prod_publish_cquery_uses_set_expr();
+    test_prod_cquery_resolves_paths_against_repo_root();
     test_targets_csv_to_list();
     test_cquery_expr();
     test_null_env();

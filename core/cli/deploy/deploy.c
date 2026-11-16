@@ -1375,6 +1375,56 @@ int deploy_prod_publish_paths_for_test(s3_client *client, const char *bucket,
     return publish_paths(client, bucket, tag, paths, err, sha_out, cap);
 }
 
+/*
+ * cquery --output=files prints workspace-relative paths. Publish, however,
+ * runs with the runfiles directory as its cwd under `bazel run`, so a relative
+ * path would be opened against the wrong tree. Anchor every relative path at
+ * the repo root; absolute paths pass through verbatim. Returns a new
+ * newline-separated string (caller frees), or NULL when out of memory.
+ */
+static char *resolve_artifact_paths(const char *repo_root, const char *paths) {
+    buffer resolved = {0};
+    const char *cursor;
+    size_t root_len;
+
+    if (paths == NULL) {
+        return NULL;
+    }
+    if (repo_root == NULL || repo_root[0] == '\0') {
+        return strdup(paths);
+    }
+    root_len = strlen(repo_root);
+    cursor = paths;
+    while (cursor != NULL && *cursor != '\0') {
+        const char *newline = strchr(cursor, '\n');
+        size_t len = newline != NULL ? (size_t)(newline - cursor)
+                                     : strlen(cursor);
+        int rc = 0;
+
+        if (len > 0 && cursor[0] != '/') {
+            rc = buffer_append(&resolved, repo_root, root_len);
+            if (rc == 0 && repo_root[root_len - 1] != '/') {
+                rc = buffer_append(&resolved, "/", 1);
+            }
+        }
+        if (rc == 0 && len > 0) {
+            rc = buffer_append(&resolved, cursor, len);
+        }
+        if (rc == 0 && newline != NULL) {
+            rc = buffer_append(&resolved, "\n", 1);
+        }
+        if (rc != 0) {
+            free(resolved.data);
+            return NULL;
+        }
+        cursor = newline != NULL ? newline + 1 : NULL;
+    }
+    if (resolved.data == NULL) {
+        return strdup("");
+    }
+    return resolved.data;
+}
+
 static int prod_cquery_files(const struct prod_context *ctx,
                              const char *repo_root, const char *targets,
                              char **paths) {
@@ -1383,6 +1433,7 @@ static int prod_cquery_files(const struct prod_context *ctx,
     char expr[PATH_MAX];
     const char *bazel = ctx != NULL && ctx->bazel != NULL ? ctx->bazel
                                                            : "bazel";
+    char *raw = NULL;
     int rc;
 
     if (deploy_shell_quote(repo_root, quoted_root, sizeof(quoted_root)) != 0 ||
@@ -1395,7 +1446,13 @@ static int prod_cquery_files(const struct prod_context *ctx,
     if (rc < 0 || (size_t)rc >= sizeof(command)) {
         return EIO;
     }
-    return run_capture(command, paths);
+    rc = run_capture(command, &raw);
+    if (rc != 0) {
+        return rc;
+    }
+    *paths = resolve_artifact_paths(repo_root, raw);
+    free(raw);
+    return *paths != NULL ? 0 : ENOMEM;
 }
 
 int deploy_prod_cquery_files_for_test(const char *repo_root, const char *bazel,
