@@ -1150,6 +1150,15 @@ static int cert_policy_is_conditional(const node *role) {
     return 0;
 }
 
+#define OPERATOR_MAX_POLICIES 8
+
+typedef struct {
+    const node *items[OPERATOR_MAX_POLICIES];
+    size_t count;
+} operator_policies;
+
+static operator_policies collect_operator_policies(const node *root);
+
 /*
  * The operator policy may grant bucket-lifecycle actions on the cert bucket
  * because CloudFormation's S3 handlers create and configure it under the
@@ -1217,11 +1226,16 @@ static void check_operator_role_resources(checker *c, const node *root) {
         }
     }
 
-    const node *policy = map_get(resources, "OperatorPolicy");
-    if (policy == NULL) {
+    if (map_get(resources, "OperatorPolicy") == NULL) {
         violation(c, "missing OperatorPolicy resource");
-    } else if (grants_cert_object_access(policy)) {
-        violation(c, "OperatorPolicy must never grant object access to the cert bucket");
+        return;
+    }
+    const operator_policies operator = collect_operator_policies(root);
+    for (size_t i = 0; i < operator.count; i++) {
+        if (grants_cert_object_access(operator.items[i])) {
+            violation(c, "operator policies must never grant object access to the cert bucket");
+            return;
+        }
     }
 }
 
@@ -1289,15 +1303,14 @@ static int operator_policy_attached(const node *root, const char *user_id, const
 }
 
 /*
- * Spec §3: the operator stack always creates the human/operator IAM user
- * `<project>` (provision mints its key) and that user must carry the operator
- * managed policy.  The CI user is conditional; the operator user is not.
+ * The operator identity is the unconditional, project-named IAM user that
+ * carries OperatorPolicy.  Locating it once keeps the user requirement and the
+ * policy-union scans reading from the same definition.
  */
-static void check_operator_user(checker *c, const node *root) {
+static const node *find_operator_user(const node *root) {
     const node *resources = template_resources(root);
     if (resources == NULL || resources->kind != NODE_MAP) {
-        violation(c, "operator stack must create an operator IAM user");
-        return;
+        return NULL;
     }
     for (size_t i = 0; i < resources->npairs; i++) {
         const node *user = resources->pairs[i].value;
@@ -1314,6 +1327,61 @@ static void check_operator_user(checker *c, const node *root) {
         if (!operator_policy_attached(root, resources->pairs[i].key, user)) {
             continue;
         }
+        return user;
+    }
+    return NULL;
+}
+
+/*
+ * The operator permissions are split across several managed policies to stay
+ * under the 6144-character AWS managed-policy quota.  Grant checks must reason
+ * about the union attached to OperatorUser, not one policy resource, or a
+ * statement moved to a sibling policy would silently escape validation.
+ */
+static operator_policies collect_operator_policies(const node *root) {
+    operator_policies set = {0};
+    const node *resources = template_resources(root);
+    const node *user = find_operator_user(root);
+    if (resources == NULL || resources->kind != NODE_MAP || user == NULL) {
+        return set;
+    }
+    const node *arns = map_get(map_get(user, "Properties"), "ManagedPolicyArns");
+    if (arns == NULL) {
+        return set;
+    }
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const node *candidate = resources->pairs[i].value;
+        if (!resource_is_type(candidate, "AWS::IAM::ManagedPolicy")) {
+            continue;
+        }
+        if (!node_references(arns, resources->pairs[i].key)) {
+            continue;
+        }
+        if (set.count < OPERATOR_MAX_POLICIES) {
+            set.items[set.count++] = candidate;
+        }
+    }
+    return set;
+}
+
+static const node *operator_policies_find_statement(const operator_policies *set,
+                                                    const char *action) {
+    for (size_t i = 0; i < set->count; i++) {
+        const node *found = find_statement(set->items[i], action);
+        if (found != NULL) {
+            return found;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Spec §3: the operator stack always creates the human/operator IAM user
+ * `<project>` (provision mints its key) and that user must carry the operator
+ * managed policy.  The CI user is conditional; the operator user is not.
+ */
+static void check_operator_user(checker *c, const node *root) {
+    if (find_operator_user(root) != NULL) {
         return;
     }
     violation(c, "operator stack must create an unconditional ProjectName-named IAM user "
@@ -1397,14 +1465,14 @@ static void check_operator_image_builder_permissions(checker *c, const node *roo
     if (map_get(template_parameters(root), "EnableImageBuilder") == NULL) {
         return;
     }
-    const node *policy = map_get(template_resources(root), "OperatorPolicy");
-    if (policy == NULL) {
-        /* Missing OperatorPolicy is reported by check_operator_role_resources. */
+    const operator_policies operator = collect_operator_policies(root);
+    if (operator.count == 0) {
+        /* Missing operator user/policy is reported elsewhere. */
         return;
     }
-    if (find_statement(policy, "imagebuilder:CreateComponent") == NULL ||
-        find_statement(policy, "imagebuilder:CreateImagePipeline") == NULL) {
-        violation(c, "OperatorPolicy must grant imagebuilder:CreateComponent and "
+    if (operator_policies_find_statement(&operator, "imagebuilder:CreateComponent") == NULL ||
+        operator_policies_find_statement(&operator, "imagebuilder:CreateImagePipeline") == NULL) {
+        violation(c, "operator policies must grant imagebuilder:CreateComponent and "
                      "imagebuilder:CreateImagePipeline when EnableImageBuilder is declared");
     }
 }
@@ -1425,16 +1493,18 @@ static int statement_grants_on_artifacts(const node *statement, const char *acti
 }
 
 static void check_operator_bucket_lifecycle(checker *c, const node *root) {
-    const node *policy = map_get(template_resources(root), "OperatorPolicy");
-    if (policy == NULL) {
-        /* Missing OperatorPolicy is reported by check_operator_role_resources. */
+    const operator_policies operator = collect_operator_policies(root);
+    if (operator.count == 0) {
+        /* Missing operator user/policy is reported elsewhere. */
         return;
     }
-    if (!statement_grants_on_artifacts(find_statement(policy, "s3:CreateBucket"),
-                                       "s3:CreateBucket") ||
-        !statement_grants_on_artifacts(find_statement(policy, "s3:DeleteBucket"),
-                                       "s3:DeleteBucket")) {
-        violation(c, "OperatorPolicy must grant s3:CreateBucket and s3:DeleteBucket "
+    if (!statement_grants_on_artifacts(
+            operator_policies_find_statement(&operator, "s3:CreateBucket"),
+            "s3:CreateBucket") ||
+        !statement_grants_on_artifacts(
+            operator_policies_find_statement(&operator, "s3:DeleteBucket"),
+            "s3:DeleteBucket")) {
+        violation(c, "operator policies must grant s3:CreateBucket and s3:DeleteBucket "
                      "on the ${ProjectName}-artifacts- bucket pattern");
     }
 }
@@ -1506,7 +1576,13 @@ static void check_operator(checker *c, const node *root) {
     check_imagebuilder_execution_role(c, root);
     check_operator_image_builder_permissions(c, root);
     check_operator_bucket_lifecycle(c, root);
-    check_operator_s3_scope(c, map_get(resources, "OperatorPolicy"));
+    /* check_iam_node above already walks every resource node, so the generic
+     * wildcard/action scan covers the managed-policy union attached to the
+     * user. These scope checks reason about the same union explicitly. */
+    const operator_policies operator = collect_operator_policies(root);
+    for (size_t i = 0; i < operator.count; i++) {
+        check_operator_s3_scope(c, operator.items[i]);
+    }
 }
 
 /* ---------------------------------------------------------------- infra */
