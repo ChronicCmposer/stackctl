@@ -86,6 +86,7 @@ static int record_exists = 1;
 static int ssm_missing;
 static int run_fail;
 static int wait_timeout;
+static int wait_busy_polls;
 static int ddns_fail;
 static int pin_fail;
 static char g_console_override[1024];
@@ -319,8 +320,13 @@ static int fake_wait_running(ec2_client *client, const char *instance_id,
     (void)attempts;
     (void)interval;
     log_call("wait_running");
-    *timed_out = wait_timeout;
     memset(out, 0, sizeof *out);
+    if (wait_busy_polls > 0) {
+        wait_busy_polls--;
+        *timed_out = 1;
+        return 0;
+    }
+    *timed_out = wait_timeout;
     snprintf(out->instance_id, sizeof out->instance_id, "%s", "i-new");
     snprintf(out->state, sizeof out->state, "%s", "running");
     snprintf(out->public_ip, sizeof out->public_ip, "%s", "198.51.100.50");
@@ -590,6 +596,7 @@ static void reset_all(void) {
     ssm_missing = 0;
     run_fail = 0;
     wait_timeout = 0;
+    wait_busy_polls = 0;
     ddns_fail = 0;
     pin_fail = 0;
     ssh_transport_fail = 0;
@@ -1798,6 +1805,59 @@ static void test_reconnect_reader_removes_staging_after_rc(void) {
     free_runtime(&rt);
 }
 
+static void test_launch_progress_lines(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "progress run exits 0");
+    CHECK(stream_contains(rt.err, "verifying project identity"),
+          "identity guard is announced");
+    CHECK(stream_contains(rt.err, "requesting a"),
+          "RunInstances request is announced");
+    CHECK(stream_contains(rt.err, "requested instance i-new"),
+          "the new instance id is announced");
+    CHECK(stream_contains(rt.err, "to be running"),
+          "the running waiter is announced");
+    CHECK(stream_contains(rt.err, "pinning the host key"),
+          "the host-key pin is announced");
+    CHECK(stream_contains(rt.err, "running setup entrypoint over SSH"),
+          "the setup entrypoint start is announced with expectations");
+    CHECK(stream_contains(rt.err, "10-30 minutes"),
+          "the setup announcement warns it can take many minutes");
+    CHECK(stream_contains(rt.err, "writing the launch record") ||
+              stream_contains(rt.err, "finalising the launch record"),
+          "the launch-record write is announced");
+    free_runtime(&rt);
+}
+
+static void test_running_waiter_reports_elapsed_progress(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+    rt.wait_attempts = 4;
+    wait_busy_polls = 2;
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "a waiter that becomes ready exits 0");
+    CHECK(stream_contains(rt.err, "waiting for instance running"),
+          "elapsed-time progress is emitted while the instance boots");
+    free_runtime(&rt);
+}
+
 int main(void) {
     test_missing_stack_is_exit1();
     test_empty_operator_cidr_is_exit1();
@@ -1843,6 +1903,8 @@ int main(void) {
     test_ami_preflight_checks_every_declared_arch();
     test_ami_preflight_names_arch_missing_from_region();
     test_reconnect_reader_removes_staging_after_rc();
+    test_launch_progress_lines();
+    test_running_waiter_reports_elapsed_progress();
 
     if (failures != 0) {
         fprintf(stderr, "%d failure(s)\n", failures);

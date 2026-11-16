@@ -69,6 +69,19 @@ int cli_dispatch_normalize_rc(int rc);
  */
 int cli_dispatch_verb_exit(int verb_rc);
 
+/*
+ * Put stdout and stderr into unbuffered mode. stackctl is a statically linked
+ * musl binary, so libc fully buffers redirected/piped streams and a long verb
+ * looks hung until it exits. `cli_dispatch_run` calls this before any verb
+ * runs; it is exposed so the colocated test can assert the observable
+ * behaviour (a write reaches a pipe without an explicit flush).
+ *
+ * Returns 0 when both streams were switched, or EIO when either setvbuf()
+ * call failed. Failure is non-fatal for the CLI: output still works, it is
+ * merely buffered when the destination is not a terminal.
+ */
+int cli_dispatch_unbuffer_stdio(void);
+
 /* Render top-level help (usage, command list, global flags) to `out`. */
 void cli_dispatch_print_help(FILE *out, const char *program);
 

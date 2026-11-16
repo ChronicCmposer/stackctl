@@ -19,6 +19,21 @@ typedef struct terminate_options {
     const char *instance_id; /* --instance-id, or NULL for the full sweep */
 } terminate_options;
 
+/*
+ * Wall-clock budget for the termination waiter. A live g4dn took well over
+ * 150 s to reach `terminated`, so the old 300 s (60 polls x 5 s) budget expired
+ * while the instance was still shutting down. 600 s leaves headroom without
+ * making a genuinely stuck teardown hang forever.
+ */
+#define TERMINATE_WAIT_BUDGET_SEC 600
+
+/*
+ * Number of single-attempt waiter polls needed to cover the budget at
+ * `interval_sec`. A non-positive interval (the test seam) means one second per
+ * attempt. Always at least 1.
+ */
+int terminate_wait_attempts(int interval_sec);
+
 /* Frozen option table (exposed for argv tests). */
 extern const cli_option_spec terminate_option_specs[];
 extern const size_t terminate_option_count;

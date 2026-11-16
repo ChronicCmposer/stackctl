@@ -79,6 +79,25 @@ typedef int (*sshc_abort_fn)(void *user);
 void sshc_set_abort_hook(sshc_abort_fn fn, void *user);
 
 /*
+ * Optional progress hook, invoked from the same thread as the child wait loop
+ * while a child is still running (never from a signal handler). `elapsed_sec`
+ * is whole seconds since the child started. This is how long, silent remote
+ * work (the setup entrypoint importing container images) stays observable
+ * without a second thread.
+ *
+ *   fn            NULL disables reporting.
+ *   user          passed through unchanged.
+ *   interval_sec  report cadence: > 0 = first report after that many seconds,
+ *                 then no more often than that; <= 0 = report on every poll
+ *                 (test seam; a run then produces several reports).
+ *
+ * Module-level state is deliberate, mirroring the abort hook: one session runs
+ * at a time per verb. Install before sshc_exec() and clear it afterwards.
+ */
+typedef void (*sshc_progress_fn)(void *user, int elapsed_sec);
+void sshc_set_progress_hook(sshc_progress_fn fn, void *user, int interval_sec);
+
+/*
  * Execute argv, capturing stdout for sentinel parsing.
  *
  *   argv        NULL-terminated command (e.g. from sshc_build_argv).

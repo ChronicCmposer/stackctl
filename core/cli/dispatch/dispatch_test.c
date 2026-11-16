@@ -11,6 +11,8 @@
 #include "dispatch.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -550,7 +552,51 @@ static void test_run_version(void) {
     (void)unsetenv(CLI_DISPATCH_VERSION_ENV);
 }
 
+static void test_unbuffer_stdio_flushes_immediately(void) {
+    int fds[2];
+    int saved;
+    int flags;
+    int rc;
+
+    CHECK(pipe(fds) == 0);
+    if (failures != 0) {
+        return;
+    }
+    fflush(stdout);
+    saved = dup(STDOUT_FILENO);
+    CHECK(saved >= 0);
+    CHECK(dup2(fds[1], STDOUT_FILENO) == STDOUT_FILENO);
+    close(fds[1]);
+
+    flags = fcntl(fds[0], F_GETFL, 0);
+    CHECK(flags >= 0);
+    if (flags >= 0) {
+        CHECK(fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) == 0);
+    }
+
+    rc = cli_dispatch_unbuffer_stdio();
+    CHECK(rc == 0);
+    fputs("x", stdout); /* deliberately no fflush() */
+
+    {
+        struct pollfd pfd = {.fd = fds[0], .events = POLLIN, .revents = 0};
+        char buffer[8];
+        ssize_t got = -1;
+
+        if (poll(&pfd, 1, 500) > 0) {
+            got = read(fds[0], buffer, sizeof buffer);
+        }
+        CHECK(got == 1 && buffer[0] == 'x');
+        CHECK(pfd.revents & POLLIN);
+    }
+
+    CHECK(dup2(saved, STDOUT_FILENO) == STDOUT_FILENO);
+    close(saved);
+    close(fds[0]);
+}
+
 int main(void) {
+    test_unbuffer_stdio_flushes_immediately();
     test_table();
     test_find();
     test_normalize_rc();

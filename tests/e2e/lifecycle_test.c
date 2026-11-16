@@ -1050,7 +1050,10 @@ static void scenario_terminate(fixture *fx) {
     CHECK(strcmp(W.dns_ip, "0.0.0.0") != 0,
           "targeted terminate leaves an unrelated DNS record");
 
-    /* A waiter timeout is exit 5 and skips the park. */
+    /*
+     * A waiter timeout is exit 5, but the instance is still going away
+     * server-side: the DDNS record is parked and host keys forgotten anyway.
+     */
     W.instance_count = 0;
     world_add("i-slow", "running", "203.0.113.50", "n5");
     opts.instance_id = NULL;
@@ -1058,8 +1061,9 @@ static void scenario_terminate(fixture *fx) {
     W.terminate_wait_timed_out = 1;
     CHECK(terminate_execute(&rt, &opts) == CLI_EXIT_CLEANUP,
           "termination waiter timeout is exit 5");
-    CHECK(strcmp(W.dns_ip, "203.0.113.50") == 0,
-          "park skipped after waiter timeout");
+    CHECK(strcmp(W.dns_ip, "0.0.0.0") == 0,
+          "park still runs after waiter timeout");
+    W.terminate_wait_timed_out = 0;
 
     fclose(rt.out);
     fclose(rt.err);

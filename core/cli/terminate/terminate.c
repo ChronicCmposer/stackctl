@@ -5,8 +5,11 @@
  * --instance-id that must carry the Project tag), waits for `terminated`,
  * parks the DDNS A record at 0.0.0.0 (unconditionally for the sweep, including
  * zero matches), verifies the park against the authoritative NS and forgets the
- * known-hosts bindings. A waiter timeout or park failure is exit 5 and skips the
- * DDNS park, leaving the verb idempotent for a re-run.
+ * known-hosts bindings. The instance terminates server-side regardless of the
+ * waiter, so a waiter error/timeout still parks DNS and forgets host keys
+ * (best-effort) before exiting 5: leaving the record pointed at a dying
+ * instance and the host-key store stale is worse than a late cleanup. A park
+ * failure on the normal path is exit 5.
  */
 
 #include "terminate_internal.h"
@@ -14,6 +17,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 const cli_option_spec terminate_option_specs[] = {
     {"instance-id", 0, 1, 0, "<id>",
@@ -22,6 +26,74 @@ const cli_option_spec terminate_option_specs[] = {
 
 const size_t terminate_option_count =
     sizeof terminate_option_specs / sizeof terminate_option_specs[0];
+
+int terminate_wait_attempts(int interval_sec) {
+    int attempts;
+
+    if (interval_sec <= 0) {
+        /* Test seam: no real sleep, but keep the budget in one-second slots. */
+        return TERMINATE_WAIT_BUDGET_SEC;
+    }
+    attempts = TERMINATE_WAIT_BUDGET_SEC / interval_sec;
+    return attempts > 0 ? attempts : 1;
+}
+
+/* Sleep between bounded polls; a zero/negative interval keeps tests instant. */
+static void sleep_seconds(int seconds) {
+    struct timespec delay;
+
+    if (seconds <= 0) {
+        return;
+    }
+    delay.tv_sec = seconds;
+    delay.tv_nsec = 0;
+    while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+    }
+}
+
+/*
+ * Poll the termination waiter one attempt at a time so each poll can be
+ * announced on stderr. A single-attempt call is exactly one aws_wait poll, so
+ * the effective budget (polls x interval) and abort-check semantics are
+ * unchanged. Returns 0 with *timed_out set, or a propagated waiter error.
+ */
+static int wait_terminated_with_progress(instance_runtime *rt,
+                                         const char *const *ids, size_t count,
+                                         int *timed_out) {
+    int interval = rt->wait_interval > 0 ? rt->wait_interval : 0;
+    int attempts = terminate_wait_attempts(interval);
+    int elapsed = 0;
+
+    *timed_out = 0;
+    instance_err(rt,
+                 "stackctl: waiting for termination of %zu instance(s) "
+                 "(budget %ds)\n",
+                 count, TERMINATE_WAIT_BUDGET_SEC);
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        int step_timed_out = 0;
+        int rc = rt->svc.ec2_wait_terminated(rt->svc.ec2, ids, count, 1, 0,
+                                             &step_timed_out);
+
+        if (rc != 0) {
+            return rc;
+        }
+        if (!step_timed_out) {
+            return 0;
+        }
+        elapsed += interval > 0 ? interval : 1;
+        if (attempt + 1 < attempts) {
+            if (elapsed % 15 == 0) {
+                instance_err(rt,
+                             "stackctl: waiting for termination (%ds elapsed / "
+                             "budget %ds)\n",
+                             elapsed, TERMINATE_WAIT_BUDGET_SEC);
+            }
+            sleep_seconds(interval);
+        }
+    }
+    *timed_out = 1;
+    return 0;
+}
 
 /* Read the DDNS password and park the record at 0.0.0.0, then verify it. */
 static int park_record(instance_runtime *rt) {
@@ -97,6 +169,7 @@ int terminate_execute(instance_runtime *rt, const terminate_options *opts) {
     char target_ip[EC2_IP_MAX] = {0};
     char record_ip[64] = {0};
     bool parked = false;
+    int waiter_failed = 0;
     int rc;
     int exit_code;
 
@@ -117,6 +190,7 @@ int terminate_execute(instance_runtime *rt, const terminate_options *opts) {
         return instance_fail(rt, CLI_EXIT_USAGE, "EC2 services unavailable");
     }
 
+    instance_err(rt, "stackctl: resolving project instances\n");
     {
         const char *const project_values[] = {rt->cfg.project};
         ec2_filter filter = {"tag:Project", project_values, 1};
@@ -174,6 +248,11 @@ int terminate_execute(instance_runtime *rt, const terminate_options *opts) {
         ec2_terminate_result terminated;
         int timed_out = 0;
 
+        instance_err(rt, "stackctl: terminating %zu instance(s):", id_count);
+        for (size_t i = 0; i < id_count; i++) {
+            instance_err(rt, " %s", ids[i]);
+        }
+        instance_err(rt, "\n");
         memset(&terminated, 0, sizeof terminated);
         rc = rt->svc.ec2_terminate_instances(rt->svc.ec2, ids, id_count,
                                              &terminated);
@@ -182,24 +261,29 @@ int terminate_execute(instance_runtime *rt, const terminate_options *opts) {
             return instance_fail(rt, CLI_EXIT_AWS,
                                  "failed to terminate instances");
         }
-        rc = rt->svc.ec2_wait_terminated(rt->svc.ec2, ids, id_count,
-                                         rt->wait_attempts, rt->wait_interval,
-                                         &timed_out);
+        rc = wait_terminated_with_progress(rt, ids, id_count, &timed_out);
         if (rc != 0) {
-            return instance_fail(rt, CLI_EXIT_AWS,
-                                 "failed while waiting for termination");
+            instance_err(rt,
+                         "stackctl: failed while waiting for termination; "
+                         "parking DDNS and forgetting host keys anyway\n");
+            waiter_failed = 1;
+        } else if (timed_out != 0) {
+            instance_err(rt,
+                         "stackctl: timed out waiting for instances to "
+                         "terminate after %ds; parking DDNS and forgetting "
+                         "host keys anyway\n",
+                         TERMINATE_WAIT_BUDGET_SEC);
+            waiter_failed = 1;
         }
-        if (timed_out != 0) {
-            return instance_fail(
-                rt, CLI_EXIT_CLEANUP,
-                "timed out waiting for instances to terminate; DNS park "
-                "skipped (re-run terminate to finish)");
-        }
+    } else {
+        instance_err(rt, "stackctl: no matching instances to terminate\n");
     }
 
     /*
      * --instance-id parks only when the record still points at that instance's
-     * IP; the sweep always parks (including zero matches).
+     * IP; the sweep always parks (including zero matches). After a waiter
+     * failure the instance is still going away server-side, so park and forget
+     * best-effort even though the verb reports exit 5.
      */
     if (opts->instance_id != NULL) {
         int snap = instance_dns_snapshot(rt, record_ip, sizeof record_ip, NULL);
@@ -208,20 +292,34 @@ int terminate_execute(instance_runtime *rt, const terminate_options *opts) {
             strcmp(record_ip, target_ip) == 0) {
             exit_code = park_record(rt);
             if (exit_code != CLI_EXIT_OK) {
-                return exit_code;
+                if (!waiter_failed) {
+                    return exit_code;
+                }
+                instance_warn(rt,
+                              "DDNS park did not complete after a waiter "
+                              "failure");
+            } else {
+                parked = true;
             }
-            parked = true;
         } else if (snap != 0 && snap != ENOENT) {
-            return instance_fail(
-                rt, CLI_EXIT_CLEANUP,
-                "cannot read the DDNS record to decide whether to park");
+            if (!waiter_failed) {
+                return instance_fail(
+                    rt, CLI_EXIT_CLEANUP,
+                    "cannot read the DDNS record to decide whether to park");
+            }
+            instance_warn(rt, "cannot read the DDNS record to park it");
         }
     } else {
         exit_code = park_record(rt);
         if (exit_code != CLI_EXIT_OK) {
-            return exit_code;
+            if (!waiter_failed) {
+                return exit_code;
+            }
+            instance_warn(rt,
+                          "DDNS park did not complete after a waiter failure");
+        } else {
+            parked = instance_ddns_configured(rt);
         }
-        parked = instance_ddns_configured(rt);
     }
 
     forget_bindings(rt, ids, id_count);
@@ -229,8 +327,8 @@ int terminate_execute(instance_runtime *rt, const terminate_options *opts) {
     instance_audit(rt, "terminate", opts->instance_id != NULL
                                         ? opts->instance_id
                                         : "<sweep>",
-                   "success");
-    return CLI_EXIT_OK;
+                   waiter_failed ? "cleanup-incomplete" : "success");
+    return waiter_failed ? CLI_EXIT_CLEANUP : CLI_EXIT_OK;
 }
 
 /* ------------------------------------------------------------------------- */

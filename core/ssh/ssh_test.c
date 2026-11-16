@@ -259,12 +259,52 @@ static void test_abort_hook(void) {
     sshc_set_abort_hook(NULL, NULL);
 }
 
+static int progress_calls;
+static int progress_last_elapsed;
+
+static void count_progress(void *user, int elapsed_sec) {
+    (void)user;
+    progress_calls++;
+    progress_last_elapsed = elapsed_sec;
+}
+
+static void test_progress_hook(void) {
+    int remote_rc = -1;
+    char *slow[] = {"/bin/sh", "-c", "sleep 0.3", NULL};
+    char *quick[] = {"/bin/sh", "-c", "exit 0", NULL};
+
+    /* Interval 0 is the test seam: report on every poll of a running child. */
+    progress_calls = 0;
+    progress_last_elapsed = -1;
+    sshc_set_progress_hook(count_progress, NULL, 0);
+    CHECK(sshc_exec(slow, 10, NULL, &remote_rc) == 0,
+          "progress exec completes");
+    CHECK(progress_calls >= 2, "a long-running child reports progress repeatedly");
+    CHECK(progress_last_elapsed >= 0, "progress carries a non-negative elapsed time");
+
+    /* Cleared hook: a short child produces no further reports. */
+    sshc_set_progress_hook(NULL, NULL, 0);
+    progress_calls = 0;
+    CHECK(sshc_exec(quick, 10, NULL, &remote_rc) == 0,
+          "exec after clearing the progress hook completes");
+    CHECK(progress_calls == 0, "cleared progress hook stays silent");
+
+    /* A positive interval suppresses the immediate report for a fast child. */
+    progress_calls = 0;
+    sshc_set_progress_hook(count_progress, NULL, 30);
+    CHECK(sshc_exec(quick, 10, NULL, &remote_rc) == 0,
+          "interval exec completes");
+    CHECK(progress_calls == 0, "positive interval does not fire before it elapses");
+    sshc_set_progress_hook(NULL, NULL, 0);
+}
+
 int main(void) {
     test_golden_argv();
     test_sentinel();
     test_reconnect();
     test_timeout();
     test_abort_hook();
+    test_progress_hook();
 
     if (failures != 0) {
         fprintf(stderr, "ssh_test: %d failure(s)\n", failures);

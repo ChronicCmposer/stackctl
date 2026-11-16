@@ -129,6 +129,24 @@ int cli_dispatch_verb_exit(int verb_rc) {
     return exit_code;
 }
 
+int cli_dispatch_unbuffer_stdio(void) {
+    int rc = 0;
+
+    /* A static musl binary fully buffers stdout/stderr when they are pipes or
+     * files, hiding all progress until exit. Line/fully buffered streams also
+     * make the periodic launch/terminate progress invisible to an operator
+     * watching a redirected log. _IONBF makes every write hit the fd at once.
+     * setvbuf() must run before any I/O on the stream; cli_dispatch_run calls
+     * this first. A failure is non-fatal (output still works, just buffered). */
+    if (setvbuf(stdout, NULL, _IONBF, 0) != 0) {
+        rc = EIO;
+    }
+    if (setvbuf(stderr, NULL, _IONBF, 0) != 0) {
+        rc = EIO;
+    }
+    return rc;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Help and version                                                          */
 /* ------------------------------------------------------------------------- */
@@ -512,6 +530,10 @@ int cli_dispatch_run(int argc, char **argv) {
     const cli_command *command;
     const char *program;
     int rc;
+
+    /* Must precede any output: a redirected static-musl stream would otherwise
+     * buffer every progress line until the verb exits. */
+    (void)cli_dispatch_unbuffer_stdio();
 
     rc = cli_globals_parse(argc, argv, &globals);
     if (rc != 0) {

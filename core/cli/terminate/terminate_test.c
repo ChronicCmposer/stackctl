@@ -126,6 +126,7 @@ static int fake_terminate(ec2_client *client, const char *const *ids,
 
 static int wait_fail;
 static int wait_timeout;
+static int wait_calls;
 
 static int fake_wait_terminated(ec2_client *client, const char *const *ids,
                                 size_t id_count, int attempts, int interval,
@@ -136,6 +137,7 @@ static int fake_wait_terminated(ec2_client *client, const char *const *ids,
     (void)attempts;
     (void)interval;
     log_call("wait_terminated");
+    wait_calls++;
     if (wait_fail) {
         return EC2_ERR_AWS_API;
     }
@@ -232,6 +234,7 @@ static void reset_all(void) {
     terminated_count = 0;
     wait_fail = 0;
     wait_timeout = 0;
+    wait_calls = 0;
     memset(dns_ip, 0, sizeof dns_ip);
     dns_fail = 0;
     dns_calls = 0;
@@ -294,6 +297,21 @@ static void free_runtime(instance_runtime *rt) {
     if (rt->err != NULL) {
         fclose(rt->err);
     }
+}
+
+static int stream_contains(FILE *stream, const char *needle) {
+    char buffer[8192];
+    size_t got;
+
+    if (stream == NULL) {
+        return 0;
+    }
+    fflush(stream);
+    rewind(stream);
+    got = fread(buffer, 1, sizeof buffer - 1, stream);
+    buffer[got] = '\0';
+    clearerr(stream);
+    return strstr(buffer, needle) != NULL;
 }
 
 /* --- tests --------------------------------------------------------------- */
@@ -424,7 +442,7 @@ static void test_sweep_only_active_states(void) {
     free_runtime(&rt);
 }
 
-static void test_wait_timeout_skips_park(void) {
+static void test_wait_timeout_still_parks_and_forgets(void) {
     instance_runtime rt;
     instance_services svc;
     terminate_options opts = {.instance_id = NULL};
@@ -438,9 +456,46 @@ static void test_wait_timeout_skips_park(void) {
     rc = terminate_execute(&rt, &opts);
 
     CHECK(rc == CLI_EXIT_CLEANUP, "waiter timeout is exit 5");
-    CHECK(ddns_calls == 0, "DNS park skipped on waiter timeout");
-    CHECK(forgot_count == 0, "bindings not forgotten on waiter timeout");
+    CHECK(ddns_calls == 1 && strcmp(ddns_last_ip, "0.0.0.0") == 0,
+          "DNS park still runs on waiter timeout");
+    CHECK(forgot_count == 1 && strcmp(forgot_ids[0], "i-1") == 0,
+          "bindings still forgotten on waiter timeout");
+    CHECK(stream_contains(rt.err, "waiting for termination"),
+          "waiter progress is announced on stderr");
     free_runtime(&rt);
+}
+
+static void test_wait_error_still_parks_and_forgets(void) {
+    instance_runtime rt;
+    instance_services svc;
+    terminate_options opts = {.instance_id = NULL};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc);
+    add_instance("i-1", "running", "198.51.100.1");
+    wait_fail = 1;
+
+    rc = terminate_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_CLEANUP, "waiter API failure is exit 5");
+    CHECK(ddns_calls == 1 && strcmp(ddns_last_ip, "0.0.0.0") == 0,
+          "DNS park still runs when the waiter errors");
+    CHECK(forgot_count == 1, "bindings still forgotten when the waiter errors");
+    CHECK(stream_contains(rt.err, "failed while waiting for termination"),
+          "waiter failure is reported");
+    free_runtime(&rt);
+}
+
+static void test_wait_budget_is_600_seconds(void) {
+    CHECK(TERMINATE_WAIT_BUDGET_SEC == 600,
+          "termination waiter budget is 600 seconds");
+    CHECK(terminate_wait_attempts(5) == 120,
+          "600s at a 5s interval is 120 polls");
+    CHECK(terminate_wait_attempts(0) == 600,
+          "zero interval (test seam) is one second per poll");
+    CHECK(terminate_wait_attempts(700) == 1,
+          "an interval longer than the budget still polls at least once");
 }
 
 static void test_park_failure_is_exit5(void) {
@@ -559,7 +614,9 @@ int main(void) {
     test_single_instance_already_terminated_is_exit1();
     test_sweep_zero_matches_still_parks();
     test_sweep_only_active_states();
-    test_wait_timeout_skips_park();
+    test_wait_timeout_still_parks_and_forgets();
+    test_wait_error_still_parks_and_forgets();
+    test_wait_budget_is_600_seconds();
     test_park_failure_is_exit5();
     test_dns_verify_failure_is_exit5();
     test_single_instance_record_elsewhere_is_not_parked();

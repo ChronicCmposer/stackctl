@@ -119,6 +119,60 @@ static void sleep_seconds(int seconds) {
     }
 }
 
+/*
+ * Poll the running waiter one attempt at a time so the boot wait is observable
+ * on stderr. A single-attempt call is exactly one aws_wait poll: the effective
+ * budget (polls x interval) and abort-check semantics are unchanged. Progress
+ * goes to stderr so `--json` keeps stdout clean.
+ */
+static int wait_running_with_progress(instance_runtime *rt, const char *id,
+                                      ec2_instance *out, int *timed_out) {
+    int attempts = rt->wait_attempts > 0 ? rt->wait_attempts : 1;
+    int interval = rt->wait_interval > 0 ? rt->wait_interval : 0;
+    int budget = interval > 0 ? attempts * interval : attempts;
+
+    *timed_out = 0;
+    instance_err(rt,
+                 "stackctl: waiting for instance %s to be running (budget "
+                 "%ds)\n",
+                 id, budget);
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        int step_timed_out = 0;
+        int rc = rt->svc.ec2_wait_running(rt->svc.ec2, id, 1, 0, out,
+                                          &step_timed_out);
+
+        if (rc != 0) {
+            return rc;
+        }
+        if (!step_timed_out) {
+            return 0;
+        }
+        if (attempt + 1 < attempts) {
+            int elapsed = (attempt + 1) * (interval > 0 ? interval : 1);
+
+            instance_err(rt,
+                         "stackctl: waiting for instance running (%ds elapsed / "
+                         "budget %ds)\n",
+                         elapsed, budget);
+            sleep_seconds(interval);
+        }
+    }
+    *timed_out = 1;
+    return 0;
+}
+
+/*
+ * SSH progress heartbeat: the setup entrypoint can import container images for
+ * many minutes without producing output. sshc_exec calls this from its child
+ * wait loop every ~30 s so the operator can distinguish work from a hang.
+ */
+static void report_setup_progress(void *user, int elapsed_sec) {
+    instance_runtime *rt = user;
+
+    instance_err(rt, "stackctl: setup still running (%ds elapsed)\n",
+                 elapsed_sec);
+}
+
 /* Resolve the effective AMI for `arch` (pinned/ssm/baked, no fallbacks). */
 static int resolve_ami(instance_runtime *rt, const cfn_stack *stack,
                        const char *arch, char *out, size_t cap) {
@@ -903,6 +957,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
      * Local tool preflight: host-key pinning requires ssh-keyscan. Fail before
      * any AWS call or spend rather than midway through the launch.
      */
+    instance_err(rt, "stackctl: preflight: checking local ssh-keyscan\n");
     if (rt->svc.tool_available != NULL &&
         !rt->svc.tool_available("ssh-keyscan")) {
         return instance_fail(
@@ -912,12 +967,14 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
     }
 
     /* Identity guard: never spend or mutate as the wrong project identity. */
+    instance_err(rt, "stackctl: verifying project identity\n");
     rc = instance_identity_guard(rt);
     if (rc != CLI_EXIT_OK) {
         return rc;
     }
 
     /* Infra stack outputs (missing stack = hard error, run deploy first). */
+    instance_err(rt, "stackctl: reading infra stack outputs\n");
     {
         char stack_name[INST_PROJECT_MAX + 16];
 
@@ -962,6 +1019,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
         return instance_fail(rt, CLI_EXIT_USAGE, "%s",
                              why != NULL ? why : "invalid --arch");
     }
+    instance_err(rt, "stackctl: resolving the %s AMI\n", arch);
     {
         const char *const *arches = launch_arch_list(&rt->cfg);
 
@@ -1021,6 +1079,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
      * Release identity: fetch + verify the manifest against the stack tag and
      * select the member for this arch/variant. This happens before any spend.
      */
+    instance_err(rt, "stackctl: verifying the release manifest\n");
     rc = resolve_release(rt, stack, arch, opts->variant, release_tag,
                          sizeof release_tag, member, sizeof member, release_sha,
                          sizeof release_sha, member_sha, sizeof member_sha,
@@ -1117,6 +1176,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
     }
 
     /* RunInstances. */
+    instance_err(rt, "stackctl: requesting a %s instance (%s)\n",
+                 spot ? "spot" : "on-demand", instance_type);
     {
         ec2_run_spec spec;
 
@@ -1147,10 +1208,12 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
         }
     }
 
+    instance_err(rt, "stackctl: requested instance %s; waiting for it to run\n",
+                 run_result.instance_id);
+
     /* Ready waiter. */
-    rc = rt->svc.ec2_wait_running(rt->svc.ec2, run_result.instance_id,
-                                  rt->wait_attempts, rt->wait_interval, &ready,
-                                  &timed_out);
+    rc = wait_running_with_progress(rt, run_result.instance_id, &ready,
+                                    &timed_out);
     if (rc != 0 || timed_out != 0) {
         int status = rc == 0 ? CLI_EXIT_LAUNCH : CLI_EXIT_AWS;
         int result;
@@ -1168,6 +1231,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
     /* DDNS update + verify. */
     if (instance_ddns_configured(rt)) {
         bool updated = false;
+
+        instance_err(rt, "stackctl: updating DDNS %s -> %s\n", fqdn, new_ip);
 
         if (instance_ddns_set(rt, password, new_ip, &updated) != 0 ||
             !updated ||
@@ -1201,10 +1266,17 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
          * minutes to publish the host-key fingerprint block. A persistent AWS
          * error is exit 2; an empty-but-successful console is the TOFU case.
          */
+        instance_err(rt,
+                     "stackctl: verifying the host key (console fingerprints + "
+                     "ssh-keyscan)\n");
         for (int attempt = 0; attempt < attempts; attempt++) {
             free(console);
             console = NULL;
             print_count = 0;
+            instance_err(rt,
+                         "stackctl: waiting for console host-key fingerprints "
+                         "(attempt %d/%d)\n",
+                         attempt + 1, attempts);
             rc = rt->svc.ec2_get_console_output(
                 rt->svc.ec2, run_result.instance_id, &console);
             if (rc == 0) {
@@ -1230,6 +1302,10 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             for (int attempt = 0; attempt < attempts; attempt++) {
                 free(key_line);
                 key_line = NULL;
+                instance_err(rt,
+                             "stackctl: scanning the host key at %s "
+                             "(attempt %d/%d)\n",
+                             new_ip, attempt + 1, attempts);
                 rc = rt->svc.keyscan(new_ip, rt->cfg.ssh_port, &key_line);
                 if (rc == 0 && key_line != NULL) {
                     break;
@@ -1265,6 +1341,10 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                               "console host-key fingerprints unavailable; "
                               "trusting the first scanned key (TOFU)");
             }
+        }
+        if (failure == 0) {
+            instance_err(rt, "stackctl: pinning the host key for %s\n",
+                         run_result.instance_id);
         }
         if (failure == 0 &&
             rt->svc.kh_pin(known_hosts_path(rt), run_result.instance_id,
@@ -1380,13 +1460,26 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                     .reconnect_argv = reconnect_argv,
                 };
 
+                /*
+                 * The entrypoint imports container images and can legitimately
+                 * run for many minutes. Say so before blocking, then heartbeat
+                 * every ~30 s from the wait loop (and read the reconnect rc if
+                 * the transport drops after the work finished).
+                 */
+                instance_err(
+                    rt,
+                    "stackctl: running setup entrypoint over SSH (imports "
+                    "container images; can take 10-30 minutes)\n");
                 /* Let the first signal abort the setup session (F9). */
                 sshc_set_abort_hook(cli_abort_check, NULL);
+                sshc_set_progress_hook(report_setup_progress, rt, 30);
                 ssh_rc = rt->svc.ssh_exec(
                     argv, opts->setup_timeout > 0 ? opts->setup_timeout
                                                    : LAUNCH_DEFAULT_SETUP_TIMEOUT,
                     &sentinel, &remote_rc);
+                sshc_set_progress_hook(NULL, NULL, 0);
                 sshc_set_abort_hook(NULL, NULL);
+                instance_err(rt, "stackctl: reading the setup result\n");
             }
             sshc_argv_free(argv);
             sshc_argv_free(reconnect_argv);
@@ -1542,6 +1635,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
     }
 
     /* Completed launch record (keyed by the nonce), including replaced ids. */
+    instance_err(rt, "stackctl: writing the launch record\n");
     if (rt->launch_record_append != NULL) {
         state_launch_record record;
         int record_rc;

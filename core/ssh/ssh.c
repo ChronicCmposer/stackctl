@@ -26,10 +26,55 @@
 
 static sshc_abort_fn abort_hook;
 static void *abort_user;
+static sshc_progress_fn progress_hook;
+static void *progress_user;
+static int progress_interval_sec;
 
 void sshc_set_abort_hook(sshc_abort_fn fn, void *user) {
     abort_hook = fn;
     abort_user = user;
+}
+
+void sshc_set_progress_hook(sshc_progress_fn fn, void *user, int interval_sec) {
+    progress_hook = fn;
+    progress_user = user;
+    progress_interval_sec = interval_sec;
+}
+
+/* Whole milliseconds between two CLOCK_MONOTONIC readings. */
+static long elapsed_millis(const struct timespec *start,
+                           const struct timespec *now) {
+    return (now->tv_sec - start->tv_sec) * 1000L +
+           (now->tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+/*
+ * Report progress at most once per interval. A non-positive interval is the
+ * test seam: it reports on every poll. A positive interval waits for the first
+ * tick before reporting so a quick session stays quiet. Runs on the waiting
+ * thread, never in a signal handler.
+ */
+static void maybe_report_progress(const struct timespec *start, long *last_ms) {
+    struct timespec now;
+    long elapsed;
+
+    if (progress_hook == NULL) {
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    elapsed = elapsed_millis(start, &now);
+    if (progress_interval_sec > 0) {
+        long interval_ms = (long)progress_interval_sec * 1000L;
+
+        if (elapsed < interval_ms) {
+            return;
+        }
+        if (*last_ms >= 0 && elapsed - *last_ms < interval_ms) {
+            return;
+        }
+    }
+    *last_ms = elapsed;
+    progress_hook(progress_user, (int)(elapsed / 1000));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -435,6 +480,7 @@ static int run_once(char *const argv[], int timeout_sec, capture *out,
     int pipe_fds[2];
     pid_t child;
     struct timespec start;
+    long last_progress_ms = -1;
     int status = 0;
     int finished = 0;
     int aborted = 0;
@@ -482,6 +528,7 @@ static int run_once(char *const argv[], int timeout_sec, capture *out,
             finished = 1;
             break;
         }
+        maybe_report_progress(&start, &last_progress_ms);
         if (waited < 0 && errno != EINTR) {
             finished = 1;
             break;
