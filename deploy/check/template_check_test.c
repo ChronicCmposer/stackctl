@@ -76,6 +76,8 @@ int main(void) {
                 TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_operator_missing_user_policy.yaml",
                 TC_MODE_OPERATOR);
+    expect_file(1, "deploy/check/testdata/bad_operator_missing_imagebuilder_perms.yaml",
+                TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_operator_baked_ami_trust.yaml",
                 TC_MODE_OPERATOR);
 

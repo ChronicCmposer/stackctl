@@ -60,6 +60,7 @@ cc_test(
         "testdata/bad_infra_literal_cidr.yaml",
         "testdata/bad_operator_action_intrinsic.yaml",
         "testdata/bad_operator_baked_ami_trust.yaml",
+        "testdata/bad_operator_missing_imagebuilder_perms.yaml",
         "testdata/bad_operator_missing_user_policy.yaml",
         "testdata/bad_operator_resource_intrinsic.yaml",
         "testdata/bad_operator_wildcard.yaml",

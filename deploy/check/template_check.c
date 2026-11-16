@@ -1321,6 +1321,31 @@ static void check_baked_ami_publish_role(checker *c, const node *root) {
     }
 }
 
+/*
+ * A template that can create Image Builder resources must let the operator
+ * identity create them too.  This is the gap class that let a first
+ * ENABLE_IMAGE_BUILDER=true deploy reach AccessDenied on
+ * imagebuilder:CreateDistributionConfiguration: the infra stack created the
+ * resources while the operator policy granted zero imagebuilder actions.
+ * Fail closed on the two core create actions so the permissions can never
+ * drift out of the operator policy again.
+ */
+static void check_operator_image_builder_permissions(checker *c, const node *root) {
+    if (map_get(template_parameters(root), "EnableImageBuilder") == NULL) {
+        return;
+    }
+    const node *policy = map_get(template_resources(root), "OperatorPolicy");
+    if (policy == NULL) {
+        /* Missing OperatorPolicy is reported by check_operator_role_resources. */
+        return;
+    }
+    if (find_statement(policy, "imagebuilder:CreateComponent") == NULL ||
+        find_statement(policy, "imagebuilder:CreateImagePipeline") == NULL) {
+        violation(c, "OperatorPolicy must grant imagebuilder:CreateComponent and "
+                     "imagebuilder:CreateImagePipeline when EnableImageBuilder is declared");
+    }
+}
+
 static void check_operator(checker *c, const node *root) {
     check_required_params(c, root, OPERATOR_PARAMS,
                           sizeof(OPERATOR_PARAMS) / sizeof(OPERATOR_PARAMS[0]));
@@ -1386,6 +1411,7 @@ static void check_operator(checker *c, const node *root) {
     check_operator_role_resources(c, root);
     check_operator_user(c, root);
     check_baked_ami_publish_role(c, root);
+    check_operator_image_builder_permissions(c, root);
     check_operator_s3_scope(c, map_get(resources, "OperatorPolicy"));
 }
 
