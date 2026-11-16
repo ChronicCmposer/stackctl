@@ -63,6 +63,7 @@ cc_test(
         "testdata/bad_infra_export.yaml",
         "testdata/bad_infra_literal_cidr.yaml",
         "testdata/bad_operator_action_intrinsic.yaml",
+        "testdata/bad_operator_createaction_prefixed.yaml",
         "testdata/bad_operator_ib_execution_trust.yaml",
         "testdata/bad_operator_missing_bucket_lifecycle.yaml",
         "testdata/bad_operator_missing_bucket_public_access_block.yaml",

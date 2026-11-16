@@ -1763,6 +1763,16 @@ static void check_operator(checker *c, const node *root) {
         const node *condition = map_get(create_tags, "Condition");
         if (condition == NULL || !node_contains(condition, "ec2:CreateAction")) {
             violation(c, "CreateTags is not gated by ec2:CreateAction");
+        } else {
+            /* ec2:CreateAction takes the bare API action name, not the
+             * service-prefixed action. StringEquals is exact-match, so
+             * "ec2:RunInstances" never matches and tag-on-create is denied. */
+            const node *string_equals = map_get(condition, "StringEquals");
+            const node *create_action = map_get(string_equals, "ec2:CreateAction");
+            if (!node_scalar_equals(create_action, "RunInstances")) {
+                violation(c, "CreateTags ec2:CreateAction must be the unprefixed action "
+                             "name RunInstances");
+            }
         }
         if (condition == NULL || !node_contains(condition, "aws:TagKeys")) {
             violation(c, "CreateTags is not gated by aws:TagKeys");

@@ -66,6 +66,8 @@ int main(void) {
     expect_file(1, "deploy/check/testdata/bad_operator_wildcard.yaml", TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_operator_runinstances_createaction.yaml",
                 TC_MODE_OPERATOR);
+    expect_file(1, "deploy/check/testdata/bad_operator_createaction_prefixed.yaml",
+                TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_infra_ami_asymmetry.yaml", TC_MODE_INFRA);
     expect_file(1, "deploy/check/testdata/bad_infra_ami_asymmetry_unref.yaml",
                 TC_MODE_INFRA);
