@@ -2042,8 +2042,11 @@ static int add_release_tags(cfn_tag *tags, size_t *count, const char *tag,
 
 /*
  * Build the planned parameter set. Release identity (ReleaseTag and
- * ReleaseManifestSha256) is optional: the bootstrap CREATE change set omits it
- * so the stack and its artifact bucket can be created before any publish.
+ * ReleaseManifestSha256) is passed explicitly on every change set: the
+ * bootstrap CREATE sends empty values so the stack and its artifact bucket
+ * can be created before any publish. CFN treats an empty Default as "no
+ * default" ("Parameters must have values"), but accepts explicit empty
+ * parameter values, so omitting them is not an option.
  */
 static void build_change_set_params(const deploy_env *env, const char *project,
                                     int with_release, int ami_pinned,
@@ -2053,11 +2056,10 @@ static void build_change_set_params(const deploy_env *env, const char *project,
                                     size_t *param_count) {
     *param_count = 0;
     add_param(params, param_count, "ProjectName", project);
-    if (with_release) {
-        add_param(params, param_count, "ReleaseTag", env->tag);
-        add_param(params, param_count, "ReleaseManifestSha256",
-                  env->manifest_sha);
-    }
+    add_param(params, param_count, "ReleaseTag",
+              with_release ? env->tag : "");
+    add_param(params, param_count, "ReleaseManifestSha256",
+              with_release ? env->manifest_sha : "");
     add_param(params, param_count, "AmiPolicy",
               config_get(env->cfg, "AMI_POLICY"));
     /* Spec §6.2: per-arch AmiId parameters exist only under pinned policy. */

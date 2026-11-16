@@ -1195,14 +1195,21 @@ static void test_first_deploy_bootstraps_then_records(void) {
     CHECK(second_create < second_execute && second_execute < second_wait,
           "record change set executes and waits");
 
-    /* Bootstrap CREATE carries no release identity and no release tags. */
+    /* Bootstrap CREATE passes release identity explicitly EMPTY (CFN rejects
+     * omitted params whose only Default is the empty string) and no tags. */
     CHECK(f.create_tag_count == 0, "bootstrap change set has no release tags");
-    CHECK(!params_contain(f.create_params, f.create_param_count, "ReleaseTag",
-                          NULL, NULL),
-          "bootstrap change set omits ReleaseTag");
-    CHECK(!params_contain(f.create_params, f.create_param_count,
-                          "ReleaseManifestSha256", NULL, NULL),
-          "bootstrap change set omits ReleaseManifestSha256");
+    {
+        const char *v = NULL;
+
+        CHECK(params_contain(f.create_params, f.create_param_count, "ReleaseTag",
+                             &v, f.create_param_values) && v != NULL &&
+                  strcmp(v, "") == 0,
+              "bootstrap change set passes ReleaseTag empty");
+        CHECK(params_contain(f.create_params, f.create_param_count,
+                             "ReleaseManifestSha256", &v, f.create_param_values) &&
+                  v != NULL && strcmp(v, "") == 0,
+              "bootstrap change set passes ReleaseManifestSha256 empty");
+    }
     CHECK(params_contain(f.create_params, f.create_param_count, "AmiIdAmd64",
                          NULL, NULL),
           "bootstrap change set keeps the pinned AmiId");
