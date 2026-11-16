@@ -9,6 +9,7 @@
 #include "deploy_internal.h"
 
 #include "aws_internal.h"
+#include "core/s3/s3_internal.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -119,6 +120,16 @@ typedef struct fake {
     char tag_keys[8][128];
     char tag_values[8][256];
 
+    /* Per-type capture so a bootstrap run can assert both change sets. */
+    size_t create_param_count;
+    char create_params[48][128];
+    char create_param_values[48][256];
+    size_t create_tag_count;
+    size_t update_param_count;
+    char update_params[48][128];
+    char update_param_values[48][256];
+    size_t update_tag_count;
+
     size_t old_param_count;
     char old_param_keys[8][64];
     char old_param_values[8][128];
@@ -140,6 +151,29 @@ static int trace_index(const fake *f, int tag) {
         }
     }
     return -1;
+}
+
+/* Index of the `nth` (1-based) occurrence of `tag`, or -1. */
+static int trace_nth_index(const fake *f, int tag, int nth) {
+    for (int i = 0; i < f->trace_count; i++) {
+        if (f->trace[i] == tag) {
+            if (--nth == 0) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+static int trace_count_tag(const fake *f, int tag) {
+    int count = 0;
+
+    for (int i = 0; i < f->trace_count; i++) {
+        if (f->trace[i] == tag) {
+            count++;
+        }
+    }
+    return count;
 }
 
 static const char *tag_value(const fake *f, const char *key) {
@@ -493,6 +527,28 @@ static int fake_create_cs(void *ud, cfn_client *client, const char *region,
         snprintf(f->tag_values[i], sizeof(f->tag_values[i]), "%s",
                  spec->tags[i].value);
     }
+
+    if (spec->type == CFN_CHANGE_SET_TYPE_CREATE) {
+        f->create_param_count = spec->parameter_count;
+        for (size_t i = 0; i < spec->parameter_count && i < 48; i++) {
+            snprintf(f->create_params[i], sizeof(f->create_params[i]), "%s",
+                     spec->parameters[i].key);
+            snprintf(f->create_param_values[i],
+                     sizeof(f->create_param_values[i]), "%s",
+                     spec->parameters[i].value);
+        }
+        f->create_tag_count = spec->tag_count;
+    } else {
+        f->update_param_count = spec->parameter_count;
+        for (size_t i = 0; i < spec->parameter_count && i < 48; i++) {
+            snprintf(f->update_params[i], sizeof(f->update_params[i]), "%s",
+                     spec->parameters[i].key);
+            snprintf(f->update_param_values[i],
+                     sizeof(f->update_param_values[i]), "%s",
+                     spec->parameters[i].value);
+        }
+        f->update_tag_count = spec->tag_count;
+    }
     snprintf(out->change_set_id, sizeof(out->change_set_id), "cs-1");
     return f->create_rc;
 }
@@ -619,6 +675,39 @@ static deploy_ops fake_ops = {
     .wait_stack = fake_wait_stack,
     .delete_stack = fake_delete_stack,
 };
+
+/* Fake S3 transport for the production publish diagnostics test. */
+typedef struct publish_transport {
+    const char *fail_key; /* PUT path containing this key fails with 403 */
+    int puts;
+} publish_transport;
+
+static int publish_transport_send(void *ud, const aws_req *req,
+                                  aws_resp *resp) {
+    publish_transport *t = ud;
+
+    resp->status = 200;
+    if (strcmp(req->method, "GET") == 0) {
+        const char *body = "<ListBucketResult></ListBucketResult>";
+
+        resp->body = strdup(body);
+        resp->body_len = strlen(body);
+        return 0;
+    }
+    if (strcmp(req->method, "PUT") == 0) {
+        t->puts++;
+        if (t->fail_key != NULL && strstr(req->path, t->fail_key) != NULL) {
+            const char *body =
+                "<Error><Code>AccessDenied</Code>"
+                "<Message>Access Denied</Message></Error>";
+
+            resp->status = 403;
+            resp->body = strdup(body);
+            resp->body_len = strlen(body);
+        }
+    }
+    return 0;
+}
 
 /* Variant that exercises template loading; the base fake keeps the seam NULL
  * so the existing pipeline tests do not need a filesystem template. */
@@ -1049,47 +1138,88 @@ static void test_stack_state_recovery_guidance(void) {
     }
 }
 
-static void test_new_release_publishes_then_updates_in_order(void) {
+static int params_contain(const char keys[48][128], size_t count,
+                          const char *key, const char **value,
+                          const char values[48][256]) {
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(keys[i], key) == 0) {
+            if (value != NULL && values != NULL) {
+                *value = values[i];
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void test_first_deploy_bootstraps_then_records(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
     deploy_env env;
-    int ami_param = 0;
+    const char *release_tag_value = NULL;
+    const char *sha_value = NULL;
+    int first_create;
+    int first_execute;
+    int first_wait;
+    int second_create;
+    int second_execute;
+    int second_wait;
 
     fixture_init(&fx);
     cfg = load_config(&fx);
     f.stack_present = 0;
     f.change_count = 4;
     env = make_env(&f, cfg, &fx);
-    CHECK(deploy_run(&env) == CLI_EXIT_OK, "new release deploy succeeds");
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "first deploy succeeds");
     CHECK(strcmp(env.tag, "v1.2.3") == 0, "HEAD tag resolved");
     CHECK(f.published_count == 1, "published once");
-    CHECK(f.executed == 1, "stack update executed");
-    CHECK(trace_index(&f, TRACE_PROVENANCE) < trace_index(&f, TRACE_FRESHNESS),
-          "provenance before freshness");
-    CHECK(trace_index(&f, TRACE_FRESHNESS) < trace_index(&f, TRACE_AMI_RESOLVE),
-          "freshness before AMI preflight");
-    CHECK(trace_index(&f, TRACE_AMI_EXISTS) < trace_index(&f, TRACE_PUBLISH),
-          "AMI preflight before publish");
-    CHECK(trace_index(&f, TRACE_RELEASE_EXISTS) < trace_index(&f, TRACE_PUBLISH),
-          "immutability check before publish");
-    CHECK(trace_index(&f, TRACE_PUBLISH) < trace_index(&f, TRACE_CREATE_CS),
-          "publish before stack change set");
-    CHECK(f.last_type == CFN_CHANGE_SET_TYPE_CREATE, "CREATE change set");
-    for (size_t i = 0; i < f.last_param_count; i++) {
-        if (strcmp(f.params[i], "AmiIdAmd64") == 0) {
-            ami_param = 1;
-        }
-        if (strcmp(f.params[i], "ReleaseTag") == 0) {
-            CHECK(strcmp(f.param_values[i], "v1.2.3") == 0,
-                  "ReleaseTag parameter");
-        }
-        if (strcmp(f.params[i], "ReleaseManifestSha256") == 0) {
-            CHECK(strcmp(f.param_values[i], f.publish_sha) == 0,
-                  "manifest sha parameter");
-        }
-    }
-    CHECK(ami_param, "pinned AmiId parameter present");
+
+    /* Two change sets: bootstrap CREATE then recording UPDATE. */
+    CHECK(trace_count_tag(&f, TRACE_CREATE_CS) == 2,
+          "bootstrap and record change sets are created");
+    first_create = trace_nth_index(&f, TRACE_CREATE_CS, 1);
+    first_execute = trace_nth_index(&f, TRACE_EXECUTE, 1);
+    first_wait = trace_nth_index(&f, TRACE_WAIT_STACK, 1);
+    second_create = trace_nth_index(&f, TRACE_CREATE_CS, 2);
+    second_execute = trace_nth_index(&f, TRACE_EXECUTE, 2);
+    second_wait = trace_nth_index(&f, TRACE_WAIT_STACK, 2);
+    CHECK(first_create >= 0 && first_create < first_execute,
+          "bootstrap change set executes");
+    CHECK(first_execute < first_wait,
+          "bootstrap waits for stack create-complete");
+    CHECK(first_wait < trace_index(&f, TRACE_PUBLISH),
+          "publish happens after the artifact bucket exists");
+    CHECK(trace_index(&f, TRACE_PUBLISH) < second_create,
+          "recording change set follows publish");
+    CHECK(second_create < second_execute && second_execute < second_wait,
+          "record change set executes and waits");
+
+    /* Bootstrap CREATE carries no release identity and no release tags. */
+    CHECK(f.create_tag_count == 0, "bootstrap change set has no release tags");
+    CHECK(!params_contain(f.create_params, f.create_param_count, "ReleaseTag",
+                          NULL, NULL),
+          "bootstrap change set omits ReleaseTag");
+    CHECK(!params_contain(f.create_params, f.create_param_count,
+                          "ReleaseManifestSha256", NULL, NULL),
+          "bootstrap change set omits ReleaseManifestSha256");
+    CHECK(params_contain(f.create_params, f.create_param_count, "AmiIdAmd64",
+                         NULL, NULL),
+          "bootstrap change set keeps the pinned AmiId");
+
+    /* Recording UPDATE carries the release identity and tags. */
+    CHECK(f.last_type == CFN_CHANGE_SET_TYPE_UPDATE, "record change set is UPDATE");
+    CHECK(params_contain(f.update_params, f.update_param_count, "ReleaseTag",
+                         &release_tag_value, f.update_param_values) &&
+              release_tag_value != NULL &&
+              strcmp(release_tag_value, "v1.2.3") == 0,
+          "record change set passes ReleaseTag");
+    CHECK(params_contain(f.update_params, f.update_param_count,
+                         "ReleaseManifestSha256", &sha_value,
+                         f.update_param_values) &&
+              sha_value != NULL && strcmp(sha_value, f.publish_sha) == 0,
+          "record change set passes the published manifest sha");
+    CHECK(f.update_tag_count == 2, "record change set tags the release");
     check_release_tags(&f, "v1.2.3", f.publish_sha);
     config_free(cfg);
 }
@@ -1181,7 +1311,11 @@ static void test_publish_failure_is_aws(void) {
     f.publish_rc = EIO;
     env = make_env(&f, cfg, &fx);
     CHECK(deploy_run(&env) == CLI_EXIT_AWS, "publish failure exits 2");
-    CHECK(f.executed == 0, "no stack update after publish failure");
+    /* First deploy creates the stack (and bucket) before publishing, so that
+     * CREATE has executed; the recording change set must not run. */
+    CHECK(f.executed == 1, "bootstrap CREATE executed before publish");
+    CHECK(trace_count_tag(&f, TRACE_CREATE_CS) == 1,
+          "no recording change set after publish failure");
     config_free(cfg);
 }
 
@@ -1593,10 +1727,13 @@ static void test_publish_readback_before_record(void) {
     cfg = load_config(&fx);
     f.rel_exists = 0;
     env = make_env(&f, cfg, &fx);
-    CHECK(deploy_run(&env) == CLI_EXIT_OK, "new release deploy succeeds");
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "first release deploy succeeds");
+    CHECK(trace_nth_index(&f, TRACE_CREATE_CS, 1) <
+              trace_index(&f, TRACE_PUBLISH),
+          "bootstrap stack precedes publish");
     CHECK(trace_index(&f, TRACE_PUBLISH) < trace_index(&f, TRACE_VERIFY),
           "publish read-back after upload");
-    CHECK(trace_index(&f, TRACE_VERIFY) < trace_index(&f, TRACE_CREATE_CS),
+    CHECK(trace_index(&f, TRACE_VERIFY) < trace_nth_index(&f, TRACE_CREATE_CS, 2),
           "read-back before recording on the stack");
     config_free(cfg);
 
@@ -1608,7 +1745,9 @@ static void test_publish_readback_before_record(void) {
     env = make_env(&f, cfg, &fx);
     CHECK(deploy_run(&env) == CLI_EXIT_VERIFY,
           "read-back failure exits 3 before recording");
-    CHECK(trace_index(&f, TRACE_CREATE_CS) < 0, "no stack mutation");
+    CHECK(trace_count_tag(&f, TRACE_CREATE_CS) == 1,
+          "bootstrap ran, but no recording change set after failed read-back");
+    CHECK(f.executed == 1, "only the bootstrap change set executed");
     config_free(cfg);
 }
 
@@ -2661,6 +2800,106 @@ static void test_cquery_expr(void) {
           "over-long expression input reports truncation");
 }
 
+/* Fix 1: every publish failure names the operation/key and the errno class. */
+static void test_publish_failure_is_diagnostic(void) {
+    publish_transport t = {.fail_key = "fail.bin"};
+    s3_client *client = NULL;
+    FILE *err;
+    char dir[] = "/tmp/stackctl-pub-XXXXXX";
+    char ok_path[PATH_MAX];
+    char fail_path[PATH_MAX];
+    char paths[PATH_MAX * 2];
+    char sha[65] = {0};
+    char captured[8192];
+    size_t got;
+    int rc;
+
+    CHECK(mkdtemp(dir) != NULL, "publish test dir created");
+    snprintf(ok_path, sizeof(ok_path), "%s/ok.bin", dir);
+    snprintf(fail_path, sizeof(fail_path), "%s/fail.bin", dir);
+    write_text(ok_path, "ok payload");
+    write_text(fail_path, "fail payload");
+    snprintf(paths, sizeof(paths), "%s\n%s\n", ok_path, fail_path);
+
+    err = tmpfile();
+    CHECK(err != NULL, "publish stderr capture opens");
+    CHECK(s3_client_init_with_transport(&client, "us-east-1",
+                                        publish_transport_send, &t) == 0,
+          "fake S3 client initializes");
+    if (err != NULL && client != NULL) {
+        rc = deploy_prod_publish_paths_for_test(client, "bkt", "v9.9.9", paths,
+                                                err, sha, sizeof(sha));
+        CHECK(rc == EACCES, "failing PUT returns the mapped errno");
+        CHECK(stream_contains(err, "fail.bin"),
+              "publish diagnostic names the failing key");
+        CHECK(stream_contains(err, strerror(EACCES)),
+              "publish diagnostic includes the errno string");
+        CHECK(stream_contains(err, "s3 put"),
+              "publish diagnostic names the S3 operation");
+        rewind(err);
+        got = fread(captured, 1, sizeof(captured) - 1, err);
+        captured[got] = '\0';
+        CHECK(strstr(captured, "releases/v9.9.9/") != NULL,
+              "publish diagnostic includes the release prefix");
+    }
+    s3_client_free(client);
+    if (err != NULL) {
+        fclose(err);
+    }
+    (void)unlink(ok_path);
+    (void)unlink(fail_path);
+    (void)rmdir(dir);
+}
+
+/*
+ * Fix 2 self-heal: the bootstrap CREATE succeeds, publish fails, and the
+ * command exits failure. A re-run now sees the stack and takes the UPDATE
+ * path (publish -> record) to completion.
+ */
+static void test_bootstrap_publish_failure_self_heals(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    f.stack_present = 0;
+    f.rel_exists = 0;
+    f.publish_rc = EIO;
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_AWS,
+          "bootstrap succeeds but publish failure exits 2");
+    CHECK(trace_count_tag(&f, TRACE_CREATE_CS) == 1,
+          "only the bootstrap change set ran before publish");
+    CHECK(f.executed == 1, "the stack was created");
+    config_free(cfg);
+
+    /* The failed run left the stack in place; a re-run takes UPDATE. */
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.rel_exists = 0;
+    f.publish_rc = 0;
+    f.published_count = 0;
+    f.executed = 0;
+    f.trace_count = 0;
+    f.create_param_count = 0;
+    f.update_param_count = 0;
+    f.create_tag_count = 0;
+    f.update_tag_count = 0;
+    cfg = load_config(&fx);
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK, "second run self-heals");
+    CHECK(f.published_count == 1, "second run publishes the release");
+    CHECK(trace_count_tag(&f, TRACE_CREATE_CS) == 1,
+          "a single recording change set");
+    CHECK(trace_index(&f, TRACE_PUBLISH) < trace_index(&f, TRACE_CREATE_CS),
+          "UPDATE path publishes before recording");
+    CHECK(f.last_type == CFN_CHANGE_SET_TYPE_UPDATE, "recording is UPDATE");
+    check_release_tags(&f, "v1.2.3", f.publish_sha);
+    config_free(cfg);
+}
+
 int main(void) {
     test_prod_aws_init_installs_abort_hook();
     test_prod_freshness_builds_valid_bazel_commands();
@@ -2682,7 +2921,9 @@ int main(void) {
     test_ami_preflight_failure_is_usage();
     test_in_progress_stack_is_aws();
     test_stack_state_recovery_guidance();
-    test_new_release_publishes_then_updates_in_order();
+    test_first_deploy_bootstraps_then_records();
+    test_publish_failure_is_diagnostic();
+    test_bootstrap_publish_failure_self_heals();
     test_update_tags_release_identity();
     test_rollback_existing_tag_skips_gates_and_publish();
     test_rollback_missing_tag_is_verify();

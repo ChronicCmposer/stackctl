@@ -264,6 +264,13 @@ int deploy_prod_freshness_for_test(const char *repo_root, const char *bazel,
 int deploy_prod_cquery_files_for_test(const char *repo_root, const char *bazel,
                                       const char *targets, char **paths_out);
 
+/* Test-only: drive the production publish path (partial-prefix wipe, sidecar +
+ * object PUTs, manifest PUT) with an injected S3 client and diagnostics
+ * stream. `paths` is a newline-separated list of local artifact paths. */
+int deploy_prod_publish_paths_for_test(s3_client *client, const char *bucket,
+                                       const char *tag, const char *paths,
+                                       FILE *err, char *sha_out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

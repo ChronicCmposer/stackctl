@@ -742,6 +742,15 @@ static int dtrace_index(const dfake *f, int tag) {
     return -1;
 }
 
+static int dtrace_nth_index(const dfake *f, int tag, int nth) {
+    for (int i = 0; i < f->trace_count; i++) {
+        if (f->trace[i] == tag && --nth == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int d_aws_init(void *ud, const char *profile, aws_ctx **out) {
     (void)profile;
     *out = (aws_ctx *)ud;
@@ -1118,10 +1127,18 @@ static void scenario_deploy(fixture *fx) {
           "just-uploaded tag protected from prune");
     CHECK(dtrace_index(&f, DT_PROVENANCE) < dtrace_index(&f, DT_FRESHNESS) &&
               dtrace_index(&f, DT_FRESHNESS) < dtrace_index(&f, DT_REL_EXISTS) &&
-              dtrace_index(&f, DT_REL_EXISTS) < dtrace_index(&f, DT_PUBLISH) &&
-              dtrace_index(&f, DT_PUBLISH) < dtrace_index(&f, DT_EXECUTE) &&
-              dtrace_index(&f, DT_EXECUTE) < dtrace_index(&f, DT_PRUNE),
-          "publish-before-record-before-prune ordering");
+              dtrace_nth_index(&f, DT_CREATE_CS, 1) <
+                  dtrace_nth_index(&f, DT_EXECUTE, 1) &&
+              dtrace_nth_index(&f, DT_EXECUTE, 1) <
+                  dtrace_nth_index(&f, DT_WAIT_STACK, 1) &&
+              dtrace_nth_index(&f, DT_WAIT_STACK, 1) <
+                  dtrace_index(&f, DT_PUBLISH) &&
+              dtrace_index(&f, DT_PUBLISH) <
+                  dtrace_nth_index(&f, DT_CREATE_CS, 2) &&
+              dtrace_nth_index(&f, DT_CREATE_CS, 2) <
+                  dtrace_nth_index(&f, DT_EXECUTE, 2) &&
+              dtrace_nth_index(&f, DT_EXECUTE, 2) < dtrace_index(&f, DT_PRUNE),
+          "bootstrap-before-publish-before-record-before-prune ordering");
 
     /* Provenance failure is exit 3 and publishes nothing. */
     deploy_base(&f);
@@ -1157,8 +1174,8 @@ static void scenario_deploy(fixture *fx) {
           "declined deploy is not an error");
     CHECK(f.executed == 0, "declined change set is not executed");
     CHECK(f.deleted_change_sets >= 1, "declined change set is deleted");
-    CHECK(f.publish_count == 1,
-          "publish may precede the review (manifest is the commit marker)");
+    CHECK(f.publish_count == 0,
+          "declining the bootstrap change set publishes nothing");
 }
 
 static void scenario_prune(void) {

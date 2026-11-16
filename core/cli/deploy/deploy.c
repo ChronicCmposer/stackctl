@@ -40,6 +40,7 @@ struct prod_context {
     const char *project;
     const char *region;
     const char *bazel;
+    FILE *err;             /* diagnostic stream for publish failures */
     const deploy_ops *ops; /* complete_ops, for optional in-vtable seams */
     void *ops_ud;
 };
@@ -1195,7 +1196,7 @@ size_t deploy_prune_verify(deploy_release_entry *entries, size_t count,
 
 static int upload_artifact(s3_client *client, const char *bucket,
                            const char *tag, const char *path,
-                           buffer *manifest) {
+                           buffer *manifest, FILE *err) {
     FILE *file;
     long size;
     char *data;
@@ -1209,26 +1210,37 @@ static int upload_artifact(s3_client *client, const char *bucket,
 
     file = fopen(path, "rb");
     if (file == NULL) {
-        return errno != 0 ? errno : ENOENT;
+        rc = errno != 0 ? errno : ENOENT;
+        fprintf(err, "stackctl: s3 put: cannot read artifact %s: %s\n", path,
+                strerror(rc));
+        return rc;
     }
     if (fseek(file, 0, SEEK_END) != 0) {
         fclose(file);
+        fprintf(err, "stackctl: s3 put: cannot seek artifact %s: %s\n", path,
+                strerror(EIO));
         return EIO;
     }
     size = ftell(file);
     if (size < 0) {
         fclose(file);
+        fprintf(err, "stackctl: s3 put: cannot size artifact %s: %s\n", path,
+                strerror(EIO));
         return EIO;
     }
     rewind(file);
     data = malloc((size_t)size + 1);
     if (data == NULL) {
         fclose(file);
+        fprintf(err, "stackctl: s3 put: out of memory reading %s: %s\n", path,
+                strerror(ENOMEM));
         return ENOMEM;
     }
     if (fread(data, 1, (size_t)size, file) != (size_t)size) {
         free(data);
         fclose(file);
+        fprintf(err, "stackctl: s3 put: cannot read artifact %s: %s\n", path,
+                strerror(EIO));
         return EIO;
     }
     fclose(file);
@@ -1243,26 +1255,124 @@ static int upload_artifact(s3_client *client, const char *bucket,
         snprintf(side_key, sizeof(side_key), "releases/%s/%s.sha256", tag,
                  base) >= (int)sizeof(side_key)) {
         free(data);
+        fprintf(err, "stackctl: s3 put: object key for %s is too long: %s\n",
+                path, strerror(ENAMETOOLONG));
         return ENAMETOOLONG;
     }
 
     rc = s3_put_object(client, bucket, side_key, sidecar, strlen(sidecar),
                        "text/plain", NULL);
-    if (rc == 0) {
+    if (rc != 0) {
+        fprintf(err, "stackctl: s3 put %s failed: %s\n", side_key,
+                strerror(rc));
+    } else {
         rc = s3_put_object(client, bucket, object_key, data, (size_t)size,
                            "application/octet-stream", NULL);
+        if (rc != 0) {
+            fprintf(err, "stackctl: s3 put %s failed: %s\n", object_key,
+                    strerror(rc));
+        }
     }
     if (rc == 0) {
         char line[PATH_MAX + 80];
 
         if (deploy_manifest_line(digest, base, line, sizeof(line)) != 0) {
             rc = ENAMETOOLONG;
+            fprintf(err, "stackctl: manifest line for %s is too long: %s\n",
+                    base, strerror(rc));
         } else {
             rc = buffer_append(manifest, line, strlen(line));
         }
     }
     free(data);
     return rc;
+}
+
+/*
+ * Upload every artifact path in `paths` (newline-separated), then the release
+ * manifest. The partial-prefix wipe is best effort: a list or delete failure
+ * warns and continues, because an incomplete cleanup must not block a publish.
+ */
+static int publish_paths(s3_client *client, const char *bucket, const char *tag,
+                         const char *paths, FILE *err, char *sha_out,
+                         size_t cap) {
+    buffer manifest = {0};
+    char prefix[512];
+    s3_object_list existing = {0};
+    char *cursor = (char *)paths;
+    int rc;
+
+    snprintf(prefix, sizeof(prefix), "releases/%s/", tag);
+    rc = s3_list_objects_v2(client, bucket, prefix, &existing);
+    if (rc != 0) {
+        fprintf(err,
+                "stackctl: warning: s3 list %s failed: %s; continuing without "
+                "partial-prefix cleanup\n",
+                prefix, strerror(rc));
+    } else {
+        for (size_t i = 0; i < existing.count; i++) {
+            int drc = s3_delete_object(client, bucket, existing.items[i].key);
+
+            if (drc != 0) {
+                fprintf(err, "stackctl: warning: s3 delete %s failed: %s\n",
+                        existing.items[i].key, strerror(drc));
+            }
+        }
+    }
+    s3_object_list_free(&existing);
+
+    while (cursor != NULL && *cursor != '\0') {
+        char *line = cursor;
+        char *newline = strchr(cursor, '\n');
+
+        if (newline != NULL) {
+            *newline = '\0';
+            cursor = newline + 1;
+        } else {
+            cursor = NULL;
+        }
+        if (line[0] != '\0') {
+            rc = upload_artifact(client, bucket, tag, line, &manifest, err);
+            if (rc != 0) {
+                free(manifest.data);
+                return rc;
+            }
+        }
+    }
+
+    if (manifest.data == NULL) {
+        manifest.data = strdup("");
+        if (manifest.data == NULL) {
+            fprintf(err, "stackctl: publishing release %s: %s\n", tag,
+                    strerror(ENOMEM));
+            return ENOMEM;
+        }
+        manifest.len = 0;
+    }
+    {
+        char manifest_key_name[512];
+        char digest[65];
+
+        sha256_hex(manifest.data, manifest.len, digest);
+        snprintf(sha_out, cap, "%s", digest);
+        snprintf(manifest_key_name, sizeof(manifest_key_name),
+                 "releases/%s/release-manifest.txt", tag);
+        rc = s3_put_object(client, bucket, manifest_key_name, manifest.data,
+                           manifest.len, "text/plain", NULL);
+        if (rc != 0) {
+            fprintf(err, "stackctl: s3 put %s failed: %s\n", manifest_key_name,
+                    strerror(rc));
+        }
+    }
+    free(manifest.data);
+    return rc;
+}
+
+/* Test-only: drive the production publish path with an injected S3 client. */
+int deploy_prod_publish_paths_for_test(s3_client *client, const char *bucket,
+                                       const char *tag, const char *paths,
+                                       FILE *err, char *sha_out, size_t cap) {
+    return publish_paths(client, bucket, tag, paths, err, sha_out, cap);
 }
 
 static int prod_cquery_files(const struct prod_context *ctx,
@@ -1301,86 +1411,33 @@ static int prod_publish_release(void *ud, const char *bucket, const char *tag,
                                 char *sha_out, size_t cap) {
     aws_ctx *aws = NULL;
     s3_client *client = NULL;
-    buffer manifest = {0};
-    char quoted_root[PATH_MAX * 2];
     char *paths = NULL;
-    char *cursor;
-    char prefix[512];
-    s3_object_list existing = {0};
     int rc;
 
     const struct prod_context *ctx = ud;
+    FILE *err = ctx != NULL && ctx->err != NULL ? ctx->err : stderr;
 
     rc = s3_open(ctx != NULL ? ctx->project : "default",
                  ctx != NULL ? ctx->region : "us-east-1", &aws, &client);
     if (rc != 0) {
+        fprintf(err, "stackctl: publishing release %s: cannot open S3 client: "
+                     "%s\n",
+                tag, strerror(rc));
         return rc;
     }
-
-    /* Wipe any manifest-less partial prefix for this tag first. */
-    snprintf(prefix, sizeof(prefix), "releases/%s/", tag);
-    if (s3_list_objects_v2(client, bucket, prefix, &existing) == 0) {
-        for (size_t i = 0; i < existing.count; i++) {
-            (void)s3_delete_object(client, bucket, existing.items[i].key);
-        }
-    }
-    s3_object_list_free(&existing);
-
-    if (deploy_shell_quote(repo_root, quoted_root, sizeof(quoted_root)) != 0) {
-        s3_close(aws, client);
-        return EINVAL;
-    }
     if (prod_cquery_files(ctx, repo_root, targets, &paths) != 0) {
+        fprintf(err,
+                "stackctl: publishing release %s: cannot enumerate release "
+                "artifacts with bazel cquery: %s\n",
+                tag, strerror(EIO));
         s3_close(aws, client);
         return EIO;
     }
-    cursor = paths;
-    while (cursor != NULL && *cursor != '\0') {
-        char *line = cursor;
-        char *newline = strchr(cursor, '\n');
-
-        if (newline != NULL) {
-            *newline = '\0';
-            cursor = newline + 1;
-        } else {
-            cursor = NULL;
-        }
-        if (line[0] != '\0') {
-            rc = upload_artifact(client, bucket, tag, line, &manifest);
-            if (rc != 0) {
-                free(paths);
-                free(manifest.data);
-                s3_close(aws, client);
-                return rc;
-            }
-        }
-    }
+    rc = publish_paths(client, bucket, tag, paths, err, sha_out, cap);
     free(paths);
-
-    {
-        char manifest_key_name[512];
-        char digest[65];
-
-        if (manifest.data == NULL) {
-            manifest.data = strdup("");
-            if (manifest.data == NULL) {
-                s3_close(aws, client);
-                return ENOMEM;
-            }
-            manifest.len = 0;
-        }
-        sha256_hex(manifest.data, manifest.len, digest);
-        snprintf(sha_out, cap, "%s", digest);
-        snprintf(manifest_key_name, sizeof(manifest_key_name),
-                 "releases/%s/release-manifest.txt", tag);
-        rc = s3_put_object(client, bucket, manifest_key_name, manifest.data,
-                           manifest.len, "text/plain", NULL);
-    }
-    free(manifest.data);
     s3_close(aws, client);
     return rc;
 }
-
 
 /* ------------------------------------------------------------------------- */
 /* Production CFN vtable                                                     */
@@ -1982,6 +2039,327 @@ static int add_release_tags(cfn_tag *tags, size_t *count, const char *tag,
     return 0;
 }
 
+
+/*
+ * Build the planned parameter set. Release identity (ReleaseTag and
+ * ReleaseManifestSha256) is optional: the bootstrap CREATE change set omits it
+ * so the stack and its artifact bucket can be created before any publish.
+ */
+static void build_change_set_params(const deploy_env *env, const char *project,
+                                    int with_release, int ami_pinned,
+                                    char ami_ids[2][64],
+                                    char ami_arches[2][8], size_t ami_count,
+                                    cfn_parameter *params,
+                                    size_t *param_count) {
+    *param_count = 0;
+    add_param(params, param_count, "ProjectName", project);
+    if (with_release) {
+        add_param(params, param_count, "ReleaseTag", env->tag);
+        add_param(params, param_count, "ReleaseManifestSha256",
+                  env->manifest_sha);
+    }
+    add_param(params, param_count, "AmiPolicy",
+              config_get(env->cfg, "AMI_POLICY"));
+    /* Spec §6.2: per-arch AmiId parameters exist only under pinned policy. */
+    if (ami_pinned) {
+        for (size_t i = 0; i < ami_count; i++) {
+            char key[32];
+
+            if (make_camel_arch(ami_arches[i], key, sizeof(key)) == 0) {
+                add_param(params, param_count, key, ami_ids[i]);
+            }
+        }
+    }
+    add_param(params, param_count, "OperatorCidr",
+              config_get(env->cfg, "OPERATOR_CIDR"));
+    add_param(params, param_count, "IngressTcp",
+              config_get(env->cfg, "INGRESS_TCP"));
+    add_param(params, param_count, "IngressUdp",
+              config_get(env->cfg, "INGRESS_UDP"));
+    /* F2: map each parsed rule to its indexed port+cidr pair. Unused slots are
+     * omitted so the template's conditional resources stay off. */
+    {
+        const config_ingress_rule *rules = NULL;
+        size_t count = config_ingress_tcp(env->cfg, &rules);
+
+        for (size_t i = 0; i < count; i++) {
+            char key[32];
+            char port[16];
+
+            snprintf(port, sizeof port, "%u", rules[i].port);
+            snprintf(key, sizeof key, "IngressTcpPort%zu", i);
+            add_param(params, param_count, key, port);
+            snprintf(key, sizeof key, "IngressTcpCidr%zu", i);
+            add_param(params, param_count, key, rules[i].cidr);
+        }
+    }
+    {
+        const config_ingress_rule *rules = NULL;
+        size_t count = config_ingress_udp(env->cfg, &rules);
+
+        for (size_t i = 0; i < count; i++) {
+            char key[32];
+            char port[16];
+
+            snprintf(port, sizeof port, "%u", rules[i].port);
+            snprintf(key, sizeof key, "IngressUdpPort%zu", i);
+            add_param(params, param_count, key, port);
+            snprintf(key, sizeof key, "IngressUdpCidr%zu", i);
+            add_param(params, param_count, key, rules[i].cidr);
+        }
+    }
+    /* F4: pass the DDNS identity only when the pair is configured. */
+    if (config_get(env->cfg, "DDNS_HOST") != NULL) {
+        add_param(params, param_count, "DdnsHost",
+                  config_get(env->cfg, "DDNS_HOST"));
+        add_param(params, param_count, "DdnsDomain",
+                  config_get(env->cfg, "DDNS_DOMAIN"));
+    }
+    {
+        const char *buckets = config_get(env->cfg, "BUCKET_MODULES");
+
+        add_param(params, param_count, "CertBucketEnabled",
+                  buckets != NULL && strstr(buckets, "cert") != NULL ? "true"
+                                                                     : "false");
+    }
+    add_param(params, param_count, "EnableImageBuilder",
+              config_get(env->cfg, "ENABLE_IMAGE_BUILDER"));
+    /* F10: the spot-alert switch is always passed; the email only when on
+     * (config already enforces email-when-on). */
+    {
+        const char *alerts = config_get(env->cfg, "ENABLE_SPOT_ALERTS");
+        int alerts_on = alerts != NULL && strcmp(alerts, "true") == 0;
+
+        add_param(params, param_count, "EnableSpotAlerts",
+                  alerts_on != 0 ? "true" : "false");
+        if (alerts_on) {
+            add_param(params, param_count, "SpotAlertEmail",
+                      config_get(env->cfg, "SPOT_ALERT_EMAIL"));
+        }
+    }
+    /* F11: the image-builder parent image is passed iff configured. */
+    {
+        const char *parent = config_get(env->cfg, "IMAGE_BUILDER_PARENT_IMAGE");
+
+        if (parent != NULL) {
+            add_param(params, param_count, "ImageBuilderParentImage", parent);
+        }
+    }
+}
+
+typedef struct deploy_cs_outcome {
+    size_t change_count;
+    int executed;
+    int unchanged;
+} deploy_cs_outcome;
+
+/*
+ * Create, wait for, preview, confirm (when asked), execute and wait on one
+ * change set. `prior_review` cleans up a REVIEW_IN_PROGRESS stack on a
+ * no-op/abort, matching the historical single-change-set behavior. On success
+ * the caller reports the final outcome; no-change and abort paths report here.
+ */
+static int run_change_set(deploy_env *env, const deploy_ops *ops, void *ud,
+                          cfn_client *client, const char *region,
+                          const char *stack, const char *change_set_name,
+                          cfn_change_set_type type,
+                          const cfn_parameter *params, size_t param_count,
+                          const cfn_tag *tags, size_t tag_count,
+                          const char *template_source, int ask_confirm,
+                          int prior_review, const cfn_stack *current_stack,
+                          int live_count, deploy_cs_outcome *out) {
+    cfn_change_set_spec spec = {0};
+    cfn_change_set_result result = {0};
+    cfn_change_set change_set = {0};
+    int timed_out = 0;
+    int no_changes = 0;
+    int rc;
+
+    out->change_count = 0;
+    out->executed = 0;
+    out->unchanged = 0;
+
+    spec.stack_name = stack;
+    spec.change_set_name = change_set_name;
+    spec.template_body = template_source;
+    spec.type = type;
+    spec.parameters = params;
+    spec.parameter_count = param_count;
+    spec.tags = tags;
+    spec.tag_count = tag_count;
+    spec.description = "stackctl deploy";
+    spec.capabilities = 0;
+
+    rc = ops->create_change_set(ud, client, region, &spec, &result);
+    if (rc != 0) {
+        fprintf(env->err, "stackctl: cannot create the change set for %s\n",
+                stack);
+        return CLI_EXIT_AWS;
+    }
+    rc = ops->wait_change_set(ud, client, region, stack, change_set_name, 120,
+                              5, &timed_out, &no_changes);
+    if (rc != 0 || timed_out != 0) {
+        fprintf(env->err, "stackctl: change set for %s did not complete\n",
+                stack);
+        return CLI_EXIT_AWS;
+    }
+    if (no_changes != 0) {
+        /*
+         * The stack already matches this release. AWS reports the empty change
+         * set as FAILED with the fixed no-changes reason; that is a successful
+         * idempotent re-deploy, so clean up and report "unchanged".
+         */
+        (void)ops->delete_change_set(ud, client, region, stack,
+                                     change_set_name);
+        if (prior_review != 0) {
+            (void)ops->delete_stack(ud, client, region, stack);
+        }
+        if (env->json != 0) {
+            report_json(env, stack, 0, 0, "unchanged", current_stack, params,
+                        param_count);
+        } else {
+            fprintf(env->out, "%s: no changes (release %s recorded)\n", stack,
+                    env->tag);
+        }
+        out->unchanged = 1;
+        return CLI_EXIT_OK;
+    }
+    rc = ops->describe_change_set(ud, client, region, stack, change_set_name,
+                                  &change_set);
+    if (rc != 0) {
+        fprintf(env->err, "stackctl: cannot describe the change set for %s\n",
+                stack);
+        ops->change_set_free(ud, &change_set);
+        return CLI_EXIT_AWS;
+    }
+    if (change_set.change_count == 0) {
+        (void)ops->delete_change_set(ud, client, region, stack,
+                                     change_set_name);
+        if (prior_review != 0) {
+            (void)ops->delete_stack(ud, client, region, stack);
+        }
+        if (env->json != 0) {
+            report_json(env, stack, 0, 0, "unchanged", current_stack, params,
+                        param_count);
+        } else {
+            fprintf(env->out, "%s: no changes (release %s recorded)\n", stack,
+                    env->tag);
+        }
+        ops->change_set_free(ud, &change_set);
+        out->unchanged = 1;
+        return CLI_EXIT_OK;
+    }
+
+    if (env->json == 0) {
+        fprintf(env->out,
+                "release: %s; template/config from current checkout "
+                "(dirty: %s)\n",
+                env->tag, env->allow_dirty != 0 ? "yes" : "no");
+        fprintf(env->out, "%s: %zu change(s) in the change set\n", stack,
+                change_set.change_count);
+        (void)deploy_param_diff_write(env->out, current_stack, params,
+                                      param_count);
+        fprintf(env->out, "live Project instances: %d\n", live_count);
+        if (live_count > 0) {
+            fprintf(env->out,
+                    "warning: %d live instance(s) may be disrupted by this "
+                    "change; review the change set before applying\n",
+                    live_count);
+        }
+    }
+
+    if (ask_confirm != 0) {
+        int decision = env->confirm != NULL
+                           ? env->confirm(env->confirm_ud, "apply? [y/N] ")
+                           : CLI_CONFIRM_NONINTERACTIVE;
+
+        if (decision == CLI_CONFIRM_NONINTERACTIVE ||
+            decision == CLI_CONFIRM_EOF) {
+            (void)ops->delete_change_set(ud, client, region, stack,
+                                         change_set_name);
+            if (prior_review != 0) {
+                (void)ops->delete_stack(ud, client, region, stack);
+            }
+            fprintf(env->err,
+                    "stackctl: refusing to apply non-interactively without "
+                    "--yes\n");
+            ops->change_set_free(ud, &change_set);
+            return CLI_EXIT_USAGE;
+        }
+        if (decision != CLI_CONFIRM_YES) {
+            (void)ops->delete_change_set(ud, client, region, stack,
+                                         change_set_name);
+            if (prior_review != 0) {
+                (void)ops->delete_stack(ud, client, region, stack);
+            }
+            if (env->json != 0) {
+                report_json(env, stack, change_set.change_count, 0, "aborted",
+                            current_stack, params, param_count);
+            } else {
+                fprintf(env->out, "aborted; change set deleted\n");
+            }
+            ops->change_set_free(ud, &change_set);
+            out->unchanged = 1;
+            return CLI_EXIT_OK;
+        }
+    }
+
+    rc = ops->execute_change_set(ud, client, region, stack, change_set_name);
+    if (rc != 0) {
+        fprintf(env->err, "stackctl: failed to execute the change set for %s\n",
+                stack);
+        ops->change_set_free(ud, &change_set);
+        return CLI_EXIT_AWS;
+    }
+    timed_out = 0;
+    rc = ops->wait_stack(ud, client, region, stack,
+                         type == CFN_CHANGE_SET_TYPE_CREATE ? CFN_WAIT_CREATE
+                                                            : CFN_WAIT_UPDATE,
+                         180, 5, &timed_out);
+    if (rc != 0 || timed_out != 0) {
+        fprintf(env->err,
+                "stackctl: stack operation on %s did not complete; continues "
+                "server-side; run `stackctl status`\n",
+                stack);
+        ops->change_set_free(ud, &change_set);
+        return CLI_EXIT_AWS;
+    }
+    out->change_count = change_set.change_count;
+    out->executed = 1;
+    env->executed = 1;
+    ops->change_set_free(ud, &change_set);
+    return CLI_EXIT_OK;
+}
+
+/* Publish this release, then read every member and the manifest back. */
+static int publish_and_verify(deploy_env *env, const deploy_ops *ops, void *ud,
+                              const char *bucket, const char *repo_root,
+                              const char *targets) {
+    int rc;
+
+    rc = ops->publish_release(ud, bucket, env->tag, repo_root, targets,
+                              env->manifest_sha, sizeof(env->manifest_sha));
+    if (rc != 0) {
+        fprintf(env->err, "stackctl: publishing release %s failed: %s\n",
+                env->tag, strerror(rc));
+        return CLI_EXIT_AWS;
+    }
+    {
+        char readback_sha[65];
+
+        rc = ops->verify_release(ud, bucket, env->tag, readback_sha,
+                                 sizeof(readback_sha));
+    }
+    if (rc != 0) {
+        fprintf(env->err,
+                "stackctl: published release %s failed read-back "
+                "verification\n",
+                env->tag);
+        return rc == CLI_EXIT_VERIFY ? CLI_EXIT_VERIFY : CLI_EXIT_AWS;
+    }
+    return CLI_EXIT_OK;
+}
+
 static int deploy_run_impl(deploy_env *env) {
     const deploy_ops *ops;
     void *ud;
@@ -2014,14 +2392,11 @@ static int deploy_run_impl(deploy_env *env) {
     size_t param_count = 0;
     cfn_tag tags[2] = {0};
     size_t tag_count = 0;
-    cfn_change_set_spec spec = {0};
-    cfn_change_set_result result = {0};
-    cfn_change_set change_set = {0};
+    char create_change_set_name[CFN_CHANGE_SET_NAME_MAX];
+    char record_change_set_name[CFN_CHANGE_SET_NAME_MAX];
     char prior_pinned[128] = {0};
     int live_count = 0;
     const cfn_stack *current_stack = NULL;
-    int timed_out = 0;
-    int no_changes = 0;
     int rc;
 
     if (env == NULL || env->cfg == NULL || env->config_dir == NULL) {
@@ -2034,6 +2409,7 @@ static int deploy_run_impl(deploy_env *env) {
         prod_ctx.project = config_project(env->cfg);
         prod_ctx.region = config_region(env->cfg);
         prod_ctx.bazel = config_get(env->cfg, "BAZEL_COMMAND");
+        prod_ctx.err = env->err;
         prod_ctx.ops = &complete_ops;
         prod_ctx.ops_ud = &prod_ctx;
         ud = &prod_ctx;
@@ -2050,6 +2426,10 @@ static int deploy_run_impl(deploy_env *env) {
     snprintf(stack, sizeof(stack), "%s-infra", project);
     snprintf(change_set_name, sizeof(change_set_name), "%s-infra-deploy",
              project);
+    snprintf(create_change_set_name, sizeof(create_change_set_name),
+             "%s-infra-create", project);
+    snprintf(record_change_set_name, sizeof(record_change_set_name),
+             "%s-infra-record", project);
     rollback = env->tag_arg != NULL && env->tag_arg[0] != '\0';
 
     rc = config_repo_root(env->config_dir, &allocated_root);
@@ -2190,71 +2570,9 @@ static int deploy_run_impl(deploy_env *env) {
         }
     }
 
-    rc = ops->release_exists(ud, bucket, env->tag, &exists);
-    if (rc != 0) {
-        fprintf(env->err, "stackctl: cannot check releases/%s/\n", env->tag);
-        return CLI_EXIT_AWS;
-    }
-    if (exists != 0) {
-        if (env->skip_build != 0 && !rollback) {
-            fprintf(env->err,
-                    "stackctl: tag %s is immutable; cut a new tag (--skip-build "
-                    "does not override tag immutability)\n",
-                    env->tag);
-            return CLI_EXIT_VERIFY;
-        }
-        rc = ops->verify_release(ud, bucket, env->tag, env->manifest_sha,
-                                 sizeof(env->manifest_sha));
-        if (rc != 0) {
-            fprintf(env->err,
-                    "stackctl: release %s failed manifest verification\n",
-                    env->tag);
-            return rc == CLI_EXIT_VERIFY ? CLI_EXIT_VERIFY : CLI_EXIT_AWS;
-        }
-    } else if (rollback) {
-        char available[512] = {0};
-
-        if (ops->list_releases != NULL &&
-            ops->list_releases(ud, bucket, available, sizeof(available)) == 0 &&
-            available[0] != '\0') {
-            fprintf(env->err,
-                    "stackctl: release %s no longer exists (pruned); "
-                    "available releases: %s\n",
-                    env->tag, available);
-        } else {
-            fprintf(env->err,
-                    "stackctl: release %s no longer exists (pruned); "
-                    "available releases are listed by `stackctl status`\n",
-                    env->tag);
-        }
-        return CLI_EXIT_VERIFY;
-    } else if (env->dry_run != 0) {
-        /* F22: a dry run performs no S3 writes; skip publishing entirely. */
-    } else {
-        rc = ops->publish_release(ud, bucket, env->tag, repo_root, targets,
-                                  env->manifest_sha,
-                                  sizeof(env->manifest_sha));
-        if (rc != 0) {
-            fprintf(env->err, "stackctl: publishing release %s failed\n",
-                    env->tag);
-            return CLI_EXIT_AWS;
-        }
-        /* Read back every member and the manifest before recording it. */
-        {
-            char readback_sha[65];
-
-            rc = ops->verify_release(ud, bucket, env->tag, readback_sha,
-                                     sizeof(readback_sha));
-        }
-        if (rc != 0) {
-            fprintf(env->err,
-                    "stackctl: published release %s failed read-back "
-                    "verification\n",
-                    env->tag);
-            return rc == CLI_EXIT_VERIFY ? CLI_EXIT_VERIFY : CLI_EXIT_AWS;
-        }
-    }
-
+    /* Detect stack absence before publishing: on FIRST deploy the artifact
+     * bucket is created by the infra stack's CREATE, so the upload must wait
+     * until that CREATE has completed (the bootstrap branch below). */
     rc = ops->describe_stacks(ud, client, region, stack, &stacks);
     if (rc == ENOENT || (rc == 0 && stacks.count == 0)) {
         type = CFN_CHANGE_SET_TYPE_CREATE;
@@ -2323,100 +2641,58 @@ static int deploy_run_impl(deploy_env *env) {
         }
     }
 
-    add_param(params, &param_count, "ProjectName", project);
-    add_param(params, &param_count, "ReleaseTag", env->tag);
-    add_param(params, &param_count, "ReleaseManifestSha256", env->manifest_sha);
-    add_param(params, &param_count, "AmiPolicy",
-              config_get(env->cfg, "AMI_POLICY"));
-    /* Spec §6.2: per-arch AmiId parameters exist only under pinned policy. */
-    if (ami_pinned) {
-        for (size_t i = 0; i < ami_count; i++) {
-            char key[32];
+    rc = ops->release_exists(ud, bucket, env->tag, &exists);
+    if (rc != 0) {
+        fprintf(env->err, "stackctl: cannot check releases/%s/\n", env->tag);
+        return CLI_EXIT_AWS;
+    }
 
-            if (make_camel_arch(ami_arches[i], key, sizeof(key)) == 0) {
-                add_param(params, &param_count, key, ami_ids[i]);
-            }
+    int need_publish = 0;
+
+    if (exists != 0) {
+        if (env->skip_build != 0 && !rollback) {
+            fprintf(env->err,
+                    "stackctl: tag %s is immutable; cut a new tag (--skip-build "
+                    "does not override tag immutability)\n",
+                    env->tag);
+            return CLI_EXIT_VERIFY;
         }
-    }
-    add_param(params, &param_count, "OperatorCidr",
-              config_get(env->cfg, "OPERATOR_CIDR"));
-    add_param(params, &param_count, "IngressTcp",
-              config_get(env->cfg, "INGRESS_TCP"));
-    add_param(params, &param_count, "IngressUdp",
-              config_get(env->cfg, "INGRESS_UDP"));
-    /* F2: map each parsed rule to its indexed port+cidr pair. Unused slots are
-     * omitted so the template's conditional resources stay off. */
-    {
-        const config_ingress_rule *rules = NULL;
-        size_t count = config_ingress_tcp(env->cfg, &rules);
-
-        for (size_t i = 0; i < count; i++) {
-            char key[32];
-            char port[16];
-
-            snprintf(port, sizeof port, "%u", rules[i].port);
-            snprintf(key, sizeof key, "IngressTcpPort%zu", i);
-            add_param(params, &param_count, key, port);
-            snprintf(key, sizeof key, "IngressTcpCidr%zu", i);
-            add_param(params, &param_count, key, rules[i].cidr);
+        rc = ops->verify_release(ud, bucket, env->tag, env->manifest_sha,
+                                 sizeof(env->manifest_sha));
+        if (rc != 0) {
+            fprintf(env->err,
+                    "stackctl: release %s failed manifest verification\n",
+                    env->tag);
+            return rc == CLI_EXIT_VERIFY ? CLI_EXIT_VERIFY : CLI_EXIT_AWS;
         }
-    }
-    {
-        const config_ingress_rule *rules = NULL;
-        size_t count = config_ingress_udp(env->cfg, &rules);
+    } else if (rollback) {
+        char available[512] = {0};
 
-        for (size_t i = 0; i < count; i++) {
-            char key[32];
-            char port[16];
-
-            snprintf(port, sizeof port, "%u", rules[i].port);
-            snprintf(key, sizeof key, "IngressUdpPort%zu", i);
-            add_param(params, &param_count, key, port);
-            snprintf(key, sizeof key, "IngressUdpCidr%zu", i);
-            add_param(params, &param_count, key, rules[i].cidr);
+        if (ops->list_releases != NULL &&
+            ops->list_releases(ud, bucket, available, sizeof(available)) == 0 &&
+            available[0] != '\0') {
+            fprintf(env->err,
+                    "stackctl: release %s no longer exists (pruned); "
+                    "available releases: %s\n",
+                    env->tag, available);
+        } else {
+            fprintf(env->err,
+                    "stackctl: release %s no longer exists (pruned); "
+                    "available releases are listed by `stackctl status`\n",
+                    env->tag);
         }
-    }
-    /* F4: pass the DDNS identity only when the pair is configured. */
-    if (config_get(env->cfg, "DDNS_HOST") != NULL) {
-        add_param(params, &param_count, "DdnsHost",
-                  config_get(env->cfg, "DDNS_HOST"));
-        add_param(params, &param_count, "DdnsDomain",
-                  config_get(env->cfg, "DDNS_DOMAIN"));
-    }
-    {
-        const char *buckets = config_get(env->cfg, "BUCKET_MODULES");
-
-        add_param(params, &param_count, "CertBucketEnabled",
-                  buckets != NULL && strstr(buckets, "cert") != NULL ? "true"
-                                                                     : "false");
-    }
-    add_param(params, &param_count, "EnableImageBuilder",
-              config_get(env->cfg, "ENABLE_IMAGE_BUILDER"));
-    /* F10: the spot-alert switch is always passed; the email only when on
-     * (config already enforces email-when-on). */
-    {
-        const char *alerts = config_get(env->cfg, "ENABLE_SPOT_ALERTS");
-        int alerts_on = alerts != NULL && strcmp(alerts, "true") == 0;
-
-        add_param(params, &param_count, "EnableSpotAlerts",
-                  alerts_on != 0 ? "true" : "false");
-        if (alerts_on) {
-            add_param(params, &param_count, "SpotAlertEmail",
-                      config_get(env->cfg, "SPOT_ALERT_EMAIL"));
-        }
-    }
-    /* F11: the image-builder parent image is passed iff configured. */
-    {
-        const char *parent = config_get(env->cfg, "IMAGE_BUILDER_PARENT_IMAGE");
-
-        if (parent != NULL) {
-            add_param(params, &param_count, "ImageBuilderParentImage", parent);
-        }
+        return CLI_EXIT_VERIFY;
+    } else if (env->dry_run != 0) {
+        /* F22: a dry run performs no S3 writes; skip publishing entirely. */
+    } else {
+        need_publish = 1;
     }
 
     /* F22: a dry run stops here — identity/provenance/AMI checks already ran,
      * but nothing is published and no change set is created. */
     if (env->dry_run != 0) {
+        build_change_set_params(env, project, 1, ami_pinned, ami_ids,
+                                ami_arches, ami_count, params, &param_count);
         if (env->json != 0) {
             report_json(env, stack, 0, 0, "dry-run", current_stack, params,
                         param_count);
@@ -2433,161 +2709,104 @@ static int deploy_run_impl(deploy_env *env) {
         goto done;
     }
 
-    rc = add_release_tags(tags, &tag_count, env->tag, env->manifest_sha);
-    if (rc != 0) {
-        fprintf(env->err,
-                "stackctl: cannot determine release identity for tagging\n");
-        rc = CLI_EXIT_USAGE;
-        goto done;
-    }
+    deploy_cs_outcome outcome = {0};
 
-    spec.stack_name = stack;
-    spec.change_set_name = change_set_name;
-    spec.template_body = template_source;
-    spec.type = type;
-    spec.parameters = params;
-    spec.parameter_count = param_count;
-    spec.tags = tags;
-    spec.tag_count = tag_count;
-    spec.description = "stackctl deploy";
-    spec.capabilities = 0;
-
-    rc = ops->create_change_set(ud, client, region, &spec, &result);
-    if (rc != 0) {
-        fprintf(env->err, "stackctl: cannot create the change set for %s\n",
-                stack);
-        rc = CLI_EXIT_AWS;
-        goto done;
-    }
-    rc = ops->wait_change_set(ud, client, region, stack, change_set_name, 120,
-                              5, &timed_out, &no_changes);
-    if (rc != 0 || timed_out != 0) {
-        fprintf(env->err, "stackctl: change set for %s did not complete\n",
-                stack);
-        rc = CLI_EXIT_AWS;
-        goto done;
-    }
-    if (no_changes != 0) {
+    if (type == CFN_CHANGE_SET_TYPE_CREATE) {
         /*
-         * The stack already matches this release. AWS reports the empty change
-         * set as FAILED with the fixed no-changes reason; that is a successful
-         * idempotent re-deploy, so clean up and report "unchanged".
+         * First deploy: create the stack (and its artifact bucket) BEFORE
+         * publishing. The CREATE change set carries no release identity — the
+         * template defaults ReleaseTag/ReleaseManifestSha256 to "" — and no
+         * stackctl:release-* tags. After it completes, publish, then run an
+         * UPDATE change set that records the release with the usual parameters
+         * and tags. If publishing fails after the stack exists, this command
+         * returns failure but leaves a usable stack: a re-run takes the UPDATE
+         * path (publish -> record) and self-heals.
          */
-        (void)ops->delete_change_set(ud, client, region, stack,
-                                     change_set_name);
-        if (prior_review != 0) {
-            (void)ops->delete_stack(ud, client, region, stack);
-        }
-        if (env->json != 0) {
-            report_json(env, stack, 0, 0, "unchanged", current_stack, params,
-                        param_count);
-        } else {
-            fprintf(env->out, "%s: no changes (release %s recorded)\n", stack,
-                    env->tag);
-        }
-        rc = CLI_EXIT_OK;
-        goto done;
-    }
-    rc = ops->describe_change_set(ud, client, region, stack, change_set_name,
-                                  &change_set);
-    if (rc != 0) {
-        fprintf(env->err, "stackctl: cannot describe the change set for %s\n",
-                stack);
-        rc = CLI_EXIT_AWS;
-        goto done;
-    }
+        deploy_cs_outcome create_outcome = {0};
 
-    if (change_set.change_count == 0) {
-        (void)ops->delete_change_set(ud, client, region, stack,
-                                     change_set_name);
-        if (prior_review != 0) {
-            (void)ops->delete_stack(ud, client, region, stack);
-        }
-        if (env->json != 0) {
-            report_json(env, stack, 0, 0, "unchanged", current_stack, params,
-                        param_count);
-        } else {
-            fprintf(env->out, "%s: no changes (release %s recorded)\n", stack,
-                    env->tag);
-        }
-        rc = CLI_EXIT_OK;
-        goto done;
-    }
-
-    if (env->json == 0) {
-        fprintf(env->out,
-                "release: %s; template/config from current checkout "
-                "(dirty: %s)\n",
-                env->tag, env->allow_dirty != 0 ? "yes" : "no");
-        fprintf(env->out, "%s: %zu change(s) in the change set\n", stack,
-                change_set.change_count);
-        (void)deploy_param_diff_write(env->out, current_stack, params,
-                                      param_count);
-        fprintf(env->out, "live Project instances: %d\n", live_count);
-        if (live_count > 0) {
+        build_change_set_params(env, project, 0, ami_pinned, ami_ids,
+                                ami_arches, ami_count, params, &param_count);
+        if (env->json == 0) {
             fprintf(env->out,
-                    "warning: %d live instance(s) may be disrupted by this "
-                    "change; review the change set before applying\n",
-                    live_count);
+                    "stackctl: bootstrapping %s before publishing release %s\n",
+                    stack, env->tag);
         }
-    }
+        rc = run_change_set(env, ops, ud, client, region, stack,
+                            create_change_set_name, CFN_CHANGE_SET_TYPE_CREATE,
+                            params, param_count, NULL, 0, template_source, 1,
+                            prior_review, current_stack, live_count,
+                            &create_outcome);
+        if (rc != CLI_EXIT_OK) {
+            goto done;
+        }
+        if (create_outcome.executed == 0) {
+            rc = CLI_EXIT_OK;
+            goto done;
+        }
 
-    {
-        int decision = env->confirm != NULL
-                           ? env->confirm(env->confirm_ud, "apply? [y/N] ")
-                           : CLI_CONFIRM_NONINTERACTIVE;
-
-        if (decision == CLI_CONFIRM_NONINTERACTIVE ||
-            decision == CLI_CONFIRM_EOF) {
-            (void)ops->delete_change_set(ud, client, region, stack,
-                                         change_set_name);
-            if (prior_review != 0) {
-                (void)ops->delete_stack(ud, client, region, stack);
+        if (need_publish != 0) {
+            rc = publish_and_verify(env, ops, ud, bucket, repo_root, targets);
+            if (rc != CLI_EXIT_OK) {
+                goto done;
             }
+        }
+
+        build_change_set_params(env, project, 1, ami_pinned, ami_ids,
+                                ami_arches, ami_count, params, &param_count);
+        rc = add_release_tags(tags, &tag_count, env->tag, env->manifest_sha);
+        if (rc != 0) {
             fprintf(env->err,
-                    "stackctl: refusing to apply non-interactively without "
-                    "--yes\n");
+                    "stackctl: cannot determine release identity for "
+                    "tagging\n");
             rc = CLI_EXIT_USAGE;
             goto done;
         }
-        if (decision != CLI_CONFIRM_YES) {
-            (void)ops->delete_change_set(ud, client, region, stack,
-                                         change_set_name);
-            if (prior_review != 0) {
-                (void)ops->delete_stack(ud, client, region, stack);
+        if (env->json == 0) {
+            fprintf(env->out, "stackctl: recording release %s on %s\n",
+                    env->tag, stack);
+        }
+        rc = run_change_set(env, ops, ud, client, region, stack,
+                            record_change_set_name, CFN_CHANGE_SET_TYPE_UPDATE,
+                            params, param_count, tags, tag_count,
+                            template_source, 0, 0, current_stack, live_count,
+                            &outcome);
+        if (rc != CLI_EXIT_OK) {
+            goto done;
+        }
+        if (outcome.executed == 0) {
+            rc = CLI_EXIT_OK;
+            goto done;
+        }
+    } else {
+        /* Existing stack: publish first, then a single recording change set. */
+        if (need_publish != 0) {
+            rc = publish_and_verify(env, ops, ud, bucket, repo_root, targets);
+            if (rc != CLI_EXIT_OK) {
+                goto done;
             }
-            if (env->json != 0) {
-                report_json(env, stack, change_set.change_count, 0, "aborted",
-                        current_stack, params, param_count);
-            } else {
-                fprintf(env->out, "aborted; change set deleted\n");
-            }
+        }
+        build_change_set_params(env, project, 1, ami_pinned, ami_ids,
+                                ami_arches, ami_count, params, &param_count);
+        rc = add_release_tags(tags, &tag_count, env->tag, env->manifest_sha);
+        if (rc != 0) {
+            fprintf(env->err,
+                    "stackctl: cannot determine release identity for "
+                    "tagging\n");
+            rc = CLI_EXIT_USAGE;
+            goto done;
+        }
+        rc = run_change_set(env, ops, ud, client, region, stack,
+                            change_set_name, type, params, param_count, tags,
+                            tag_count, template_source, 1, prior_review,
+                            current_stack, live_count, &outcome);
+        if (rc != CLI_EXIT_OK) {
+            goto done;
+        }
+        if (outcome.executed == 0) {
             rc = CLI_EXIT_OK;
             goto done;
         }
     }
-
-    rc = ops->execute_change_set(ud, client, region, stack, change_set_name);
-    if (rc != 0) {
-        fprintf(env->err, "stackctl: failed to execute the change set for %s\n",
-                stack);
-        rc = CLI_EXIT_AWS;
-        goto done;
-    }
-    timed_out = 0;
-    rc = ops->wait_stack(ud, client, region, stack,
-                         type == CFN_CHANGE_SET_TYPE_CREATE ? CFN_WAIT_CREATE
-                                                            : CFN_WAIT_UPDATE,
-                         180, 5, &timed_out);
-    if (rc != 0 || timed_out != 0) {
-        fprintf(env->err,
-                "stackctl: stack operation on %s did not complete; continues "
-                "server-side; run `stackctl status`\n",
-                stack);
-        rc = CLI_EXIT_AWS;
-        goto done;
-    }
-    env->executed = 1;
 
     /* Step 5: prune old releases. A prune failure never fails the deploy. */
     if (ops->prune_releases != NULL) {
@@ -2605,8 +2824,8 @@ static int deploy_run_impl(deploy_env *env) {
     }
 
     if (env->json != 0) {
-        report_json(env, stack, change_set.change_count, 1, "deployed",
-                        current_stack, params, param_count);
+        report_json(env, stack, outcome.change_count, 1, "deployed",
+                    current_stack, params, param_count);
     } else {
         fprintf(env->out, "%s: deployed release %s\n", stack, env->tag);
     }
@@ -2614,7 +2833,6 @@ static int deploy_run_impl(deploy_env *env) {
 
 done:
     free(template_body);
-    ops->change_set_free(ud, &change_set);
     ops->stack_list_free(ud, &stacks);
     ops->cfn_destroy(ud, client);
     ops->aws_free(ud, aws);
