@@ -1471,9 +1471,11 @@ static void check_operator_image_builder_permissions(checker *c, const node *roo
         return;
     }
     if (operator_policies_find_statement(&operator, "imagebuilder:CreateComponent") == NULL ||
-        operator_policies_find_statement(&operator, "imagebuilder:CreateImagePipeline") == NULL) {
-        violation(c, "operator policies must grant imagebuilder:CreateComponent and "
-                     "imagebuilder:CreateImagePipeline when EnableImageBuilder is declared");
+        operator_policies_find_statement(&operator, "imagebuilder:CreateImagePipeline") == NULL ||
+        operator_policies_find_statement(&operator, "imagebuilder:GetComponent") == NULL) {
+        violation(c, "operator policies must grant imagebuilder:CreateComponent, "
+                     "imagebuilder:CreateImagePipeline, and imagebuilder:GetComponent "
+                     "when EnableImageBuilder is declared");
     }
 }
 

@@ -340,6 +340,31 @@ Resources:
                   - imagebuilder:UntagResource
                 Resource: !Sub arn:aws:imagebuilder:*:${AWS::AccountId}:*
               - !Ref "AWS::NoValue"
+          # CloudFormation's ImageBuilder resource handlers issue Get*/List*
+          # reads under the CALLER's identity while creating and deleting each
+          # resource; without them a create fails with AccessDenied. Enumerate
+          # the read surface for the same resource families the lifecycle
+          # statement manages (plus tag reads), never a wildcard.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: ImageBuilderRead
+                Effect: Allow
+                Action:
+                  - imagebuilder:GetComponent
+                  - imagebuilder:GetImageRecipe
+                  - imagebuilder:GetInfrastructureConfiguration
+                  - imagebuilder:GetDistributionConfiguration
+                  - imagebuilder:GetImagePipeline
+                  - imagebuilder:GetImage
+                  - imagebuilder:ListComponents
+                  - imagebuilder:ListImageRecipes
+                  - imagebuilder:ListInfrastructureConfigurations
+                  - imagebuilder:ListDistributionConfigurations
+                  - imagebuilder:ListImagePipelines
+                  - imagebuilder:ListImages
+                  - imagebuilder:ListTagsForResource
+                Resource: !Sub arn:aws:imagebuilder:*:${AWS::AccountId}:*
+              - !Ref "AWS::NoValue"
           # CloudFormation wires these roles into Image Builder and the instance
           # profile, so it must pass exactly those roles (never an arbitrary
           # role) to their services. The ARNs are constructed from the fixed
