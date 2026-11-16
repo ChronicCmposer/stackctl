@@ -763,6 +763,28 @@ static int stream_contains(FILE *stream, const char *needle) {
     return found;
 }
 
+/*
+ * Return the byte offset of the first occurrence of `needle` in a captured
+ * stream, or -1 when absent. Used to assert phase announcements appear in the
+ * order the launch performs them.
+ */
+static long stream_position(FILE *stream, const char *needle) {
+    char buffer[8192];
+    size_t got;
+    char *found;
+
+    if (stream == NULL) {
+        return -1;
+    }
+    fflush(stream);
+    rewind(stream);
+    got = fread(buffer, 1, sizeof buffer - 1, stream);
+    buffer[got] = '\0';
+    clearerr(stream);
+    found = strstr(buffer, needle);
+    return found != NULL ? (long)(found - buffer) : -1;
+}
+
 static int any_ssh_contains(const char *needle);
 
 static int file_contains(const char *path, const char *needle) {
@@ -1304,8 +1326,52 @@ static void test_pin_failure_is_exit3(void) {
     rc = launch_execute(&rt, &opts);
 
     CHECK(rc == CLI_EXIT_VERIFY, "known-hosts pin EPERM is exit 3");
+    CHECK(stream_contains(rt.err, "pinning the host key failed:"),
+          "a failed pin is announced with the errno text");
+    CHECK(stream_contains(rt.err, "launch failed (host-key pin failed)"),
+          "the launch-failed reason names the pin step");
     CHECK(terminated("i-new"), "pin failure terminates the instance");
     free_runtime(&rt);
+}
+
+static void test_binding_write_failure_announced(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    state_store *store;
+    kh_binding stale;
+    char root[256];
+    int rc;
+
+    reset_all();
+    store = open_temp_state(root, sizeof root);
+    CHECK(store != NULL, "temp state store opens");
+    if (store == NULL) {
+        return;
+    }
+    memset(&stale, 0, sizeof stale);
+    snprintf(stale.instance_id, sizeof stale.instance_id, "%s", "i-new");
+    snprintf(stale.host_key, sizeof stale.host_key, "%s",
+             "SHA256:stale0000000000000000000000000000000000000000");
+    snprintf(stale.fqdn, sizeof stale.fqdn, "%s", "box.example.com");
+    snprintf(stale.ip, sizeof stale.ip, "%s", "198.51.100.9");
+    CHECK(state_binding_put(store, &stale) == 0, "stale binding is seeded");
+
+    make_runtime(&rt, &svc);
+    rt.state = store;
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_VERIFY,
+          "binding conflict (same id, changed key) is exit 3");
+    CHECK(stream_contains(rt.err, "recording the known-hosts binding failed"),
+          "a failed binding write is announced");
+    CHECK(stream_contains(rt.err, "launch failed (binding write failed)"),
+          "the launch-failed reason names the binding write");
+    CHECK(terminated("i-new"), "binding failure terminates the instance");
+    free_runtime(&rt);
+    close_temp_state(store, root);
 }
 
 static void test_manifest_selection_honors_variant(void) {
@@ -1805,6 +1871,51 @@ static void test_reconnect_reader_removes_staging_after_rc(void) {
     free_runtime(&rt);
 }
 
+static void test_launch_phase_announcements(void) {
+    instance_runtime rt;
+    instance_services svc;
+    launch_options opts = default_options();
+    state_store *store;
+    char root[256];
+    long pin;
+    long binding;
+    long build;
+    int rc;
+
+    reset_all();
+    store = open_temp_state(root, sizeof root);
+    CHECK(store != NULL, "temp state store opens");
+    if (store == NULL) {
+        return;
+    }
+    make_runtime(&rt, &svc);
+    rt.state = store;
+    snprintf(record_ip, sizeof record_ip, "%s", "0.0.0.0");
+
+    rc = launch_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_OK, "success path with state exits 0");
+    CHECK(stream_contains(rt.err, "host key pinned for i-new"),
+          "a successful host-key pin is announced");
+    CHECK(stream_contains(rt.err, "fingerprint SHA256:"),
+          "the pin announcement includes the fingerprint");
+    CHECK(stream_contains(rt.err,
+                          "recorded known-hosts binding i-new -> "
+                          "box.example.com (198.51.100.50)"),
+          "a successful known-hosts binding write is announced");
+    CHECK(stream_contains(rt.err,
+                          "building the setup command (entrypoint deploy.sh, "
+                          "staging /run/stackctl-setup."),
+          "setup command assembly is announced before it runs");
+    pin = stream_position(rt.err, "host key pinned for i-new");
+    binding = stream_position(rt.err, "recorded known-hosts binding i-new");
+    build = stream_position(rt.err, "building the setup command");
+    CHECK(pin >= 0 && binding > pin && build > binding,
+          "phase announcements appear in pin, binding, setup-build order");
+    free_runtime(&rt);
+    close_temp_state(store, root);
+}
+
 static void test_launch_progress_lines(void) {
     instance_runtime rt;
     instance_services svc;
@@ -1881,6 +1992,7 @@ int main(void) {
     test_keep_on_failure_keeps_instance();
     test_hostkey_mismatch_is_exit3();
     test_pin_failure_is_exit3();
+    test_binding_write_failure_announced();
     test_manifest_selection_honors_variant();
     test_manifest_ambiguity_is_exit1();
     test_manifest_missing_member_is_exit3();
@@ -1903,6 +2015,7 @@ int main(void) {
     test_ami_preflight_checks_every_declared_arch();
     test_ami_preflight_names_arch_missing_from_region();
     test_reconnect_reader_removes_staging_after_rc();
+    test_launch_phase_announcements();
     test_launch_progress_lines();
     test_running_waiter_reports_elapsed_progress();
 

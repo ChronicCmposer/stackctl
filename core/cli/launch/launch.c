@@ -301,8 +301,15 @@ static void describe_leftovers(const char *const *ids, size_t count, char *names
  * (snapshot IP only while it is still a live instance IP, else park).
  */
 static int launch_fail(instance_runtime *rt, const launch_options *opts,
-                       const char *new_id, const char *snapshot_ip, int code) {
+                       const char *new_id, const char *snapshot_ip,
+                       const char *reason, int code) {
     int cleanup_failed = 0;
+
+    if (reason != NULL) {
+        instance_err(rt,
+                     "stackctl: launch failed (%s) — terminating the instance\n",
+                     reason);
+    }
 
     if (new_id != NULL && !opts->keep_on_failure) {
         const char *ids[1] = {new_id};
@@ -1221,7 +1228,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
         memset(password, 0, sizeof password);
         cfn_stack_list_free(&stacks);
         result = launch_fail(rt, opts, run_result.instance_id, snapshot_ip,
-                             status);
+                             "waiter failed", status);
         return result;
     }
     snprintf(new_ip, sizeof new_ip, "%s",
@@ -1243,7 +1250,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             memset(password, 0, sizeof password);
             cfn_stack_list_free(&stacks);
             result = launch_fail(rt, opts, run_result.instance_id, snapshot_ip,
-                                 CLI_EXIT_LAUNCH);
+                                 "DDNS update failed", CLI_EXIT_LAUNCH);
             return result;
         }
     }
@@ -1258,6 +1265,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
         size_t print_count = 0;
         int strict_yes = 1;
         int failure = 0;
+        const char *failure_reason = "host-key verification failed";
         int attempts = rt->ssh_attempts > 0 ? rt->ssh_attempts : 1;
         int console_error = 0;
 
@@ -1346,10 +1354,22 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             instance_err(rt, "stackctl: pinning the host key for %s\n",
                          run_result.instance_id);
         }
-        if (failure == 0 &&
-            rt->svc.kh_pin(known_hosts_path(rt), run_result.instance_id,
-                           key_line) != 0) {
-            failure = CLI_EXIT_VERIFY;
+        if (failure == 0) {
+            int pin_rc = rt->svc.kh_pin(known_hosts_path(rt),
+                                        run_result.instance_id, key_line);
+
+            if (pin_rc != 0) {
+                instance_err(rt,
+                             "stackctl: pinning the host key failed: %s\n",
+                             strerror(pin_rc));
+                failure = CLI_EXIT_VERIFY;
+                failure_reason = "host-key pin failed";
+            } else {
+                instance_err(rt,
+                             "stackctl: host key pinned for %s "
+                             "(fingerprint %s)\n",
+                             run_result.instance_id, fingerprint);
+            }
         }
         if (failure == 0 && rt->state != NULL) {
             kh_binding binding;
@@ -1362,7 +1382,17 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             snprintf(binding.fqdn, sizeof binding.fqdn, "%s", fqdn);
             snprintf(binding.ip, sizeof binding.ip, "%s", new_ip);
             if (state_binding_put(rt->state, &binding) != 0) {
+                instance_err(rt,
+                             "stackctl: recording the known-hosts binding "
+                             "failed (instance id already bound to a different "
+                             "key?)\n");
                 failure = CLI_EXIT_VERIFY; /* same id + changed key = EPERM */
+                failure_reason = "binding write failed";
+            } else {
+                instance_err(rt,
+                             "stackctl: recorded known-hosts binding %s -> "
+                             "%s (%s)\n",
+                             run_result.instance_id, fqdn, new_ip);
             }
         }
         free(console);
@@ -1372,7 +1402,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
 
             cfn_stack_list_free(&stacks);
             result = launch_fail(rt, opts, run_result.instance_id, snapshot_ip,
-                                 failure);
+                                 failure_reason, failure);
             return result;
         }
 
@@ -1389,7 +1419,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             if (delivered != CLI_EXIT_OK) {
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, delivered);
+                                   snapshot_ip, "DDNS password delivery failed",
+                                   delivered);
             }
         }
 
@@ -1407,12 +1438,19 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
             int remote_rc = 0;
             int ssh_rc;
 
+            instance_err(rt,
+                         "stackctl: building the setup command (entrypoint "
+                         "%s, staging /run/stackctl-setup.%s)\n",
+                         rt->cfg.setup_entrypoint, nonce);
             if (build_setup_command(rt, stack, arch, opts->variant, member,
                                     member_sha, nonce, command,
                                     sizeof command) != 0) {
+                instance_err(rt,
+                             "stackctl: building the setup command failed\n");
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, CLI_EXIT_USAGE);
+                                   snapshot_ip, "setup command build failed",
+                                   CLI_EXIT_USAGE);
             }
             snprintf(stage_dir, sizeof stage_dir, "/run/stackctl-setup.%s",
                      nonce);
@@ -1442,7 +1480,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                                 &argv) != 0) {
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, CLI_EXIT_USAGE);
+                                   snapshot_ip, "setup command build failed",
+                                   CLI_EXIT_USAGE);
             }
             reconnect_operands[0] = new_ip;
             reconnect_operands[1] = rc_command;
@@ -1451,7 +1490,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                 sshc_argv_free(argv);
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, CLI_EXIT_USAGE);
+                                   snapshot_ip, "setup command build failed",
+                                   CLI_EXIT_USAGE);
             }
             {
                 sshc_sentinel_spec sentinel = {
@@ -1493,21 +1533,23 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                 cli_signal_mark_consumed();
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, CLI_EXIT_LAUNCH);
+                                   snapshot_ip, "setup interrupted",
+                                   CLI_EXIT_LAUNCH);
             }
             if (ssh_rc == ETIMEDOUT) {
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, CLI_EXIT_LAUNCH);
+                                   snapshot_ip, "setup timed out",
+                                   CLI_EXIT_LAUNCH);
             }
             if (ssh_rc == ENOTCONN) {
                 (void)instance_fail(rt, CLI_EXIT_SSH,
                                     "SSH transport failure during setup");
                 ssh_hint(rt);
                 cfn_stack_list_free(&stacks);
-                return launch_fail(
-                    rt, opts, run_result.instance_id, snapshot_ip,
-                    CLI_EXIT_SSH);
+                return launch_fail(rt, opts, run_result.instance_id,
+                                   snapshot_ip,
+                                   "setup SSH transport failed", CLI_EXIT_SSH);
             }
             if (ssh_rc != 0) {
                 (void)instance_fail(rt, CLI_EXIT_SSH,
@@ -1516,7 +1558,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                 ssh_hint(rt);
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, CLI_EXIT_SSH);
+                                   snapshot_ip, "setup SSH session failed",
+                                   CLI_EXIT_SSH);
             }
             if (remote_rc != 0) {
                 int setup_failure = remote_rc == CLI_EXIT_VERIFY
@@ -1529,7 +1572,8 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                              remote_rc);
                 cfn_stack_list_free(&stacks);
                 return launch_fail(rt, opts, run_result.instance_id,
-                                   snapshot_ip, setup_failure);
+                                   snapshot_ip, "setup failed",
+                                   setup_failure);
             }
         }
     }
@@ -1659,6 +1703,7 @@ int launch_execute(instance_runtime *rt, const launch_options *opts) {
                          strerror(record_rc), run_result.instance_id);
             cfn_stack_list_free(&stacks);
             return launch_fail(rt, opts, run_result.instance_id, snapshot_ip,
+                               "launch record write failed",
                                CLI_EXIT_CLEANUP);
         }
     }
