@@ -10,8 +10,9 @@
  *   - IAM `CreateAccessKey`    (Version=2010-05-08, service "iam")
  *   - IAM `DeleteAccessKey`    (Version=2010-05-08, service "iam")
  *
- * IAM and STS are global services; requests are signed for `us-east-1`, the
- * SigV4 region of their global endpoints.
+ * IAM's Query API is global and served from `iam.amazonaws.com`; STS uses its
+ * regional endpoint (`sts.<region>.amazonaws.com`). Both are signed for
+ * `us-east-1`, the SigV4 region of IAM's global endpoint.
  *
  * Error model: functions return 0 on success and a positive errno-style code
  * otherwise; out-params are untouched on failure. AWS error documents are

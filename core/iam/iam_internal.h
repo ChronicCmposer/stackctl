@@ -19,6 +19,10 @@ extern "C" {
 #define IAM_STS_API_VERSION "2011-06-15"
 #define IAM_API_VERSION "2010-05-08"
 #define IAM_SIGNING_REGION "us-east-1"
+/* IAM is a global service: its Query endpoint is iam.amazonaws.com, signed for
+ * us-east-1. The regional host (iam.us-east-1.amazonaws.com) rejects Query
+ * POSTs with HTTP 415. STS, by contrast, keeps its regional host. */
+#define IAM_GLOBAL_ENDPOINT "iam.amazonaws.com"
 #define IAM_ERROR_CODE_MAX 128
 #define IAM_ERROR_MESSAGE_MAX 512
 

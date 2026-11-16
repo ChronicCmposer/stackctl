@@ -193,6 +193,14 @@ int aws_build_url(const aws_ctx *ctx, const aws_req *req,
         memcpy(host, authority, authority_len);
         host[authority_len] = '\0';
         base_path = authority + authority_len;
+    } else if (req->host != NULL) {
+        if (req->host[0] == '\0') {
+            return EINVAL;
+        }
+        host = strdup(req->host);
+        if (host == NULL) {
+            return ENOMEM;
+        }
     } else {
         size_t need = strlen(req->service) + strlen(req->region) +
                       sizeof(".amazonaws.com") + 2;

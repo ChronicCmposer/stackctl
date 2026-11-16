@@ -53,6 +53,12 @@ typedef struct aws_header {
  *   body             Request body bytes, or NULL for none.
  *   body_len         Length of `body` in bytes.
  *   content_type     Optional Content-Type header value, or NULL.
+ *   host             Optional explicit host used verbatim as the URL authority
+ *                    and Host header, without regional splicing. SigV4 still
+ *                    signs with `service`/`region`. NULL (or zero-init) means
+ *                    synthesize `<service>.<region>.amazonaws.com`. A
+ *                    non-NULL value must be non-empty. The STACKCTL_ENDPOINT_URL
+ *                    test override, when configured, takes precedence.
  *   unsigned_payload Non-zero to sign with the literal `UNSIGNED-PAYLOAD`
  *                    (S3 PUT/GET); otherwise the SHA-256 of the body is signed.
  *   extra_headers    Optional array of `extra_header_count` outbound header
@@ -75,6 +81,7 @@ typedef struct aws_req {
     const void *body;
     size_t body_len;
     const char *content_type;
+    const char *host;
     int unsigned_payload;
     const char *const *extra_headers;
     size_t extra_header_count;

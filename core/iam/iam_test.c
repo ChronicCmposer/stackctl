@@ -75,6 +75,7 @@ typedef struct fake_transport {
     char method[16];
     char path[16];
     char content_type[64];
+    char host[128];
     char body[8192];
     int unsigned_payload;
 } fake_transport;
@@ -110,6 +111,8 @@ static int fake_send(aws_ctx *aws, const aws_req *req, aws_resp *resp, void *ud)
              req->path != NULL ? req->path : "");
     snprintf(fake->content_type, sizeof fake->content_type, "%s",
              req->content_type != NULL ? req->content_type : "");
+    snprintf(fake->host, sizeof fake->host, "%s",
+             req->host != NULL ? req->host : "");
     fake->unsigned_payload = req->unsigned_payload;
     if (req->body != NULL) {
         size_t length = req->body_len;
@@ -303,6 +306,8 @@ static void test_get_caller_identity(void)
     CHECK_STR(user_id, "AIDAEXAMPLEUSERID");
     CHECK_STR(fake.service, "sts");
     CHECK_STR(fake.region, "us-east-1");
+    /* STS keeps its regional host; no explicit override. */
+    CHECK_STR(fake.host, "");
     CHECK_STR(fake.method, "POST");
     CHECK_STR(fake.path, "/");
     CHECK_STR(fake.content_type, "application/x-www-form-urlencoded");
@@ -340,6 +345,8 @@ static void test_list_access_keys_own_user(void)
     }
     CHECK_STR(fake.service, "iam");
     CHECK_STR(fake.region, "us-east-1");
+    /* IAM is global: the request targets iam.amazonaws.com explicitly. */
+    CHECK_STR(fake.host, "iam.amazonaws.com");
     CHECK(body_has(&fake, "Action=ListAccessKeys"));
     CHECK(body_has(&fake, "Version=2010-05-08"));
     CHECK(!body_has(&fake, "UserName="));

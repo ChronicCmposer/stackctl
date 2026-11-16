@@ -258,6 +258,46 @@ static void test_build_url_default_endpoint(void)
     free(home);
 }
 
+static void test_build_url_host_override(void)
+{
+    char *home = make_home();
+    setenv("HOME", home, 1);
+    unsetenv("STACKCTL_ENDPOINT_URL");
+
+    aws_ctx *ctx = NULL;
+    CHECK(aws_init(&ctx, "default") == 0, "aws_init for host override");
+
+    aws_req req = {
+        .service = "iam",
+        .region = "us-east-1",
+        .method = "POST",
+        .path = "/",
+        .host = "iam.amazonaws.com",
+    };
+    char *url = NULL;
+    char *host = NULL;
+    CHECK(aws_build_url(ctx, &req, &url, &host) == 0, "build_url host override");
+    CHECK(url != NULL && strcmp(url, "https://iam.amazonaws.com/") == 0,
+        "explicit host used verbatim, no region splicing");
+    CHECK(host != NULL && strcmp(host, "iam.amazonaws.com") == 0,
+        "Host header uses the explicit host");
+    free(url);
+    free(host);
+
+    aws_req empty = {
+        .service = "iam",
+        .region = "us-east-1",
+        .method = "POST",
+        .path = "/",
+        .host = "",
+    };
+    CHECK(aws_build_url(ctx, &empty, &url, &host) != 0,
+        "empty host override rejected");
+
+    aws_free(ctx);
+    free(home);
+}
+
 static void test_build_url_endpoint_override(void)
 {
     char *home = make_home();
@@ -536,6 +576,7 @@ int main(void)
     test_credentials_size_limit();
     test_build_url_default_endpoint();
     test_build_url_endpoint_override();
+    test_build_url_host_override();
     test_retry_policy_and_backoff();
     test_wait();
     test_response_helpers();

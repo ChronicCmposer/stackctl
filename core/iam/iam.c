@@ -414,6 +414,8 @@ static int iam_call(aws_ctx *ctx, const char *service, const char *action,
         .body = body,
         .body_len = body_length,
         .content_type = "application/x-www-form-urlencoded",
+        /* IAM's Query API is global; STS keeps its regional host. */
+        .host = strcmp(service, "iam") == 0 ? IAM_GLOBAL_ENDPOINT : NULL,
         .unsigned_payload = 0,
     };
 
