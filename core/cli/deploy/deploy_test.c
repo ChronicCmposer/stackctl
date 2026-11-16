@@ -1521,7 +1521,7 @@ static void test_spot_alert_params(void) {
     }
 }
 
-/* F11: ImageBuilderParentImage is passed iff the config key is set. */
+/* F11: ImageBuilderParentImage is required when the builder is on. */
 static void test_image_builder_parent_image_param(void) {
     fixture fx;
     fake f = {0};
@@ -1530,7 +1530,7 @@ static void test_image_builder_parent_image_param(void) {
 
     fixture_init(&fx);
     fixture_write_env_custom_builder(&fx, "443", "", "true",
-                                     "IMAGE_BUILDER_PARENT_IMAGE=ami-parent123\n");
+                                     "IMAGE_BUILDER_PARENT_IMAGE=ami-0198b63ccfac121e8\n");
     cfg = load_config(&fx);
     CHECK(cfg != NULL, "builder-parent config loads");
     if (cfg == NULL) {
@@ -1540,26 +1540,37 @@ static void test_image_builder_parent_image_param(void) {
     CHECK(deploy_run(&env) == CLI_EXIT_OK, "builder-parent deploy succeeds");
     CHECK(fake_param_value(&f, "ImageBuilderParentImage") != NULL &&
               strcmp(fake_param_value(&f, "ImageBuilderParentImage"),
-                     "ami-parent123") == 0,
+                     "ami-0198b63ccfac121e8") == 0,
           "ImageBuilderParentImage passed when set");
     config_free(cfg);
 
-    /* Unset: the parameter is omitted. */
+    /* Builder on without a parent fails closed at the config boundary. */
     {
         fixture fx2;
-        fake f2 = {0};
 
         fixture_init(&fx2);
         fixture_write_env_custom_builder(&fx2, "443", "", "true", NULL);
         cfg = load_config(&fx2);
-        CHECK(cfg != NULL, "builder config without parent loads");
+        CHECK(cfg == NULL, "builder config without parent rejected");
+        config_free(cfg);
+    }
+
+    /* Builder off: the parameter is omitted. */
+    {
+        fixture fx3;
+        fake f3 = {0};
+
+        fixture_init(&fx3);
+        fixture_write_env_custom_builder(&fx3, "443", "", "false", NULL);
+        cfg = load_config(&fx3);
+        CHECK(cfg != NULL, "builder-off config loads");
         if (cfg == NULL) {
             return;
         }
-        env = make_env(&f2, cfg, &fx2);
-        CHECK(deploy_run(&env) == CLI_EXIT_OK, "builder deploy succeeds");
-        CHECK(fake_param_value(&f2, "ImageBuilderParentImage") == NULL,
-              "ImageBuilderParentImage absent when unset");
+        env = make_env(&f3, cfg, &fx3);
+        CHECK(deploy_run(&env) == CLI_EXIT_OK, "builder-off deploy succeeds");
+        CHECK(fake_param_value(&f3, "ImageBuilderParentImage") == NULL,
+              "ImageBuilderParentImage absent when builder off");
         config_free(cfg);
     }
 }

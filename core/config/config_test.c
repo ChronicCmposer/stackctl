@@ -974,11 +974,23 @@ static void test_optional_keys(void) {
     static const kv missing_prefixes[] = {{"RELEASE_PREFIXES", NULL}};
     static const kv parent_on[] = {
         {"ENABLE_IMAGE_BUILDER", "true"},
+        {"IMAGE_BUILDER_PARENT_IMAGE", "ami-0198b63ccfac121e8"}};
+    static const kv parent_arn[] = {
+        {"ENABLE_IMAGE_BUILDER", "true"},
         {"IMAGE_BUILDER_PARENT_IMAGE",
-         "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"}};
+         "arn:aws:ssm:us-east-2:123456789012:parameter/"
+         "aws/service/ami-amazon-linux-latest/"
+         "al2023-ami-kernel-default-x86_64"}};
+    static const kv parent_missing[] = {
+        {"ENABLE_IMAGE_BUILDER", "true"},
+        {"IMAGE_BUILDER_PARENT_IMAGE", NULL}};
+    static const kv parent_bare_path[] = {
+        {"ENABLE_IMAGE_BUILDER", "true"},
+        {"IMAGE_BUILDER_PARENT_IMAGE",
+         "/aws/service/ami-amazon-linux-latest/"
+         "al2023-ami-kernel-default-x86_64"}};
     static const kv parent_off[] = {
-        {"IMAGE_BUILDER_PARENT_IMAGE",
-         "/aws/service/ami-amazon-linux-latest/x"}};
+        {"IMAGE_BUILDER_PARENT_IMAGE", "ami-0198b63ccfac121e8"}};
     static const kv parent_empty[] = {
         {"ENABLE_IMAGE_BUILDER", "true"},
         {"IMAGE_BUILDER_PARENT_IMAGE", ""}};
@@ -1026,13 +1038,35 @@ static void test_optional_keys(void) {
 
         CHECK(cfg != NULL, "builder parent under builder-on loads");
         CHECK(parent != NULL &&
-                  strcmp(parent, "/aws/service/ami-amazon-linux-latest/"
-                                  "al2023-ami-kernel-default-x86_64") == 0,
+                  strcmp(parent, "ami-0198b63ccfac121e8") == 0,
               "builder parent preserved");
         config_free(cfg);
         free(root);
         free(dir);
     }
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg = load_valid_repo(
+            "builder parent accepts a full SSM ARN", parent_arn,
+            ARRAY_LEN(parent_arn), &root, &dir);
+
+        CHECK(cfg != NULL, "builder parent accepts a full SSM ARN");
+        if (cfg != NULL) {
+            CHECK(strcmp(config_image_builder_parent_image(cfg),
+                         "arn:aws:ssm:us-east-2:123456789012:parameter/"
+                         "aws/service/ami-amazon-linux-latest/"
+                         "al2023-ami-kernel-default-x86_64") == 0,
+                  "SSM parameter ARN preserved verbatim");
+        }
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
+    expect_invalid_msg("builder parent required when builder on", parent_missing,
+                       ARRAY_LEN(parent_missing), "IMAGE_BUILDER_PARENT_IMAGE");
+    expect_invalid_msg("bare SSM path builder parent rejected", parent_bare_path,
+                       ARRAY_LEN(parent_bare_path), "must be an EC2 AMI id");
     expect_invalid_msg("builder parent rejected when builder off", parent_off,
                        ARRAY_LEN(parent_off), "ENABLE_IMAGE_BUILDER");
     expect_invalid_msg("empty builder parent rejected", parent_empty,

@@ -174,8 +174,9 @@ Validation is fail-closed at startup, before any AWS call:
   `<project>-*` resource names is unambiguous. `N` is derived so the longest bucket name fits
   S3's 63-character limit in the configured region.
 - Cross-key rules are enforced, for example `ARCH=arm64` requires `INSTANCE_TYPES_ARM64`,
-  `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`, `IMAGE_BUILDER_PARENT_IMAGE` is valid
-  only when `ENABLE_IMAGE_BUILDER=true`, and DDNS keys are required together.
+  `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`, `ENABLE_IMAGE_BUILDER=true` requires
+  `IMAGE_BUILDER_PARENT_IMAGE` (an EC2 AMI id or a full SSM parameter ARN), and DDNS keys are
+  required together.
 - Ingress rules are fully parsed at config load. Each item is `port` or `port:cidr`; IPv4 only,
   no port ranges, strict CIDR (host bits must be clear), no exact duplicate `port:cidr` pairs,
   and at most 8 rules per protocol. Malformed input exits 1 before any AWS call.
@@ -203,7 +204,7 @@ Validation is fail-closed at startup, before any AWS call:
 | `SSH_USER` | no | SSH login user; default `ec2-user`. No launch flag. |
 | `BUCKET_MODULES` | yes | Comma list drawn from `artifact` and `cert`. |
 | `ENABLE_IMAGE_BUILDER` | yes | `true`/`false`; toggles Image Builder roles and the pipeline. |
-| `IMAGE_BUILDER_PARENT_IMAGE` | builder | Image Builder parent image; valid only when `ENABLE_IMAGE_BUILDER=true`. |
+| `IMAGE_BUILDER_PARENT_IMAGE` | builder | Required when builder on: AMI id or full SSM ARN; no default. |
 | `ENABLE_SPOT_ALERTS` | no | `true`/`false` (default false); adds the SNS spot-interruption alert module. |
 | `SPOT_ALERT_EMAIL` | spot alerts | Required when `ENABLE_SPOT_ALERTS=true`; SNS email target. |
 | `PERMISSIONS_BOUNDARY_ARN` | no | IAM permissions-boundary ARN, applied to the instance role only. |
@@ -334,7 +335,8 @@ deploy [--tag <vX.Y.Z>] [--allow-dirty] [--skip-build]
    record the release in stack tags `stackctl:release-tag` / `stackctl:release-sha` and in the
    `ReleaseTag` / `ReleaseManifestSha256` parameters referenced from resource metadata. The
    change set also carries the parsed ingress slots, `DdnsHost`/`DdnsDomain` when DDNS is
-   configured, the spot-alert parameters, and `ImageBuilderParentImage` when configured.
+   configured, and the spot-alert parameters; `ImageBuilderParentImage` is passed verbatim
+   when `ENABLE_IMAGE_BUILDER=true` (where it is required).
 6. **Prune.** Keep the 10 newest releases, protecting the stack-pinned tag, the previous
    rollback tag and the just-uploaded tag. A candidate is deleted only after a cheap check of
    its manifest and members; anything unverifiable is kept with a warning.

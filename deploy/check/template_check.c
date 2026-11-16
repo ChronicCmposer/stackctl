@@ -1849,6 +1849,27 @@ static void check_baked_distribution_publish(checker *c, const node *root) {
     if (resources == NULL || resources->kind != NODE_MAP) {
         return;
     }
+
+    /* The recipe must hand the parent image to Image Builder verbatim: a raw
+     * AMI id or a full SSM parameter ARN. Synthesizing an SSM ARN from a bare
+     * path (or baking a literal instead of the parameter) produces an invalid
+     * ParentImage, so accept only `!Ref ImageBuilderParentImage`. */
+    const node *recipe = map_get(resources, "BakedImageRecipe");
+    if (recipe == NULL) {
+        violation(c, "BakedImageRecipe must be declared");
+    } else {
+        const node *parent =
+            map_get(map_get(recipe, "Properties"), "ParentImage");
+        /* Short-form intrinsics parse as opaque scalars, so a verbatim Ref is
+         * exactly this string. Fn::Sub and literals fail that equality. */
+        int plain_ref =
+            node_scalar_equals(parent, "!Ref ImageBuilderParentImage");
+        if (!plain_ref) {
+            violation(c, "BakedImageRecipe ParentImage must be "
+                         "!Ref ImageBuilderParentImage (no Fn::Sub or literal)");
+        }
+    }
+
     const node *distribution = NULL;
     for (size_t i = 0; i < resources->npairs; i++) {
         if (resource_is_type(resources->pairs[i].value,

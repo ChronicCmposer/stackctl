@@ -287,8 +287,9 @@ extra confirmation gate), but review the summary before applying:
   configured, so the stack metadata and `DdnsHost` output stop rendering the `-`
   default.
 
-The config allowlist grows from 34 to 36 keys: `IMAGE_BUILDER_PARENT_IMAGE` (valid
-only when `ENABLE_IMAGE_BUILDER=true`) and `PERMISSIONS_BOUNDARY_ARN` (an optional
+The config allowlist grows from 34 to 36 keys: `IMAGE_BUILDER_PARENT_IMAGE`
+(required when `ENABLE_IMAGE_BUILDER=true`; an EC2 AMI id or a full SSM parameter
+ARN) and `PERMISSIONS_BOUNDARY_ARN` (an optional
 ARN-shaped value). `RELEASE_PREFIXES` stays a required key but now permits an
 empty value. `PERMISSIONS_BOUNDARY_ARN` applies to the instance role **only** —
 not the CI user, the Image Builder roles, or the infra stack.
@@ -384,10 +385,12 @@ deploy.
 The distribution publishes the AMI id natively: Image Builder writes it to
 `/<project>/ami/baked/latest` through `SsmParameterConfigurations` during the
 distribution phase, so there is no EventBridge rule or SSM Automation document
-to manage. The parent image defaults to
-`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`; set
-`IMAGE_BUILDER_PARENT_IMAGE` (valid only with `ENABLE_IMAGE_BUILDER=true`) when
-the old pipeline used a different parent.
+to manage. There is no default parent image: when `ENABLE_IMAGE_BUILDER=true`,
+`IMAGE_BUILDER_PARENT_IMAGE` is required and must be an EC2 AMI id (`ami-...`) or
+a full SSM parameter ARN (`arn:aws:ssm:...`). The template passes the value to
+Image Builder verbatim, so a bare SSM path (for example
+`/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`) is
+rejected at config load; use the AMI id or the full parameter ARN instead.
 
 ### Release members
 

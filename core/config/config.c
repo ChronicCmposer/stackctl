@@ -191,6 +191,79 @@ static int arn_shape_is_valid(const char *value) {
     return last != NULL && last[1] != '\0';
 }
 
+/*
+ * Image Builder accepts a parent image in exactly two shapes: a raw EC2 AMI
+ * id, or a full SSM parameter ARN. A bare SSM parameter path is rejected
+ * because the service cannot resolve it without an account-owned ARN.
+ */
+static int ami_id_is_valid(const char *value) {
+    size_t len;
+
+    if (value == NULL || strncmp(value, "ami-", 4) != 0) {
+        return 0;
+    }
+    len = strlen(value + 4);
+    if (len < 8 || len > 17) {
+        return 0;
+    }
+    for (const char *hex = value + 4; *hex != '\0'; hex++) {
+        if (!((*hex >= '0' && *hex <= '9') || (*hex >= 'a' && *hex <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int ssm_parameter_arn_is_valid(const char *value) {
+    static const char prefix[] = "arn:aws:ssm:";
+    const char *region;
+    const char *account;
+    const char *resource;
+    size_t region_len;
+    size_t account_len;
+
+    if (value == NULL || strncmp(value, prefix, sizeof(prefix) - 1) != 0) {
+        return 0;
+    }
+    region = value + sizeof(prefix) - 1;
+    account = strchr(region, ':');
+    if (account == NULL) {
+        return 0;
+    }
+    region_len = (size_t)(account - region);
+    if (region_len == 0) {
+        return 0;
+    }
+    for (const char *c = region; c < account; c++) {
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') ||
+              *c == '-')) {
+            return 0;
+        }
+    }
+
+    account++;
+    resource = strchr(account, ':');
+    if (resource == NULL) {
+        return 0;
+    }
+    account_len = (size_t)(resource - account);
+    if (account_len != 12) {
+        return 0;
+    }
+    for (const char *c = account; c < resource; c++) {
+        if (*c < '0' || *c > '9') {
+            return 0;
+        }
+    }
+
+    resource++;
+    return strncmp(resource, "parameter/", 10) == 0 && resource[10] != '\0';
+}
+
+static int builder_parent_image_is_valid(const char *value) {
+    return ami_id_is_valid(value) || ssm_parameter_arn_is_valid(value);
+}
+
 static int parse_uint(const char *value, long min, long max, long *out) {
     char *end = NULL;
     long parsed;
@@ -639,15 +712,33 @@ static int validate_cross_keys(const config_envfile *env, const char *arch) {
                          "DDNS_HOST and DDNS_DOMAIN must be configured together");
     }
 
-    /* F11: a builder parent image is meaningful only with the builder on. */
-    if (builder_parent != NULL) {
+    /* F11: the builder needs a parent image in an Image Builder-accepted shape.
+     * The template passes it through verbatim, so a bare SSM path would reach
+     * the service as an invalid parent. */
+    {
         const char *builder = config_envfile_get(env, "ENABLE_IMAGE_BUILDER");
+        int builder_on = builder != NULL && strcmp(builder, "true") == 0;
 
-        if (builder_parent[0] == '\0') {
+        if (builder_parent != NULL && builder_parent[0] == '\0') {
             return cfg_error(EINVAL,
                              "IMAGE_BUILDER_PARENT_IMAGE must not be empty");
         }
-        if (builder == NULL || strcmp(builder, "true") != 0) {
+        if (builder_on) {
+            if (builder_parent == NULL) {
+                return cfg_error(
+                    EINVAL,
+                    "IMAGE_BUILDER_PARENT_IMAGE is required when "
+                    "ENABLE_IMAGE_BUILDER=true");
+            }
+            if (!builder_parent_image_is_valid(builder_parent)) {
+                return cfg_error(
+                    EINVAL,
+                    "IMAGE_BUILDER_PARENT_IMAGE \"%s\" must be an EC2 AMI id "
+                    "(ami-[0-9a-f]{8,17}) or a full SSM parameter ARN "
+                    "(arn:aws:ssm:<region>:<account>:parameter/<path>)",
+                    builder_parent);
+            }
+        } else if (builder_parent != NULL) {
             return cfg_error(EINVAL,
                              "IMAGE_BUILDER_PARENT_IMAGE is only valid when "
                              "ENABLE_IMAGE_BUILDER=true (ENABLE_IMAGE_BUILDER=%s)",

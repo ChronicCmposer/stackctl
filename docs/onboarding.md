@@ -146,7 +146,8 @@ OPERATOR_CIDR=203.0.113.0/24
 
 BUCKET_MODULES=artifact
 ENABLE_IMAGE_BUILDER=false
-# IMAGE_BUILDER_PARENT_IMAGE is valid only when ENABLE_IMAGE_BUILDER=true.
+# IMAGE_BUILDER_PARENT_IMAGE is required when ENABLE_IMAGE_BUILDER=true; it
+# takes an EC2 AMI id (ami-...) or a full SSM parameter ARN (arn:aws:ssm:...).
 ENABLE_SPOT_ALERTS=false
 # SPOT_ALERT_EMAIL=ops@example.com
 # PERMISSIONS_BOUNDARY_ARN=arn:aws:iam::123456789012:policy/operator-boundary
@@ -178,8 +179,10 @@ Rules that catch new maintainers:
 - `ARCH=arm64` requires `INSTANCE_TYPES_ARM64`; `ARCH=both` requires both lists
   and `launch --arch` at run time.
 - `BUCKET_MODULES` must include `artifact`; `cert` is optional.
-- `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`. `IMAGE_BUILDER_PARENT_IMAGE`
-  is valid only when `ENABLE_IMAGE_BUILDER=true`.
+- `ENABLE_SPOT_ALERTS=true` requires `SPOT_ALERT_EMAIL`. `ENABLE_IMAGE_BUILDER=true`
+  requires `IMAGE_BUILDER_PARENT_IMAGE`, which must be an EC2 AMI id (`ami-...`)
+  or a full SSM parameter ARN (`arn:aws:ssm:<region>:<account>:parameter/<path>`).
+  A bare SSM path is rejected; there is no default parent image.
 - `INGRESS_TCP`/`INGRESS_UDP` are comma lists of `port[:cidr]`; an omitted CIDR
   means `0.0.0.0/0`. Each protocol has at most 8 slots. IPv4 only, no port ranges,
   and the CIDR must not have host bits set. Malformed input fails config validation

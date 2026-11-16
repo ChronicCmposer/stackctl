@@ -84,6 +84,8 @@ int main(void) {
                 TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_infra_baked_distribution.yaml",
                 TC_MODE_INFRA);
+    expect_file(1, "deploy/check/testdata/bad_infra_baked_parent.yaml",
+                TC_MODE_INFRA);
 
     if (g_failures != 0) {
         fprintf(stderr, "%d/%d checks failed\n", g_failures, g_checks);
