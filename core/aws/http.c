@@ -171,6 +171,16 @@ static int curl_transport(aws_ctx *ctx, const aws_http_attempt *attempt,
     curl_easy_reset(handle);
     curl_easy_setopt(handle, CURLOPT_URL, attempt->url);
     curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, attempt->method);
+    /*
+     * CUSTOMREQUEST only rewrites the request line; curl still expects a
+     * response body. S3 answers HEAD with "Transfer-Encoding: chunked" and
+     * no body, so without NOBODY curl blocks on the keep-alive connection
+     * until the total timeout. NOBODY makes curl stop after the headers,
+     * which is the correct HEAD semantics (same as curl -I).
+     */
+    if (strcmp(attempt->method, "HEAD") == 0) {
+        curl_easy_setopt(handle, CURLOPT_NOBODY, 1L);
+    }
     curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, write_body);
     curl_easy_setopt(handle, CURLOPT_WRITEDATA, resp);
