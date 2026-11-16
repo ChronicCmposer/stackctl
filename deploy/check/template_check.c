@@ -624,10 +624,20 @@ static const char *const STAR_ALLOWED_ACTIONS[] = {
     "ec2:DescribeVpcs",
     "ec2:DescribeSubnets",
     "ec2:DescribeSecurityGroups",
+    "ec2:DescribeSecurityGroupRules",
     "ec2:DescribeKeyPairs",
     "ec2:DescribeVolumes",
     "ec2:DescribeInstanceStatus",
     "ec2:DescribeSpotPriceHistory",
+    /* VPC-lifecycle reads the CFN resource handlers issue under the caller's
+     * identity (same read-only class as the entries above). */
+    "ec2:DescribeInternetGateways",
+    "ec2:DescribeRouteTables",
+    "ec2:DescribeAvailabilityZones",
+    "ec2:DescribeNetworkInterfaces",
+    "ec2:DescribeTags",
+    "ec2:DescribeVpcAttribute",
+    "ec2:DescribeSubnetAttribute",
 };
 
 static int action_star_allowed(const char *action) {

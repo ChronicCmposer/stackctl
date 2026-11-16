@@ -265,10 +265,24 @@ Resources:
               - ec2:DescribeVpcs
               - ec2:DescribeSubnets
               - ec2:DescribeSecurityGroups
+              - ec2:DescribeSecurityGroupRules
               - ec2:DescribeKeyPairs
               - ec2:DescribeVolumes
               - ec2:DescribeInstanceStatus
               - ec2:DescribeSpotPriceHistory
+              # VPC-lifecycle reads the CloudFormation resource handlers issue
+              # under the caller's identity (live failures during the
+              # strimserver pilot rollback: DescribeInternetGateways; the rest
+              # of the set is the complete handler read surface for the
+              # VPC/subnet/IGW/route-table/SG resources this template's infra
+              # stack creates).
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeRouteTables
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeTags
+              - ec2:DescribeVpcAttribute
+              - ec2:DescribeSubnetAttribute
             Resource: "*"
           # The infra stack creates the baked-image Image Builder
           # component/recipe/infrastructure/distribution/pipeline as this
