@@ -7,7 +7,7 @@ built from source with the hermetic zig cc musl toolchain. See
 
 module(
     name = "stackctl",
-    version = "0.1.19",
+    version = "0.1.20",
 )
 
 # The module version above duplicates the committed VERSION file: bzlmod cannot

@@ -69,6 +69,7 @@ cc_test(
         "testdata/bad_operator_missing_imagebuilder_perms.yaml",
         "testdata/bad_operator_missing_user_policy.yaml",
         "testdata/bad_operator_resource_intrinsic.yaml",
+        "testdata/bad_operator_runinstances_createaction.yaml",
         "testdata/bad_operator_wildcard.yaml",
         "//deploy:stackctl-infra.yaml",
         "//deploy:stackctl-operator.yaml",

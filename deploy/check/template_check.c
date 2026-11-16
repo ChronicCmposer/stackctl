@@ -1737,8 +1737,11 @@ static void check_operator(checker *c, const node *root) {
         violation(c, "RunInstances is not tag-gated");
     } else {
         const node *condition = map_get(run, "Condition");
-        if (!node_contains(condition, "ec2:CreateAction")) {
-            violation(c, "RunInstances condition lacks ec2:CreateAction");
+        /* ec2:CreateAction is absent while IAM evaluates RunInstances itself, so
+         * gating the grant on it makes the statement never match. It belongs only
+         * on the tag-on-create CreateTags statement below. */
+        if (node_contains(condition, "ec2:CreateAction")) {
+            violation(c, "RunInstances must not be gated by ec2:CreateAction");
         }
         if (!node_contains(condition, "ec2:InstanceType")) {
             violation(c, "RunInstances condition lacks the instance-type allowlist");

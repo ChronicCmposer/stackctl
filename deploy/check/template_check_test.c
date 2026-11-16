@@ -64,6 +64,8 @@ int main(void) {
     /* Each negative fixture is otherwise-valid and violates exactly the one
      * named rule, so a regression in any single check fails its own test. */
     expect_file(1, "deploy/check/testdata/bad_operator_wildcard.yaml", TC_MODE_OPERATOR);
+    expect_file(1, "deploy/check/testdata/bad_operator_runinstances_createaction.yaml",
+                TC_MODE_OPERATOR);
     expect_file(1, "deploy/check/testdata/bad_infra_ami_asymmetry.yaml", TC_MODE_INFRA);
     expect_file(1, "deploy/check/testdata/bad_infra_ami_asymmetry_unref.yaml",
                 TC_MODE_INFRA);
