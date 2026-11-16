@@ -284,7 +284,7 @@ siblings (a union). Clearing a key in the active `.env` alone does not disable t
 CI user if a sibling still lists prefixes; clear it in every sibling.
 
 When set, `PERMISSIONS_BOUNDARY_ARN` applies the boundary to the instance role
-only. The Image Builder and publish roles, and the infra stack, stay unbounded.
+only. The Image Builder roles, and the infra stack, stay unbounded.
 
 ```bash
 bazel run //deploy/aws:stackctl -- provision --dry-run

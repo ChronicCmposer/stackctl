@@ -438,7 +438,7 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: ec2.amazonaws.com
+              Service: imagebuilder.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: ImageBuilderExecution
@@ -452,31 +452,13 @@ Resources:
                 Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/releases/*
               - Sid: BakedAmiPublish
                 Effect: Allow
+                # Native distribution-phase publish writes the AMI id here.
+                # GetParameter backs the aws:ec2:image DataType validation.
+                # Region-wild because distribution may run cross-region.
                 Action:
                   - ssm:PutParameter
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/ami/baked/*
-  BakedAmiPublishRole:
-    Type: AWS::IAM::Role
-    Condition: EnableImageBuilderCondition
-    Properties:
-      RoleName: !Sub ${ProjectName}-baked-ami-publish-role
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ssm.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: BakedAmiPublish
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: PublishLatestAmi
-                Effect: Allow
-                Action:
-                  - ssm:PutParameter
-                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/ami/baked/latest
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/${ProjectName}/ami/baked/*
 Outputs:
   InstanceRoleArn:
     Value: !GetAtt InstanceRole.Arn

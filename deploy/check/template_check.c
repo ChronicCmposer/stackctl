@@ -1314,20 +1314,34 @@ static int trust_allows_service(const node *statement, const char *service) {
 }
 
 /*
- * BakedAmiPublishRole is assumed by SSM Automation (EventBridge -> SSM
- * Automation target), never by EC2 directly.  An EC2 trust principal here is
- * silently unusable, so fail closed on anything but ssm.amazonaws.com.
+ * The Image Builder pipeline runs under a service execution role owned by the
+ * operator stack.  That role must be assumable by imagebuilder.amazonaws.com
+ * (an EC2 trust is silently unusable) and must be able to publish the baked
+ * AMI id through the native distribution SsmParameterConfigurations.  Fail
+ * closed when either half is missing.
  */
-static void check_baked_ami_publish_role(checker *c, const node *root) {
-    const node *role = map_get(template_resources(root), "BakedAmiPublishRole");
+static void check_imagebuilder_execution_role(checker *c, const node *root) {
+    if (map_get(template_parameters(root), "EnableImageBuilder") == NULL) {
+        return;
+    }
+    const node *role = map_get(template_resources(root), "ImageBuilderExecutionRole");
     if (role == NULL) {
-        violation(c, "missing BakedAmiPublishRole resource");
+        violation(c, "missing ImageBuilderExecutionRole resource");
         return;
     }
     const node *properties = map_get(role, "Properties");
     const node *assume = map_get(properties, "AssumeRolePolicyDocument");
-    if (!trust_allows_service(map_get(assume, "Statement"), "ssm.amazonaws.com")) {
-        violation(c, "BakedAmiPublishRole must trust ssm.amazonaws.com (SSM Automation)");
+    const int trust_ok =
+        trust_allows_service(map_get(assume, "Statement"), "imagebuilder.amazonaws.com");
+
+    const node *publish = find_statement(role, "ssm:PutParameter");
+    const int publish_ok =
+        publish != NULL &&
+        node_contains(map_get(publish, "Resource"), "${ProjectName}/ami/baked/");
+
+    if (!trust_ok || !publish_ok) {
+        violation(c, "ImageBuilderExecutionRole must trust imagebuilder.amazonaws.com "
+                     "and grant ssm:PutParameter on ${ProjectName}/ami/baked/*");
     }
 }
 
@@ -1420,7 +1434,7 @@ static void check_operator(checker *c, const node *root) {
 
     check_operator_role_resources(c, root);
     check_operator_user(c, root);
-    check_baked_ami_publish_role(c, root);
+    check_imagebuilder_execution_role(c, root);
     check_operator_image_builder_permissions(c, root);
     check_operator_s3_scope(c, map_get(resources, "OperatorPolicy"));
 }
@@ -1752,6 +1766,61 @@ static void check_app_ingress(checker *c, const node *root) {
     }
 }
 
+/*
+ * The baked AMI pipeline publishes the output image natively: the distribution
+ * must name AMIs with the Image Builder buildDate token (the service rejects
+ * buildVersion) and carry SsmParameterConfigurations so Image Builder writes
+ * the AMI id to /<project>/ami/baked/latest during distribution.  The pipeline
+ * must also set its ExecutionRole, without which it never runs.  Each missing
+ * clause is its own violation.
+ */
+static void check_baked_distribution_publish(checker *c, const node *root) {
+    const node *resources = template_resources(root);
+    if (resources == NULL || resources->kind != NODE_MAP) {
+        return;
+    }
+    const node *distribution = NULL;
+    for (size_t i = 0; i < resources->npairs; i++) {
+        if (resource_is_type(resources->pairs[i].value,
+                             "AWS::ImageBuilder::DistributionConfiguration")) {
+            distribution = resources->pairs[i].value;
+            break;
+        }
+    }
+    if (distribution == NULL) {
+        return;
+    }
+    const node *properties = map_get(distribution, "Properties");
+    const node *distributions = map_get(properties, "Distributions");
+    const node *entry = scalar_at(distributions, 0);
+    if (entry == NULL || entry->kind != NODE_MAP) {
+        violation(c, "baked distribution must declare a Distributions entry");
+        return;
+    }
+    const node *ami = map_get(entry, "AmiDistributionConfiguration");
+    if (!node_contains(map_get(ami, "Name"), "{{ imagebuilder:buildDate }}")) {
+        violation(c, "baked AMI distribution Name must contain {{ imagebuilder:buildDate }}");
+    }
+    const node *ssm = map_get(entry, "SsmParameterConfigurations");
+    int publish_ok = 0;
+    for (size_t i = 0; i < scalar_count(ssm); i++) {
+        const node *config = scalar_at(ssm, i);
+        if (config != NULL && config->kind == NODE_MAP &&
+            node_contains(map_get(config, "ParameterName"),
+                          "/${ProjectName}/ami/baked/")) {
+            publish_ok = 1;
+        }
+    }
+    if (!publish_ok) {
+        violation(c, "baked distribution must publish to /${ProjectName}/ami/baked/ "
+                     "via SsmParameterConfigurations");
+    }
+    const node *pipeline = map_get(resources, "BakedImagePipeline");
+    if (pipeline == NULL || map_get(map_get(pipeline, "Properties"), "ExecutionRole") == NULL) {
+        violation(c, "BakedImagePipeline must set ExecutionRole");
+    }
+}
+
 static void check_infra(checker *c, const node *root) {
     check_required_params(c, root, INFRA_PARAMS,
                           sizeof(INFRA_PARAMS) / sizeof(INFRA_PARAMS[0]));
@@ -1761,6 +1830,7 @@ static void check_infra(checker *c, const node *root) {
     check_stack_name_contract(c, root);
     check_image_builder_references(c, root);
     check_ami_id_arch_symmetry(c, root);
+    check_baked_distribution_publish(c, root);
 
     const node *resources = template_resources(root);
     check_iam_node(c, resources);

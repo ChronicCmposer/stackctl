@@ -379,9 +379,12 @@ deploy.
 ### Baked image
 
 `ENABLE_IMAGE_BUILDER=true` turns on the `BakedImageComponent`,
-`BakedImageRecipe`, `BakedImageInfrastructure`, `BakedImageDistribution`,
-`BakedImagePipeline` and publish-role resources. `AMI_POLICY=baked` selects the
-pipeline output. The parent image defaults to
+`BakedImageRecipe`, `BakedImageInfrastructure`, `BakedImageDistribution` and
+`BakedImagePipeline` resources. `AMI_POLICY=baked` selects the pipeline output.
+The distribution publishes the AMI id natively: Image Builder writes it to
+`/<project>/ami/baked/latest` through `SsmParameterConfigurations` during the
+distribution phase, so there is no EventBridge rule or SSM Automation document
+to manage. The parent image defaults to
 `/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64`; set
 `IMAGE_BUILDER_PARENT_IMAGE` (valid only with `ENABLE_IMAGE_BUILDER=true`) when
 the old pipeline used a different parent.

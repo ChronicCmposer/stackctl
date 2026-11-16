@@ -5,6 +5,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files([
     "testdata/bad_infra_ami_asymmetry.yaml",
     "testdata/bad_infra_ami_asymmetry_unref.yaml",
+    "testdata/bad_infra_baked_distribution.yaml",
     "testdata/bad_infra_bucket.yaml",
     "testdata/bad_infra_export.yaml",
     "testdata/bad_infra_literal_cidr.yaml",
@@ -55,11 +56,12 @@ cc_test(
     data = [
         "testdata/bad_infra_ami_asymmetry.yaml",
         "testdata/bad_infra_ami_asymmetry_unref.yaml",
+        "testdata/bad_infra_baked_distribution.yaml",
         "testdata/bad_infra_bucket.yaml",
         "testdata/bad_infra_export.yaml",
         "testdata/bad_infra_literal_cidr.yaml",
         "testdata/bad_operator_action_intrinsic.yaml",
-        "testdata/bad_operator_baked_ami_trust.yaml",
+        "testdata/bad_operator_ib_execution_trust.yaml",
         "testdata/bad_operator_missing_imagebuilder_perms.yaml",
         "testdata/bad_operator_missing_user_policy.yaml",
         "testdata/bad_operator_resource_intrinsic.yaml",
