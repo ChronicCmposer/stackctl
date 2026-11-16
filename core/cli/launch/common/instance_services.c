@@ -105,7 +105,7 @@ int instance_keyscan_exec(const char *ip, int port, char **line_out) {
     ssize_t got;
     int status = 0;
     char port_text[16];
-    char *newline;
+    char *cursor;
 
     if (ip == NULL || line_out == NULL || port <= 0) {
         return EINVAL;
@@ -156,16 +156,32 @@ int instance_keyscan_exec(const char *ip, int port, char **line_out) {
     (void)waitpid(pid, &status, 0);
     buffer[used] = '\0';
 
-    newline = strchr(buffer, '\n');
-    if (newline != NULL) {
-        *newline = '\0';
+    /*
+     * ssh-keyscan prints one or more `#` banner/comment lines before the key
+     * line, so scan every line rather than trusting the first.
+     */
+    cursor = buffer;
+    for (;;) {
+        char *next = strchr(cursor, '\n');
+        char *start = cursor;
+
+        if (next != NULL) {
+            *next = '\0';
+        }
+        while (*start == ' ' || *start == '\t' || *start == '\r') {
+            start++;
+        }
+        if (*start != '\0' && *start != '#') {
+            *line_out = strdup(start);
+            if (*line_out == NULL) {
+                return ENOMEM;
+            }
+            return 0;
+        }
+        if (next == NULL) {
+            break;
+        }
+        cursor = next + 1;
     }
-    if (buffer[0] == '\0' || strncmp(buffer, "#", 1) == 0) {
-        return 0; /* no key produced yet */
-    }
-    *line_out = strdup(buffer);
-    if (*line_out == NULL) {
-        return ENOMEM;
-    }
-    return 0;
+    return 0; /* no key produced yet */
 }

@@ -186,6 +186,121 @@ static void test_tool_available(void) {
     rmdir(dir);
 }
 
+static int write_text_file(const char *path, const char *text) {
+    FILE *file = fopen(path, "w");
+    int rc;
+
+    if (file == NULL) {
+        return -1;
+    }
+    rc = fputs(text, file) >= 0 ? 0 : -1;
+    if (fclose(file) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+/*
+ * instance_keyscan_exec forks a real child, so drive it through the PATH seam:
+ * a fake `ssh-keyscan` execs `cat` on a fixture file selected by an environment
+ * variable. The cases mirror real ssh-keyscan output, which prefixes the key
+ * line with one or more `#` banner/comment lines.
+ */
+static void test_keyscan_exec(void) {
+    static const struct {
+        const char *label;
+        const char *output;
+        const char *expected; /* NULL means "no key line" */
+    } cases[] = {
+        {"banner then key",
+         "# 198.51.100.7:22 SSH-2.0-OpenSSH_9.9\n"
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYONE\n",
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYONE"},
+        {"multiple comments then key",
+         "# 198.51.100.7:22 SSH-2.0-OpenSSH_9.9\n"
+         "# 198.51.100.7:22 SSH-2.0-OpenSSH_9.9\n"
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYTWO\n",
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYTWO"},
+        {"comments only",
+         "# 198.51.100.7:22 SSH-2.0-OpenSSH_9.9\n"
+         "# 198.51.100.7:22 SSH-2.0-OpenSSH_9.9\n",
+         NULL},
+        {"empty output", "", NULL},
+        {"key first (legacy shape)",
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYLEGACY\n",
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYLEGACY"},
+        {"whitespace line then key",
+         "   \n\t\n"
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYWS\n",
+         "198.51.100.7 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKEYWS"},
+    };
+    char template[] = "/tmp/stackctl-keyscan-XXXXXX";
+    char dir[PATH_MAX];
+    char script[PATH_MAX];
+    char fixture[PATH_MAX];
+    char path[PATH_MAX * 2];
+    const char *saved_path = getenv("PATH");
+    char *saved_copy = saved_path != NULL ? strdup(saved_path) : NULL;
+    size_t i;
+
+    if (mkdtemp(template) == NULL) {
+        perror("mkdtemp");
+        exit(2);
+    }
+    if (snprintf(dir, sizeof dir, "%s", template) >= (int)sizeof dir ||
+        snprintf(script, sizeof script, "%s/ssh-keyscan", dir) >=
+            (int)sizeof script ||
+        snprintf(fixture, sizeof fixture, "%s/output", dir) >=
+            (int)sizeof fixture) {
+        exit(2);
+    }
+    if (write_text_file(script,
+                        "#!/bin/sh\n"
+                        "exec cat \"$STACKCTL_KEYSCAN_FIXTURE\"\n") != 0 ||
+        chmod(script, 0755) != 0) {
+        perror("fake ssh-keyscan");
+        exit(2);
+    }
+    /* Prepend the fake dir so `cat` still resolves through the rest of PATH. */
+    if (snprintf(path, sizeof path, "%s:%s", dir,
+                 saved_path != NULL ? saved_path : "") >= (int)sizeof path) {
+        exit(2);
+    }
+    CHECK(setenv("PATH", path, 1) == 0, "keyscan test PATH set");
+    CHECK(setenv("STACKCTL_KEYSCAN_FIXTURE", fixture, 1) == 0,
+          "keyscan fixture env set");
+
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char *line = (char *)0x1;
+        int rc;
+
+        if (write_text_file(fixture, cases[i].output) != 0) {
+            CHECK(0, cases[i].label);
+            continue;
+        }
+        rc = instance_keyscan_exec("198.51.100.7", 22, &line);
+        CHECK(rc == 0, cases[i].label);
+        if (cases[i].expected == NULL) {
+            CHECK(line == NULL, cases[i].label);
+        } else {
+            CHECK(line != NULL && strcmp(line, cases[i].expected) == 0,
+                  cases[i].label);
+        }
+        free(line);
+    }
+
+    unsetenv("STACKCTL_KEYSCAN_FIXTURE");
+    if (saved_copy != NULL) {
+        CHECK(setenv("PATH", saved_copy, 1) == 0, "keyscan test PATH restored");
+        free(saved_copy);
+    } else {
+        unsetenv("PATH");
+    }
+    unlink(script);
+    unlink(fixture);
+    rmdir(dir);
+}
+
 static void test_arch(void) {
     char out[16];
     const char *why = NULL;
@@ -346,6 +461,7 @@ int main(void) {
     test_console_fingerprints();
     test_manifest();
     test_tool_available();
+    test_keyscan_exec();
     test_arch();
     test_types();
     test_misc();
