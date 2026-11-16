@@ -2024,8 +2024,16 @@ typedef struct change_set_wait_ctx {
     const char *region;
     const char *stack_name;
     const char *change_set_name;
+    int track_no_changes;
     int failed;
+    int no_changes;
 } change_set_wait_ctx;
+
+/* AWS's fixed StatusReason when the submitted template and parameters make no
+ * changes to the stack. Matched as a substring because the message carries an
+ * appended instruction sentence. */
+static const char NO_CHANGES_REASON[] =
+    "didn't contain changes";
 
 static int change_set_wait_poll(aws_ctx *aws, void *ud, int *done)
 {
@@ -2039,8 +2047,26 @@ static int change_set_wait_poll(aws_ctx *aws, void *ud, int *done)
     }
     if (cs.status == CFN_CHANGE_SET_STATUS_CREATE_COMPLETE) {
         *done = 1;
-    } else if (cs.status == CFN_CHANGE_SET_STATUS_FAILED ||
-               cs.status == CFN_CHANGE_SET_STATUS_DELETE_COMPLETE ||
+    } else if (cs.status == CFN_CHANGE_SET_STATUS_FAILED) {
+        if (ctx->track_no_changes != 0 &&
+            strstr(cs.status_reason, NO_CHANGES_REASON) != NULL) {
+            ctx->no_changes = 1;
+            *done = 1;
+            fprintf(stderr,
+                    "stackctl: change set %s: no changes needed "
+                    "(stack already conforms)\n",
+                    ctx->change_set_name);
+        } else {
+            ctx->failed = 1;
+            *done = 1;
+            fprintf(stderr,
+                    "stackctl: change set %s reached %s: %s\n",
+                    ctx->change_set_name,
+                    cfn_change_set_status_string(cs.status),
+                    cs.status_reason[0] != '\0' ? cs.status_reason
+                                                : "(no reason reported)");
+        }
+    } else if (cs.status == CFN_CHANGE_SET_STATUS_DELETE_COMPLETE ||
                cs.status == CFN_CHANGE_SET_STATUS_DELETE_FAILED) {
         ctx->failed = 1;
         *done = 1;
@@ -2056,23 +2082,32 @@ static int change_set_wait_poll(aws_ctx *aws, void *ud, int *done)
 
 int cfn_wait_for_change_set(cfn_client *client, const char *region,
                             const char *stack_name, const char *change_set_name,
-                            int attempts, int interval_sec, int *timed_out)
+                            int attempts, int interval_sec, int *timed_out,
+                            int *no_changes)
 {
     if (client == NULL || region == NULL || change_set_name == NULL ||
         timed_out == NULL || attempts < 1) {
         return EINVAL;
+    }
+    if (no_changes != NULL) {
+        *no_changes = 0;
     }
     change_set_wait_ctx ctx = {
         .client = client,
         .region = region,
         .stack_name = stack_name,
         .change_set_name = change_set_name,
+        .track_no_changes = no_changes != NULL,
         .failed = 0,
+        .no_changes = 0,
     };
     int rc = aws_wait(client->aws, change_set_wait_poll, &ctx, attempts,
                       interval_sec, timed_out);
     if (rc != 0) {
         return rc;
+    }
+    if (no_changes != NULL) {
+        *no_changes = ctx.no_changes;
     }
     return ctx.failed ? ECANCELED : 0;
 }

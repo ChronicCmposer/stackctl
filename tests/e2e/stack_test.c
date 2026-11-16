@@ -328,7 +328,7 @@ static int p_create_cs(void *ud, cfn_client *client, const char *region,
 
 static int p_wait_cs(void *ud, cfn_client *client, const char *region,
                      const char *stack, const char *cs, int attempts,
-                     int interval, int *timed_out) {
+                     int interval, int *timed_out, int *no_changes) {
     pfake *f = ud;
 
     (void)client;
@@ -340,6 +340,9 @@ static int p_wait_cs(void *ud, cfn_client *client, const char *region,
     ptrace(f, PT_WAIT_CS);
     if (timed_out != NULL) {
         *timed_out = 0;
+    }
+    if (no_changes != NULL) {
+        *no_changes = 0;
     }
     return f->wait_cs_rc;
 }
@@ -909,7 +912,7 @@ static int d_create_cs(void *ud, cfn_client *client, const char *region,
 
 static int d_wait_cs(void *ud, cfn_client *client, const char *region,
                      const char *stack, const char *cs, int attempts,
-                     int interval, int *timed_out) {
+                     int interval, int *timed_out, int *no_changes) {
     dfake *f = ud;
 
     (void)client;
@@ -921,6 +924,9 @@ static int d_wait_cs(void *ud, cfn_client *client, const char *region,
     dtrace(f, DT_WAIT_CS);
     if (timed_out != NULL) {
         *timed_out = 0;
+    }
+    if (no_changes != NULL) {
+        *no_changes = 0;
     }
     return f->wait_cs_rc;
 }

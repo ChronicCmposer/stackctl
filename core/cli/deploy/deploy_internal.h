@@ -82,7 +82,8 @@ typedef struct deploy_ops {
                              cfn_change_set_result *out);
     int (*wait_change_set)(void *ud, cfn_client *client, const char *region,
                            const char *stack_name, const char *change_set_name,
-                           int attempts, int interval_sec, int *timed_out);
+                           int attempts, int interval_sec, int *timed_out,
+                           int *no_changes);
     int (*describe_change_set)(void *ud, cfn_client *client, const char *region,
                                const char *stack_name,
                                const char *change_set_name,

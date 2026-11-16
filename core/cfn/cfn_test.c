@@ -790,9 +790,11 @@ static void test_wait_for_change_set(void)
         "</DescribeChangeSetResponse>");
     fake_serve(&f, CHANGE_SET_EMPTY);
     int timed_out = -1;
+    int no_changes = -1;
     int rc = cfn_wait_for_change_set(client, "us-east-1", "proj-infra", "cs1",
-                                     5, 0, &timed_out);
-    CHECK(rc == 0 && timed_out == 0, "wait change set success");
+                                     5, 0, &timed_out, &no_changes);
+    CHECK(rc == 0 && timed_out == 0 && no_changes == 0,
+          "wait change set success");
     CHECK(f.count == 2, "change set polled twice");
 
     fake_clear(&f);
@@ -801,9 +803,42 @@ static void test_wait_for_change_set(void)
         "<Status>FAILED</Status><StatusReason>bad template</StatusReason>"
         "</DescribeChangeSetResult></DescribeChangeSetResponse>");
     timed_out = -1;
+    no_changes = -1;
     rc = cfn_wait_for_change_set(client, "us-east-1", "proj-infra", "cs1",
-                                 2, 0, &timed_out);
-    CHECK(rc == ECANCELED && timed_out == 0, "failed change set aborts wait");
+                                 2, 0, &timed_out, &no_changes);
+    CHECK(rc == ECANCELED && timed_out == 0 && no_changes == 0,
+          "failed change set aborts wait");
+
+    /* AWS reports an already-conforming stack as FAILED with this exact reason;
+     * it is success, not an error. */
+    fake_clear(&f);
+    fake_serve(&f,
+        "<DescribeChangeSetResponse><DescribeChangeSetResult>"
+        "<Status>FAILED</Status><StatusReason>The submitted information "
+        "didn't contain changes. Submit different information to create a "
+        "change set.</StatusReason>"
+        "</DescribeChangeSetResult></DescribeChangeSetResponse>");
+    timed_out = -1;
+    no_changes = -1;
+    rc = cfn_wait_for_change_set(client, "us-east-1", "proj-infra", "cs1",
+                                 2, 0, &timed_out, &no_changes);
+    CHECK(rc == 0 && timed_out == 0 && no_changes == 1,
+          "no-changes change set is not an error");
+    CHECK(f.count == 1, "no-changes change set completes on first poll");
+
+    /* A NULL out-param keeps the historical FAILED-is-an-error behavior. */
+    fake_clear(&f);
+    fake_serve(&f,
+        "<DescribeChangeSetResponse><DescribeChangeSetResult>"
+        "<Status>FAILED</Status><StatusReason>The submitted information "
+        "didn't contain changes. Submit different information to create a "
+        "change set.</StatusReason>"
+        "</DescribeChangeSetResult></DescribeChangeSetResponse>");
+    timed_out = -1;
+    rc = cfn_wait_for_change_set(client, "us-east-1", "proj-infra", "cs1",
+                                 2, 0, &timed_out, NULL);
+    CHECK(rc == ECANCELED && timed_out == 0,
+          "NULL out-param preserves failed-is-an-error behavior");
 
     cfn_client_destroy(client);
     fake_clear(&f);

@@ -96,10 +96,10 @@ static int prod_create_cs(void *ud, cfn_client *client, const char *region,
 
 static int prod_wait_cs(void *ud, cfn_client *client, const char *region,
                         const char *stack, const char *cs, int attempts,
-                        int interval, int *timed_out) {
+                        int interval, int *timed_out, int *no_changes) {
     (void)ud;
     return cfn_wait_for_change_set(client, region, stack, cs, attempts, interval,
-                                   timed_out);
+                                   timed_out, no_changes);
 }
 
 static int prod_desc_cs(void *ud, cfn_client *client, const char *region,
@@ -829,6 +829,7 @@ int provision_run(const provision_env *env) {
     cfn_change_set_result result = {0};
     cfn_change_set change_set = {0};
     int timed_out = 0;
+    int no_changes = 0;
     int rc;
 
     if (env == NULL || env->cfg == NULL || env->config_dir == NULL) {
@@ -1023,12 +1024,25 @@ int provision_run(const provision_env *env) {
         goto done;
     }
     rc = ops->wait_change_set(ud, client, region, stack, change_set_name, 120,
-                              5, &timed_out);
+                              5, &timed_out, &no_changes);
     if (rc != 0 || timed_out != 0) {
         fprintf(env->err, "stackctl: change set for %s did not complete\n",
                 stack);
         rc = CLI_EXIT_AWS;
         goto done;
+    }
+    if (no_changes != 0) {
+        /*
+         * The stack already conforms. Clean up the empty change set and treat
+         * the stack step as a success so the key lifecycle below still runs:
+         * a conforming stack with zero operator keys must still mint them.
+         */
+        (void)ops->delete_change_set(ud, client, region, stack,
+                                     change_set_name);
+        if (prior_review != 0) {
+            (void)ops->delete_stack(ud, client, region, stack);
+        }
+        goto ensure_credentials;
     }
     rc = ops->describe_change_set(ud, client, region, stack, change_set_name,
                                   &change_set);
@@ -1137,6 +1151,7 @@ int provision_run(const provision_env *env) {
         goto done;
     }
 
+ensure_credentials:
     {
         int mismatch = 0;
 

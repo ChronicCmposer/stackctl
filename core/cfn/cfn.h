@@ -375,10 +375,18 @@ int cfn_wait_for_stack(cfn_client *client, const char *region,
 /*
  * Poll DescribeChangeSet until CREATE_COMPLETE. ECANCELED on FAILED or a
  * deleted change set, with status reason on stderr.
+ *
+ * AWS reports a change set with nothing to apply as FAILED with the fixed
+ * reason "The submitted information didn't contain changes. ...". That is a
+ * successful no-op, not an error: when `no_changes` is non-NULL it is set to 1
+ * and the call returns 0. Any other FAILED reason keeps the ECANCELED path.
+ * Passing NULL for `no_changes` preserves the historical behavior where every
+ * FAILED change set is an error.
  */
 int cfn_wait_for_change_set(cfn_client *client, const char *region,
                             const char *stack_name, const char *change_set_name,
-                            int attempts, int interval_sec, int *timed_out);
+                            int attempts, int interval_sec, int *timed_out,
+                            int *no_changes);
 
 #ifdef __cplusplus
 }

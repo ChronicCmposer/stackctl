@@ -66,6 +66,7 @@ typedef struct fake {
     cfn_stack_status status;
     int create_rc;
     int wait_cs_rc;
+    int wait_cs_no_changes;
     int describe_cs_rc;
     int change_count;
     int execute_rc;
@@ -248,7 +249,7 @@ static int fake_create_cs(void *ud, cfn_client *client, const char *region,
 
 static int fake_wait_cs(void *ud, cfn_client *client, const char *region,
                         const char *stack, const char *cs, int attempts,
-                        int interval, int *timed_out) {
+                        int interval, int *timed_out, int *no_changes) {
     fake *f = ud;
 
     (void)client;
@@ -260,6 +261,9 @@ static int fake_wait_cs(void *ud, cfn_client *client, const char *region,
     trace(f, TRACE_WAIT_CS);
     if (timed_out != NULL) {
         *timed_out = 0;
+    }
+    if (no_changes != NULL) {
+        *no_changes = f->wait_cs_no_changes;
     }
     return f->wait_cs_rc;
 }
@@ -1013,6 +1017,33 @@ static void test_empty_change_set_skips_prompt_and_execute(void) {
     config_free(cfg);
 }
 
+/* The operator's exact pilot scenario: the stack already conforms, so AWS
+ * reports the change set FAILED with the "didn't contain changes" reason. The
+ * stack step is a success and the key lifecycle still runs (0 keys -> mint). */
+static void test_conforming_stack_still_runs_key_lifecycle(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.wait_cs_no_changes = 1;
+    f.change_count = 0;
+    env = make_env(&f, cfg, &fx);
+    CHECK(provision_run(&env) == CLI_EXIT_OK,
+          "no-changes provision completes");
+    CHECK(f.executed == 0, "no-changes change set is never executed");
+    CHECK(f.deleted_change_sets == 1, "no-changes change set deleted");
+    CHECK(trace_index(&f, TRACE_LIST) >= 0, "key lifecycle ran");
+    CHECK(trace_index(&f, TRACE_CREATE_KEY) >= 0, "keys minted");
+    CHECK(f.create_count == 2, "operator and CI keys minted");
+    CHECK(f.write_count == 2, "both profiles written");
+    config_free(cfg);
+}
+
 static void test_execute_failure_is_aws(void) {
     fixture fx;
     fake f = {0};
@@ -1673,6 +1704,7 @@ int main(void) {
     test_decline_deletes_change_set();
     test_noninteractive_without_yes_is_usage();
     test_empty_change_set_skips_prompt_and_execute();
+    test_conforming_stack_still_runs_key_lifecycle();
     test_execute_failure_is_aws();
     test_wait_stack_failure_is_aws();
     test_identity_mismatch_is_verify();

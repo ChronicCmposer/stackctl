@@ -93,6 +93,7 @@ typedef struct fake {
     int describe_rc;
     int create_rc;
     int wait_cs_rc;
+    int wait_cs_no_changes;
     int describe_cs_rc;
     int change_count;
     int execute_rc;
@@ -498,7 +499,7 @@ static int fake_create_cs(void *ud, cfn_client *client, const char *region,
 
 static int fake_wait_cs(void *ud, cfn_client *client, const char *region,
                         const char *stack, const char *cs, int attempts,
-                        int interval, int *timed_out) {
+                        int interval, int *timed_out, int *no_changes) {
     fake *f = ud;
 
     (void)client;
@@ -510,6 +511,8 @@ static int fake_wait_cs(void *ud, cfn_client *client, const char *region,
     trace(f, TRACE_WAIT_CS);
     if (timed_out != NULL)
         *timed_out = 0;
+    if (no_changes != NULL)
+        *no_changes = f->wait_cs_no_changes;
     return f->wait_cs_rc;
 }
 
@@ -1199,6 +1202,31 @@ static void test_empty_change_set_skips_execute(void) {
     CHECK(f.executed == 0, "nothing executed");
     CHECK(f.confirm_calls == 0, "no prompt for an empty change set");
     CHECK(f.deleted_change_sets == 1, "change set deleted");
+    config_free(cfg);
+}
+
+/* Re-deploying the same release against a conforming stack makes AWS report
+ * the change set FAILED with the "didn't contain changes" reason. That is a
+ * successful no-op, not an error. */
+static void test_no_changes_redeploy_is_success(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    deploy_env env;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.rel_exists = 1;
+    f.wait_cs_no_changes = 1;
+    f.change_count = 0;
+    env = make_env(&f, cfg, &fx);
+    CHECK(deploy_run(&env) == CLI_EXIT_OK,
+          "no-changes re-deploy is success");
+    CHECK(f.executed == 0, "no-changes change set is never executed");
+    CHECK(f.confirm_calls == 0, "no-changes change set skips the prompt");
+    CHECK(f.deleted_change_sets == 1, "no-changes change set deleted");
     config_free(cfg);
 }
 
@@ -2450,6 +2478,7 @@ int main(void) {
     test_existing_release_verify_failure_is_verify();
     test_publish_failure_is_aws();
     test_empty_change_set_skips_execute();
+    test_no_changes_redeploy_is_success();
     test_dry_run_is_fully_dry();
     test_ingress_indexed_params();
     test_ddns_params();

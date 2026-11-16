@@ -1311,10 +1311,10 @@ static int prod_create_cs(void *ud, cfn_client *client, const char *region,
 
 static int prod_wait_cs(void *ud, cfn_client *client, const char *region,
                         const char *stack, const char *cs, int attempts,
-                        int interval, int *timed_out) {
+                        int interval, int *timed_out, int *no_changes) {
     (void)ud;
     return cfn_wait_for_change_set(client, region, stack, cs, attempts, interval,
-                                   timed_out);
+                                   timed_out, no_changes);
 }
 
 static int prod_desc_cs(void *ud, cfn_client *client, const char *region,
@@ -1890,6 +1890,7 @@ static int deploy_run_impl(deploy_env *env) {
     int live_count = 0;
     const cfn_stack *current_stack = NULL;
     int timed_out = 0;
+    int no_changes = 0;
     int rc;
 
     if (env == NULL || env->cfg == NULL || env->config_dir == NULL) {
@@ -2328,11 +2329,32 @@ static int deploy_run_impl(deploy_env *env) {
         goto done;
     }
     rc = ops->wait_change_set(ud, client, region, stack, change_set_name, 120,
-                              5, &timed_out);
+                              5, &timed_out, &no_changes);
     if (rc != 0 || timed_out != 0) {
         fprintf(env->err, "stackctl: change set for %s did not complete\n",
                 stack);
         rc = CLI_EXIT_AWS;
+        goto done;
+    }
+    if (no_changes != 0) {
+        /*
+         * The stack already matches this release. AWS reports the empty change
+         * set as FAILED with the fixed no-changes reason; that is a successful
+         * idempotent re-deploy, so clean up and report "unchanged".
+         */
+        (void)ops->delete_change_set(ud, client, region, stack,
+                                     change_set_name);
+        if (prior_review != 0) {
+            (void)ops->delete_stack(ud, client, region, stack);
+        }
+        if (env->json != 0) {
+            report_json(env, stack, 0, 0, "unchanged", current_stack, params,
+                        param_count);
+        } else {
+            fprintf(env->out, "%s: no changes (release %s recorded)\n", stack,
+                    env->tag);
+        }
+        rc = CLI_EXIT_OK;
         goto done;
     }
     rc = ops->describe_change_set(ud, client, region, stack, change_set_name,
