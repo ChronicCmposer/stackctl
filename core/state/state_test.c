@@ -228,6 +228,60 @@ static void test_binding_matrix(void) {
     free(root);
 }
 
+static void test_binding_host_key_charset(void) {
+    char *root = make_temp_root();
+    state_store *store = NULL;
+    kh_binding binding;
+    kh_binding got;
+
+    setenv("XDG_STATE_HOME", root, 1);
+    CHECK(state_open("demo", "us-east-1", &store) == 0,
+          "store for host-key charset");
+    if (store == NULL) {
+        free(root);
+        return;
+    }
+
+    /* ssh-keyscan stores a fingerprint (`SHA256:<base64>`), whose base64
+     * material legitimately contains '+', '/' and '='. It must round-trip. */
+    binding = make_binding("i-444",
+                           "SHA256:T+f+L/Zb1qUPMebCvl5ZHhk4EQxcMz+Pwp5cYKvAtXo",
+                           "fp.example", "198.51.100.5");
+    CHECK(state_binding_put(store, &binding) == 0,
+          "base64 fingerprint is accepted in host_key");
+    memset(&got, 0, sizeof got);
+    CHECK(state_binding_get(store, "i-444", &got) == 0 &&
+              strcmp(got.host_key, binding.host_key) == 0,
+          "base64 fingerprint round-trips verbatim");
+
+    /* TAB/LF would corrupt the tab/newline-separated state line. */
+    binding =
+        make_binding("i-445", "SHA256:abc\tdef", "tab.example", "198.51.100.6");
+    CHECK(state_binding_put(store, &binding) == EINVAL,
+          "host_key containing TAB is rejected");
+    binding =
+        make_binding("i-446", "SHA256:abc\ndef", "nl.example", "198.51.100.7");
+    CHECK(state_binding_put(store, &binding) == EINVAL,
+          "host_key containing LF is rejected");
+
+    /* AWS/DNS identifiers still forbid '/'. */
+    binding = make_binding("i-4/47", "SHA256:abc", "slash.example",
+                           "198.51.100.8");
+    CHECK(state_binding_put(store, &binding) == EINVAL,
+          "instance_id containing '/' is rejected");
+    binding = make_binding("i-448", "SHA256:abc", "slash/example",
+                           "198.51.100.9");
+    CHECK(state_binding_put(store, &binding) == EINVAL,
+          "fqdn containing '/' is rejected");
+    binding = make_binding("i-449", "SHA256:abc", "ip.example",
+                           "198.51.100.10/24");
+    CHECK(state_binding_put(store, &binding) == EINVAL,
+          "ip containing '/' is rejected");
+
+    state_close(store);
+    free(root);
+}
+
 static void test_logs(void) {
     char *root = make_temp_root();
     state_store *store = NULL;
@@ -289,6 +343,7 @@ static void test_logs(void) {
 int main(void) {
     test_lock_and_open();
     test_binding_matrix();
+    test_binding_host_key_charset();
     test_logs();
 
     if (failures != 0) {

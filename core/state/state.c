@@ -138,6 +138,15 @@ static int has_bad_name_char(const char *text) {
            strchr(text, '\n') != NULL || strchr(text, '\t') != NULL;
 }
 
+/* `host_key` stores an ssh-keyscan fingerprint, `SHA256:<base64>`, whose base64
+ * material legitimately contains '/', '+' and '='. Only the state line's own
+ * hazards are forbidden: TAB/LF delimiters and a backslash that could escape
+ * them. Path separators are valid here, unlike in identifiers. */
+static int has_binding_key_hazard(const char *text) {
+    return strchr(text, '\\') != NULL || strchr(text, '\n') != NULL ||
+           strchr(text, '\t') != NULL;
+}
+
 static int field_copy(char *dst, size_t cap, const char *src) {
     size_t len = strlen(src);
 
@@ -744,7 +753,7 @@ static int validate_binding(const kh_binding *binding) {
     return binding->instance_id[0] == '\0' || binding->host_key[0] == '\0' ||
                    binding->fqdn[0] == '\0' || binding->ip[0] == '\0' ||
                    has_bad_name_char(binding->instance_id) ||
-                   has_bad_name_char(binding->host_key) ||
+                   has_binding_key_hazard(binding->host_key) ||
                    has_bad_name_char(binding->fqdn) ||
                    has_bad_name_char(binding->ip)
                ? EINVAL
