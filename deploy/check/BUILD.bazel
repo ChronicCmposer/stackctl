@@ -65,6 +65,7 @@ cc_test(
         "testdata/bad_operator_action_intrinsic.yaml",
         "testdata/bad_operator_ib_execution_trust.yaml",
         "testdata/bad_operator_missing_bucket_lifecycle.yaml",
+        "testdata/bad_operator_missing_bucket_public_access_block.yaml",
         "testdata/bad_operator_missing_imagebuilder_perms.yaml",
         "testdata/bad_operator_missing_user_policy.yaml",
         "testdata/bad_operator_resource_intrinsic.yaml",

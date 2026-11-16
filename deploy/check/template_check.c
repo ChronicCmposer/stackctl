@@ -633,6 +633,7 @@ static const char *const STAR_ALLOWED_ACTIONS[] = {
      * identity (same read-only class as the entries above). */
     "ec2:DescribeInternetGateways",
     "ec2:DescribeRouteTables",
+    "ec2:DescribeNetworkAcls",
     "ec2:DescribeAvailabilityZones",
     "ec2:DescribeNetworkInterfaces",
     "ec2:DescribeTags",
@@ -1162,8 +1163,10 @@ static operator_policies collect_operator_policies(const node *root);
 /*
  * The operator policy may grant bucket-lifecycle actions on the cert bucket
  * because CloudFormation's S3 handlers create and configure it under the
- * caller's identity, but it must never grant object-level access: the cert
- * store is written only by the conditional instance-role policy.
+ * caller's identity, but it must never grant object CONTENT access: the cert
+ * store is written only by the conditional instance-role policy. s3:ListBucket
+ * is bucket-level (HeadBucket) and exposes no object contents, so the handler
+ * lifecycle statement may carry it.
  */
 static int grants_cert_object_access(const node *n) {
     if (n == NULL) {
@@ -1185,8 +1188,7 @@ static int grants_cert_object_access(const node *n) {
     if (action != NULL && resource != NULL && node_contains(resource, "-certs-")) {
         if (action_list_contains(action, "s3:GetObject") ||
             action_list_contains(action, "s3:PutObject") ||
-            action_list_contains(action, "s3:DeleteObject") ||
-            action_list_contains(action, "s3:ListBucket")) {
+            action_list_contains(action, "s3:DeleteObject")) {
             return 1;
         }
     }
@@ -1255,9 +1257,19 @@ static void check_operator_s3_scope(checker *c, const node *n) {
 
     const node *action = map_get(n, "Action");
     const node *resource = map_get(n, "Resource");
+    /* The CloudFormation bucket handler needs an unscoped s3:ListBucket
+     * (HeadBucket) while it creates/deletes the bucket. That statement is
+     * identified by its co-located bucket lifecycle write grants; release
+     * readers still must prefix-condition their ListBucket. */
+    const int bucket_handler_statement =
+        action_list_contains(action, "s3:CreateBucket") &&
+        action_list_contains(action, "s3:DeleteBucket");
     for (size_t i = 0; i < scalar_count(action); i++) {
         const node *entry = scalar_at(action, i);
         if (entry == NULL || !node_scalar_equals(entry, "s3:ListBucket")) {
+            continue;
+        }
+        if (bucket_handler_statement) {
             continue;
         }
         const node *condition = map_get(n, "Condition");
@@ -1483,15 +1495,166 @@ static void check_operator_image_builder_permissions(checker *c, const node *roo
  * The infra stack always creates its artifact bucket (and conditionally the
  * cert bucket) through CloudFormation's S3 handlers, which run under the
  * caller's identity. Object-level release access is therefore insufficient:
- * the operator policy must also grant bucket create/delete on the artifacts
- * bucket pattern, or a first deploy rolls back with s3:CreateBucket denied.
- * Fail closed on both actions in one violation.
+ * the operator policy must also grant the complete bucket handler surface on
+ * the artifacts bucket pattern, or a deploy rolls back mid-configure with an
+ * AccessDenied. The IAM action names differ from the S3 API names for several
+ * subresources (public access block, encryption, ownership controls); the list
+ * below is the canonical set, enumerated and never wildcarded.
  */
-static int statement_grants_on_artifacts(const node *statement, const char *action) {
-    return statement != NULL &&
-           action_list_contains(map_get(statement, "Action"), action) &&
-           node_contains(map_get(statement, "Resource"),
-                         "${ProjectName}-artifacts-");
+static const char *const BUCKET_HANDLER_ACTIONS[] = {
+    "s3:CreateBucket",
+    "s3:DeleteBucket",
+    "s3:GetBucketLocation",
+    "s3:GetBucketAcl",
+    "s3:GetBucketVersioning",
+    "s3:PutBucketVersioning",
+    "s3:GetBucketTagging",
+    "s3:PutBucketTagging",
+    "s3:GetBucketPublicAccessBlock",
+    "s3:PutBucketPublicAccessBlock",
+    "s3:GetEncryptionConfiguration",
+    "s3:PutEncryptionConfiguration",
+    "s3:DeleteBucketEncryption",
+    "s3:GetBucketOwnershipControls",
+    "s3:PutBucketOwnershipControls",
+    "s3:GetLifecycleConfiguration",
+    "s3:PutLifecycleConfiguration",
+    "s3:DeleteBucketLifecycle",
+    "s3:ListBucket",
+};
+
+/* CloudFormation EC2 handler surface for the VPC/subnet/IGW/route-table/
+ * security-group resources the infra stack creates. Each action is anchored to
+ * the VpcLifecycle statement (which also grants ec2:CreateVpc) so an unrelated
+ * launch-time grant of the same action cannot satisfy the check. */
+static const char *const INFRA_EC2_HANDLER_ACTIONS[] = {
+    "ec2:CreateVpc",
+    "ec2:DeleteVpc",
+    "ec2:ModifyVpcAttribute",
+    "ec2:CreateSubnet",
+    "ec2:DeleteSubnet",
+    "ec2:ModifySubnetAttribute",
+    "ec2:CreateInternetGateway",
+    "ec2:DeleteInternetGateway",
+    "ec2:AttachInternetGateway",
+    "ec2:DetachInternetGateway",
+    "ec2:CreateRouteTable",
+    "ec2:DeleteRouteTable",
+    "ec2:CreateRoute",
+    "ec2:DeleteRoute",
+    "ec2:ReplaceRoute",
+    "ec2:AssociateRouteTable",
+    "ec2:DisassociateRouteTable",
+    "ec2:ReplaceRouteTableAssociation",
+    "ec2:CreateSecurityGroup",
+    "ec2:DeleteSecurityGroup",
+    "ec2:AuthorizeSecurityGroupIngress",
+    "ec2:RevokeSecurityGroupIngress",
+    "ec2:AuthorizeSecurityGroupEgress",
+    "ec2:RevokeSecurityGroupEgress",
+    "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
+    "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
+    "ec2:CreateTags",
+    "ec2:DeleteTags",
+};
+
+/* Spot alerts are optional in the infra stack but, when enabled, the SNS and
+ * EventBridge handlers run as the same operator identity. */
+static const char *const SPOT_ALERT_SNS_ACTIONS[] = {
+    "sns:CreateTopic",
+    "sns:DeleteTopic",
+    "sns:GetTopicAttributes",
+    "sns:Subscribe",
+    "sns:Unsubscribe",
+    "sns:GetSubscriptionAttributes",
+    "sns:SetSubscriptionAttributes",
+    "sns:ListSubscriptionsByTopic",
+};
+
+static const char *const SPOT_ALERT_EVENTS_ACTIONS[] = {
+    "events:PutRule",
+    "events:DeleteRule",
+    "events:DescribeRule",
+    "events:PutTargets",
+    "events:RemoveTargets",
+    "events:ListTargetsByRule",
+};
+
+static const node *find_statement_pair(const node *n, const char *action,
+                                       const char *anchor) {
+    if (n == NULL) {
+        return NULL;
+    }
+    if (n->kind == NODE_MAP) {
+        const node *actions = map_get(n, "Action");
+        if (actions != NULL && action_list_contains(actions, action) &&
+            action_list_contains(actions, anchor)) {
+            return n;
+        }
+        for (size_t i = 0; i < n->npairs; i++) {
+            const node *found = find_statement_pair(n->pairs[i].value, action, anchor);
+            if (found != NULL) {
+                return found;
+            }
+        }
+    } else if (n->kind == NODE_SEQ) {
+        for (size_t i = 0; i < n->nitems; i++) {
+            const node *found = find_statement_pair(n->items[i], action, anchor);
+            if (found != NULL) {
+                return found;
+            }
+        }
+    }
+    return NULL;
+}
+
+static const node *find_statement_on_pattern(const node *n, const char *action,
+                                             const char *needle) {
+    if (n == NULL) {
+        return NULL;
+    }
+    if (n->kind == NODE_MAP) {
+        const node *actions = map_get(n, "Action");
+        const node *resource = map_get(n, "Resource");
+        if (actions != NULL && action_list_contains(actions, action) &&
+            node_contains(resource, needle)) {
+            return n;
+        }
+        for (size_t i = 0; i < n->npairs; i++) {
+            const node *found = find_statement_on_pattern(n->pairs[i].value, action, needle);
+            if (found != NULL) {
+                return found;
+            }
+        }
+    } else if (n->kind == NODE_SEQ) {
+        for (size_t i = 0; i < n->nitems; i++) {
+            const node *found = find_statement_on_pattern(n->items[i], action, needle);
+            if (found != NULL) {
+                return found;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int operator_policies_grant_with_anchor(const operator_policies *set,
+                                               const char *action, const char *anchor) {
+    for (size_t i = 0; i < set->count; i++) {
+        if (find_statement_pair(set->items[i], action, anchor) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int operator_policies_grant_on_pattern(const operator_policies *set,
+                                              const char *action, const char *needle) {
+    for (size_t i = 0; i < set->count; i++) {
+        if (find_statement_on_pattern(set->items[i], action, needle) != NULL) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void check_operator_bucket_lifecycle(checker *c, const node *root) {
@@ -1500,14 +1663,54 @@ static void check_operator_bucket_lifecycle(checker *c, const node *root) {
         /* Missing operator user/policy is reported elsewhere. */
         return;
     }
-    if (!statement_grants_on_artifacts(
-            operator_policies_find_statement(&operator, "s3:CreateBucket"),
-            "s3:CreateBucket") ||
-        !statement_grants_on_artifacts(
-            operator_policies_find_statement(&operator, "s3:DeleteBucket"),
-            "s3:DeleteBucket")) {
-        violation(c, "operator policies must grant s3:CreateBucket and s3:DeleteBucket "
-                     "on the ${ProjectName}-artifacts- bucket pattern");
+    const int cert_bucket = map_get(template_parameters(root), "CertBucketEnabled") != NULL;
+    for (size_t i = 0;
+         i < sizeof(BUCKET_HANDLER_ACTIONS) / sizeof(BUCKET_HANDLER_ACTIONS[0]); i++) {
+        const char *action = BUCKET_HANDLER_ACTIONS[i];
+        if (!operator_policies_grant_on_pattern(&operator, action,
+                                                "${ProjectName}-artifacts-")) {
+            violation(c, "operator policies must grant %s on the "
+                         "${ProjectName}-artifacts- bucket pattern",
+                      action);
+        }
+        if (cert_bucket &&
+            !operator_policies_grant_on_pattern(&operator, action,
+                                                "${ProjectName}-certs-")) {
+            violation(c, "operator policies must grant %s on the "
+                         "${ProjectName}-certs- bucket pattern",
+                      action);
+        }
+    }
+}
+
+static void check_operator_infra_handler_permissions(checker *c, const node *root) {
+    const operator_policies operator = collect_operator_policies(root);
+    if (operator.count == 0) {
+        return;
+    }
+    for (size_t i = 0;
+         i < sizeof(INFRA_EC2_HANDLER_ACTIONS) / sizeof(INFRA_EC2_HANDLER_ACTIONS[0]); i++) {
+        if (!operator_policies_grant_with_anchor(&operator, INFRA_EC2_HANDLER_ACTIONS[i],
+                                                 "ec2:CreateVpc")) {
+            violation(c, "operator policies must grant %s for the infra stack EC2 handlers",
+                      INFRA_EC2_HANDLER_ACTIONS[i]);
+        }
+    }
+    for (size_t i = 0;
+         i < sizeof(SPOT_ALERT_SNS_ACTIONS) / sizeof(SPOT_ALERT_SNS_ACTIONS[0]); i++) {
+        if (!operator_policies_grant_with_anchor(&operator, SPOT_ALERT_SNS_ACTIONS[i],
+                                                 "sns:CreateTopic")) {
+            violation(c, "operator policies must grant %s for the spot-alert SNS handlers",
+                      SPOT_ALERT_SNS_ACTIONS[i]);
+        }
+    }
+    for (size_t i = 0;
+         i < sizeof(SPOT_ALERT_EVENTS_ACTIONS) / sizeof(SPOT_ALERT_EVENTS_ACTIONS[0]); i++) {
+        if (!operator_policies_grant_with_anchor(&operator, SPOT_ALERT_EVENTS_ACTIONS[i],
+                                                 "events:PutRule")) {
+            violation(c, "operator policies must grant %s for the spot-alert EventBridge "
+                         "handlers", SPOT_ALERT_EVENTS_ACTIONS[i]);
+        }
     }
 }
 
@@ -1578,6 +1781,7 @@ static void check_operator(checker *c, const node *root) {
     check_imagebuilder_execution_role(c, root);
     check_operator_image_builder_permissions(c, root);
     check_operator_bucket_lifecycle(c, root);
+    check_operator_infra_handler_permissions(c, root);
     /* check_iam_node above already walks every resource node, so the generic
      * wildcard/action scan covers the managed-policy union attached to the
      * user. These scope checks reason about the same union explicitly. */
