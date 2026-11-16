@@ -216,6 +216,22 @@ size_t deploy_param_diff_write(FILE *out, const cfn_stack *current,
 /* Single-quote `in` for POSIX sh, escaping embedded single quotes. */
 int deploy_shell_quote(const char *in, char *out, size_t cap);
 
+/*
+ * Convert a comma-separated Bazel target list into a space-separated list
+ * suitable for `bazel build --check_up_to_date`. Returns 0, EINVAL for a
+ * NULL/empty list or an empty/invalid field (charset: A-Za-z0-9 / : . _ + ~ - %),
+ * or ENAMETOOLONG when `out` is too small.
+ */
+int deploy_targets_csv_to_list(const char *csv, char *out, size_t cap);
+
+/*
+ * Build the `set(...)` query expression for `bazel cquery --output=files` from
+ * a comma-separated target list, e.g. `//:a,//:b` -> `set(//:a //:b)`. The
+ * result contains spaces and parentheses, so callers must single-quote it in a
+ * shell command. Returns 0, EINVAL, or ENAMETOOLONG.
+ */
+int deploy_cquery_expr(const char *csv, char *out, size_t cap);
+
 /* Run the verb body; returns a frozen cli_exit_code value. */
 int deploy_run(deploy_env *env);
 
@@ -236,6 +252,17 @@ int deploy_prod_provenance_for_test(const char *repo_root, int allow_dirty,
  * NULL for the client. */
 int deploy_cheap_verify_manifest_for_test(const char *bucket, const char *tag,
                                           char *manifest);
+
+/* Test-only: the production freshness seam, so tests drive the real bazel
+ * command construction (cquery set expression + build target list) against a
+ * fake `bazel` on disk rather than an injected stub. */
+int deploy_prod_freshness_for_test(const char *repo_root, const char *bazel,
+                                   const char *targets);
+
+/* Test-only: the production publish cquery seam, capturing the output paths of
+ * the real `bazel cquery --output=files` invocation. */
+int deploy_prod_cquery_files_for_test(const char *repo_root, const char *bazel,
+                                      const char *targets, char **paths_out);
 
 #ifdef __cplusplus
 }

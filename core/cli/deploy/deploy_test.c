@@ -2454,8 +2454,219 @@ static void test_prune_all_unverifiable_still_exit_ok(void) {
     config_free(cfg);
 }
 
+/*
+ * Write a fake `bazel` that records every argv element (one `ARG:<value>` line
+ * per element) to `capture` and prints a synthetic artifact path, so the real
+ * shell command construction can be asserted without invoking bazel.
+ */
+static int write_capture_bazel(const char *path, const char *capture) {
+    FILE *script = fopen(path, "w");
+    int rc = 0;
+
+    if (script == NULL) {
+        return -1;
+    }
+    fprintf(script,
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do\n"
+            "  printf 'ARG:%%s\\n' \"$arg\" >> '%s'\n"
+            "done\n"
+            "printf '/tmp/fake-artifact\\n'\n"
+            "exit 0\n",
+            capture);
+    if (ferror(script)) {
+        rc = -1;
+    }
+    if (fclose(script) != 0) {
+        rc = -1;
+    }
+    if (rc == 0 && chmod(path, 0755) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+static void test_prod_freshness_builds_valid_bazel_commands(void) {
+    char template[] = "/tmp/stackctl-freshness-XXXXXX";
+    char *dir = mkdtemp(template);
+    char bazel_path[PATH_MAX];
+    char capture_path[PATH_MAX];
+    char repo_root[PATH_MAX];
+    char *captured;
+    int rc;
+
+    CHECK(dir != NULL, "freshness fixture dir");
+    if (dir == NULL) {
+        return;
+    }
+    snprintf(bazel_path, sizeof(bazel_path), "%s/bazel", dir);
+    snprintf(capture_path, sizeof(capture_path), "%s/capture.txt", dir);
+    snprintf(repo_root, sizeof(repo_root), "%s/repo", dir);
+    CHECK(mkdir(repo_root, 0700) == 0, "freshness repo root created");
+    CHECK(write_capture_bazel(bazel_path, capture_path) == 0,
+          "fake bazel script writes");
+
+    rc = deploy_prod_freshness_for_test(repo_root, bazel_path,
+                                        "//:a,//:b,//:c");
+    CHECK(rc == 0, "production freshness accepts multiple targets");
+    captured = read_text_file(capture_path);
+    CHECK(captured != NULL, "captured bazel argv reads");
+    if (captured != NULL) {
+        CHECK(strstr(captured, "ARG:cquery\n") != NULL,
+              "freshness runs cquery");
+        CHECK(strstr(captured, "ARG:set(//:a //:b //:c)\n") != NULL,
+              "cquery receives one set() expression");
+        CHECK(strstr(captured, "ARG:--check_up_to_date\n") != NULL,
+              "freshness runs build --check_up_to_date");
+        CHECK(strstr(captured, "ARG://:a\n") != NULL &&
+                  strstr(captured, "ARG://:b\n") != NULL &&
+                  strstr(captured, "ARG://:c\n") != NULL,
+              "build receives space-separated targets");
+        CHECK(strchr(captured, ',') == NULL, "no comma reaches bazel");
+        free(captured);
+    }
+
+    (void)unlink(capture_path);
+    (void)unlink(bazel_path);
+    (void)rmdir(repo_root);
+    (void)rmdir(dir);
+}
+
+static void test_prod_publish_cquery_uses_set_expr(void) {
+    char template[] = "/tmp/stackctl-publish-XXXXXX";
+    char *dir = mkdtemp(template);
+    char bazel_path[PATH_MAX];
+    char capture_path[PATH_MAX];
+    char repo_root[PATH_MAX];
+    char *captured;
+    char *paths = NULL;
+    int rc;
+
+    CHECK(dir != NULL, "publish fixture dir");
+    if (dir == NULL) {
+        return;
+    }
+    snprintf(bazel_path, sizeof(bazel_path), "%s/bazel", dir);
+    snprintf(capture_path, sizeof(capture_path), "%s/capture.txt", dir);
+    snprintf(repo_root, sizeof(repo_root), "%s/repo", dir);
+    CHECK(mkdir(repo_root, 0700) == 0, "publish repo root created");
+    CHECK(write_capture_bazel(bazel_path, capture_path) == 0,
+          "publish fake bazel script writes");
+
+    rc = deploy_prod_cquery_files_for_test(repo_root, bazel_path, "//:a,//:b",
+                                           &paths);
+    CHECK(rc == 0, "production publish cquery succeeds");
+    CHECK(paths != NULL && strstr(paths, "/tmp/fake-artifact") != NULL,
+          "publish cquery returns the artifact paths");
+    free(paths);
+    captured = read_text_file(capture_path);
+    CHECK(captured != NULL, "captured publish argv reads");
+    if (captured != NULL) {
+        CHECK(strstr(captured, "ARG:cquery\n") != NULL,
+              "publish runs cquery");
+        CHECK(strstr(captured, "ARG:--output=files\n") != NULL,
+              "publish requests output=files");
+        CHECK(strstr(captured, "ARG:set(//:a //:b)\n") != NULL,
+              "publish cquery receives one set() expression");
+        CHECK(strchr(captured, ',') == NULL, "no comma reaches publish bazel");
+        free(captured);
+    }
+
+    (void)unlink(capture_path);
+    (void)unlink(bazel_path);
+    (void)rmdir(repo_root);
+    (void)rmdir(dir);
+}
+
+static void test_targets_csv_to_list(void) {
+    char out[128];
+    char small[6];
+    char overlong[1600];
+
+    CHECK(deploy_targets_csv_to_list("//:a", out, sizeof(out)) == 0,
+          "single target converts");
+    CHECK(strcmp(out, "//:a") == 0, "single target stays intact");
+    CHECK(deploy_targets_csv_to_list("//:a,//:b,//:c", out, sizeof(out)) == 0,
+          "multiple targets convert");
+    CHECK(strcmp(out, "//:a //:b //:c") == 0,
+          "multiple targets become space-separated");
+    CHECK(deploy_targets_csv_to_list("//pkg:name+tag", out, sizeof(out)) == 0 &&
+              strcmp(out, "//pkg:name+tag") == 0,
+          "label charset punctuation is preserved");
+
+    CHECK(deploy_targets_csv_to_list("", out, sizeof(out)) == EINVAL,
+          "empty list rejected");
+    CHECK(deploy_targets_csv_to_list(NULL, out, sizeof(out)) == EINVAL,
+          "NULL list rejected");
+    CHECK(deploy_targets_csv_to_list("//:a", NULL, sizeof(out)) == EINVAL,
+          "NULL output rejected");
+    CHECK(deploy_targets_csv_to_list("//:a,\"x\"", out, sizeof(out)) == EINVAL,
+          "quote rejected");
+    CHECK(deploy_targets_csv_to_list("//:a,//:b)", out, sizeof(out)) == EINVAL,
+          "paren rejected");
+    CHECK(deploy_targets_csv_to_list("//:a,//:b c", out, sizeof(out)) == EINVAL,
+          "space rejected");
+    CHECK(deploy_targets_csv_to_list("//:a;rm", out, sizeof(out)) == EINVAL,
+          "shell metacharacter rejected");
+    CHECK(deploy_targets_csv_to_list("//:a,", out, sizeof(out)) == EINVAL,
+          "trailing empty field rejected");
+    CHECK(deploy_targets_csv_to_list(",//:a", out, sizeof(out)) == EINVAL,
+          "leading empty field rejected");
+    CHECK(deploy_targets_csv_to_list("//:a,,//:b", out, sizeof(out)) == EINVAL,
+          "doubled comma rejected");
+
+    CHECK(deploy_targets_csv_to_list("//:a,//:b", small, sizeof(small)) ==
+              ENAMETOOLONG,
+          "too-small output reports truncation");
+    memset(overlong, 'a', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+    CHECK(deploy_targets_csv_to_list(overlong, out, sizeof(out)) ==
+              ENAMETOOLONG,
+          "over-long input reports truncation");
+}
+
+static void test_cquery_expr(void) {
+    char out[128];
+    char small[6];
+    char overlong[1600];
+
+    CHECK(deploy_cquery_expr("//:a", out, sizeof(out)) == 0,
+          "single-target expression builds");
+    CHECK(strcmp(out, "set(//:a)") == 0,
+          "single-target expression is set(label)");
+    CHECK(deploy_cquery_expr("//:a,//:b,//:c", out, sizeof(out)) == 0,
+          "multi-target expression builds");
+    CHECK(strcmp(out, "set(//:a //:b //:c)") == 0,
+          "multi-target expression is one set() over space-separated labels");
+
+    CHECK(deploy_cquery_expr("", out, sizeof(out)) == EINVAL,
+          "empty expression rejected");
+    CHECK(deploy_cquery_expr(NULL, out, sizeof(out)) == EINVAL,
+          "NULL expression rejected");
+    CHECK(deploy_cquery_expr("//:a", NULL, sizeof(out)) == EINVAL,
+          "NULL output rejected");
+    CHECK(deploy_cquery_expr("//:a,'x'", out, sizeof(out)) == EINVAL,
+          "quote rejected");
+    CHECK(deploy_cquery_expr("//:a,//:b)", out, sizeof(out)) == EINVAL,
+          "paren rejected");
+    CHECK(deploy_cquery_expr("//:a,//:b c", out, sizeof(out)) == EINVAL,
+          "space rejected");
+
+    CHECK(deploy_cquery_expr("//:a,//:b", small, sizeof(small)) ==
+              ENAMETOOLONG,
+          "too-small expression output reports truncation");
+    memset(overlong, 'a', sizeof(overlong) - 1);
+    overlong[sizeof(overlong) - 1] = '\0';
+    CHECK(deploy_cquery_expr(overlong, out, sizeof(out)) == ENAMETOOLONG,
+          "over-long expression input reports truncation");
+}
+
 int main(void) {
     test_prod_aws_init_installs_abort_hook();
+    test_prod_freshness_builds_valid_bazel_commands();
+    test_prod_publish_cquery_uses_set_expr();
+    test_targets_csv_to_list();
+    test_cquery_expr();
     test_null_env();
     test_provenance_failure();
     test_ambiguous_tag_is_usage();

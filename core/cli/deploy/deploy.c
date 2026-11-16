@@ -232,6 +232,100 @@ int deploy_shell_quote(const char *in, char *out, size_t cap) {
     return 0;
 }
 
+/* Conservative Bazel label charset: enough for `//pkg:target`, config suffixes
+ * and version-like names, but never a quote, paren, space, comma or shell
+ * metacharacter. Keeps comma-separated input safe to splice into a shell
+ * command and a Bazel query expression. */
+static int deploy_label_char(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '/' || c == ':' || c == '.' ||
+           c == '_' || c == '+' || c == '~' || c == '-' || c == '%';
+}
+
+/* Validate a comma-separated label list: no NULL/empty, no empty field, every
+ * field non-empty and confined to deploy_label_char(). Returns 0 or EINVAL. */
+static int deploy_validate_targets(const char *csv) {
+    const char *p;
+
+    if (csv == NULL || *csv == '\0') {
+        return EINVAL;
+    }
+    p = csv;
+    while (1) {
+        const char *field = p;
+
+        while (*p != ',' && *p != '\0') {
+            if (!deploy_label_char(*p)) {
+                return EINVAL;
+            }
+            p++;
+        }
+        if (p == field) {
+            return EINVAL; /* empty field: leading, trailing or doubled comma */
+        }
+        if (*p == '\0') {
+            break;
+        }
+        p++; /* skip the comma */
+        if (*p == '\0') {
+            return EINVAL; /* trailing comma leaves an empty field */
+        }
+    }
+    return 0;
+}
+
+int deploy_targets_csv_to_list(const char *csv, char *out, size_t cap) {
+    size_t used = 0;
+    const char *p;
+
+    if (out == NULL || cap == 0 || deploy_validate_targets(csv) != 0) {
+        return EINVAL;
+    }
+    for (p = csv; *p != '\0'; p++) {
+        char c = *p == ',' ? ' ' : *p;
+
+        if (used + 1 >= cap) {
+            out[cap - 1] = '\0';
+            return ENAMETOOLONG;
+        }
+        out[used++] = c;
+    }
+    out[used] = '\0';
+    return 0;
+}
+
+int deploy_cquery_expr(const char *csv, char *out, size_t cap) {
+    static const char prefix[] = "set(";
+    size_t used = 0;
+    const char *p;
+
+    if (out == NULL || cap == 0 || deploy_validate_targets(csv) != 0) {
+        return EINVAL;
+    }
+    if (cap < sizeof(prefix) + 1) {
+        out[cap - 1] = '\0';
+        return ENAMETOOLONG;
+    }
+    memcpy(out, prefix, sizeof(prefix) - 1);
+    used = sizeof(prefix) - 1;
+    for (p = csv; *p != '\0'; p++) {
+        char c = *p == ',' ? ' ' : *p;
+
+        if (used + 2 > cap) {
+            out[cap - 1] = '\0';
+            return ENAMETOOLONG;
+        }
+        out[used++] = c;
+    }
+    if (used + 2 > cap) {
+        out[cap - 1] = '\0';
+        return ENAMETOOLONG;
+    }
+    out[used++] = ')';
+    out[used] = '\0';
+    return 0;
+}
+
 /* Append `tag` only when the whole tag (plus separator) fits; never clip a
  * tag mid-word. Returns 1 when appended, 0 when the list is full. */
 static int append_tag_list(char *out, size_t cap, size_t *used,
@@ -656,19 +750,31 @@ static int prod_freshness(void *ud, const char *repo_root,
                                                            : "bazel";
     char command[PATH_MAX * 4];
     char quoted_root[PATH_MAX * 2];
+    char expr[PATH_MAX];
+    char list[PATH_MAX];
     int rc;
 
-    if (deploy_shell_quote(repo_root, quoted_root, sizeof(quoted_root)) != 0) {
+    if (deploy_shell_quote(repo_root, quoted_root, sizeof(quoted_root)) != 0 ||
+        deploy_cquery_expr(targets, expr, sizeof(expr)) != 0 ||
+        deploy_targets_csv_to_list(targets, list, sizeof(list)) != 0) {
         return CLI_EXIT_FRESHNESS;
     }
     rc = snprintf(command, sizeof(command),
-                  "cd %s && '%s' cquery --output=files %s >/dev/null 2>&1 "
+                  "cd %s && '%s' cquery --output=files '%s' >/dev/null 2>&1 "
                   "&& '%s' build --check_up_to_date %s >/dev/null 2>&1",
-                  quoted_root, bazel, targets, bazel, targets);
+                  quoted_root, bazel, expr, bazel, list);
     if (rc < 0 || (size_t)rc >= sizeof(command)) {
         return CLI_EXIT_FRESHNESS;
     }
     return system(command) == 0 ? 0 : CLI_EXIT_FRESHNESS;
+}
+
+int deploy_prod_freshness_for_test(const char *repo_root, const char *bazel,
+                                   const char *targets) {
+    struct prod_context ctx = {0};
+
+    ctx.bazel = bazel;
+    return prod_freshness(&ctx, repo_root, targets);
 }
 
 static int prod_bucket(void *ud, const char *project, const char *region,
@@ -1159,13 +1265,43 @@ static int upload_artifact(s3_client *client, const char *bucket,
     return rc;
 }
 
+static int prod_cquery_files(const struct prod_context *ctx,
+                             const char *repo_root, const char *targets,
+                             char **paths) {
+    char command[PATH_MAX * 4];
+    char quoted_root[PATH_MAX * 2];
+    char expr[PATH_MAX];
+    const char *bazel = ctx != NULL && ctx->bazel != NULL ? ctx->bazel
+                                                           : "bazel";
+    int rc;
+
+    if (deploy_shell_quote(repo_root, quoted_root, sizeof(quoted_root)) != 0 ||
+        deploy_cquery_expr(targets, expr, sizeof(expr)) != 0) {
+        return EINVAL;
+    }
+    rc = snprintf(command, sizeof(command),
+                  "cd %s && '%s' cquery --output=files '%s'",
+                  quoted_root, bazel, expr);
+    if (rc < 0 || (size_t)rc >= sizeof(command)) {
+        return EIO;
+    }
+    return run_capture(command, paths);
+}
+
+int deploy_prod_cquery_files_for_test(const char *repo_root, const char *bazel,
+                                      const char *targets, char **paths_out) {
+    struct prod_context ctx = {0};
+
+    ctx.bazel = bazel;
+    return prod_cquery_files(&ctx, repo_root, targets, paths_out);
+}
+
 static int prod_publish_release(void *ud, const char *bucket, const char *tag,
                                 const char *repo_root, const char *targets,
                                 char *sha_out, size_t cap) {
     aws_ctx *aws = NULL;
     s3_client *client = NULL;
     buffer manifest = {0};
-    char command[PATH_MAX * 4];
     char quoted_root[PATH_MAX * 2];
     char *paths = NULL;
     char *cursor;
@@ -1194,12 +1330,7 @@ static int prod_publish_release(void *ud, const char *bucket, const char *tag,
         s3_close(aws, client);
         return EINVAL;
     }
-    rc = snprintf(command, sizeof(command), "cd %s && '%s' cquery --output=files %s",
-                  quoted_root,
-                  ctx != NULL && ctx->bazel != NULL ? ctx->bazel : "bazel",
-                  targets);
-    if (rc < 0 || (size_t)rc >= sizeof(command) ||
-        run_capture(command, &paths) != 0) {
+    if (prod_cquery_files(ctx, repo_root, targets, &paths) != 0) {
         s3_close(aws, client);
         return EIO;
     }
