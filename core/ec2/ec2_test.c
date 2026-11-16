@@ -235,20 +235,20 @@ static void test_run_instances_on_demand(fake_transport *fake)
           "root volume encryption invariant");
     CHECK(body_has(fake, "BlockDeviceMapping.1.Ebs.DeleteOnTermination=true"),
           "root volume delete-on-termination invariant");
-    CHECK(body_has(fake, "TagSpecifications.1.ResourceType=instance"),
+    CHECK(body_has(fake, "TagSpecification.1.ResourceType=instance"),
           "tag specification targets the instance resource only");
-    CHECK(body_count(fake, "TagSpecifications.1.Tag.") == 6,
+    CHECK(body_count(fake, "TagSpecification.1.Tag.") == 6,
           "three tag key/value pairs are emitted");
     CHECK(body_count(fake, ".Key=") == 3, "exactly three tag keys");
-    CHECK(body_has(fake, "TagSpecifications.1.Tag.1.Key=Project"),
+    CHECK(body_has(fake, "TagSpecification.1.Tag.1.Key=Project"),
           "Project tag key");
-    CHECK(body_has(fake, "TagSpecifications.1.Tag.1.Value=proj"), "Project tag value");
-    CHECK(body_has(fake, "TagSpecifications.1.Tag.2.Key=Name"), "Name tag key");
-    CHECK(body_has(fake, "TagSpecifications.1.Tag.2.Value=host.example.com"),
+    CHECK(body_has(fake, "TagSpecification.1.Tag.1.Value=proj"), "Project tag value");
+    CHECK(body_has(fake, "TagSpecification.1.Tag.2.Key=Name"), "Name tag key");
+    CHECK(body_has(fake, "TagSpecification.1.Tag.2.Value=host.example.com"),
           "Name tag value");
-    CHECK(body_has(fake, "TagSpecifications.1.Tag.3.Key=stackctl%3Alaunch-nonce"),
+    CHECK(body_has(fake, "TagSpecification.1.Tag.3.Key=stackctl%3Alaunch-nonce"),
           "launch-nonce tag key percent-encoded");
-    CHECK(body_has(fake, "TagSpecifications.1.Tag.3.Value=nonce1"),
+    CHECK(body_has(fake, "TagSpecification.1.Tag.3.Value=nonce1"),
           "launch-nonce tag value");
     CHECK(!body_has(fake, "ResourceType=volume"), "never tags the volume");
     CHECK(!body_has(fake, "InstanceMarketOptions"), "on-demand omits market options");

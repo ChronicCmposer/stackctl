@@ -154,14 +154,14 @@ static int build_run_request(const ec2_run_spec *spec, ec2_params *params)
         /* MaxPrice is deliberately omitted: AWS defaults to the on-demand cap. */
     }
 
-    rc |= ec2_params_add(params, "TagSpecifications.1.ResourceType", "instance");
-    rc |= ec2_params_add(params, "TagSpecifications.1.Tag.1.Key", "Project");
-    rc |= ec2_params_add(params, "TagSpecifications.1.Tag.1.Value", spec->project);
-    rc |= ec2_params_add(params, "TagSpecifications.1.Tag.2.Key", "Name");
-    rc |= ec2_params_add(params, "TagSpecifications.1.Tag.2.Value", spec->name);
-    rc |= ec2_params_add(params, "TagSpecifications.1.Tag.3.Key",
+    rc |= ec2_params_add(params, "TagSpecification.1.ResourceType", "instance");
+    rc |= ec2_params_add(params, "TagSpecification.1.Tag.1.Key", "Project");
+    rc |= ec2_params_add(params, "TagSpecification.1.Tag.1.Value", spec->project);
+    rc |= ec2_params_add(params, "TagSpecification.1.Tag.2.Key", "Name");
+    rc |= ec2_params_add(params, "TagSpecification.1.Tag.2.Value", spec->name);
+    rc |= ec2_params_add(params, "TagSpecification.1.Tag.3.Key",
                          "stackctl:launch-nonce");
-    rc |= ec2_params_add(params, "TagSpecifications.1.Tag.3.Value",
+    rc |= ec2_params_add(params, "TagSpecification.1.Tag.3.Value",
                          spec->launch_nonce);
 
     return rc != 0 ? ENOMEM : 0;
