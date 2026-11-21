@@ -40,6 +40,7 @@ static size_t fixture_count;
 static int describe_fail;
 static char dns_ip[64];
 static int dns_missing;
+static int dns_error;
 static int ssm_missing;
 static int manifest_missing;
 static char member_missing[64];
@@ -169,6 +170,9 @@ static int fake_dns(const char *domain, const char *host, char *ip,
                     bool *parked) {
     (void)domain;
     (void)host;
+    if (dns_error != 0) {
+        return dns_error;
+    }
     if (dns_missing) {
         return ENOENT;
     }
@@ -386,6 +390,7 @@ static void reset_all(void) {
     describe_fail = 0;
     memset(dns_ip, 0, sizeof dns_ip);
     dns_missing = 0;
+    dns_error = 0;
     ssm_missing = 0;
     manifest_missing = 0;
     memset(member_missing, 0, sizeof member_missing);
@@ -454,6 +459,25 @@ static void free_runtime(instance_runtime *rt) {
 }
 
 static int has(const char *needle) { return strstr(output_buffer, needle) != NULL; }
+
+static int stream_contains(FILE *stream, const char *needle) {
+    char buffer[8192];
+    size_t got;
+    int found = 0;
+
+    if (stream == NULL) {
+        return 0;
+    }
+    fflush(stream);
+    rewind(stream);
+    got = fread(buffer, 1, sizeof buffer - 1, stream);
+    buffer[got] = '\0';
+    if (strstr(buffer, needle) != NULL) {
+        found = 1;
+    }
+    clearerr(stream);
+    return found;
+}
 
 /* --- tests --------------------------------------------------------------- */
 
@@ -532,6 +556,24 @@ static void test_missing_record_is_exit1(void) {
     rc = status_execute(&rt, &opts);
 
     CHECK(rc == CLI_EXIT_USAGE, "missing DDNS record is exit 1");
+    free_runtime(&rt);
+}
+
+static void test_ddns_transport_error_hints_vpn(void) {
+    instance_runtime rt;
+    instance_services svc;
+    status_options opts = {0};
+    int rc;
+
+    reset_all();
+    make_runtime(&rt, &svc, 0);
+    dns_error = ECONNREFUSED;
+
+    rc = status_execute(&rt, &opts);
+
+    CHECK(rc == CLI_EXIT_AWS, "DDNS transport failure is exit 2");
+    CHECK(stream_contains(rt.err, "VPN"),
+          "DDNS transport failure suggests checking the VPN");
     free_runtime(&rt);
 }
 
@@ -1091,6 +1133,7 @@ int main(void) {
     test_instance_and_ami_reported();
     test_ddns_mismatch_is_warning();
     test_missing_record_is_exit1();
+    test_ddns_transport_error_hints_vpn();
     test_missing_ssm_param_is_exit1();
     test_aws_error_is_exit2();
     test_empty_operator_cidr_warns();

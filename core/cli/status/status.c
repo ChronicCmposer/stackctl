@@ -1281,6 +1281,18 @@ static void text_report(instance_runtime *rt, const cfn_stack *stack,
     }
 }
 
+/*
+ * A non-ENOENT DDNS read failure is a DNS transport problem, not a missing
+ * record. A VPN is the most common cause: it can intercept or refuse the
+ * authoritative, non-recursive queries the DNS layer must make. Append this
+ * hint on that path so the failure points at the likely remedy.
+ */
+static void ddns_read_hint(instance_runtime *rt) {
+    instance_err(rt,
+                 "stackctl: check that any VPN is disabled and retry: VPNs "
+                 "can intercept authoritative DNS queries\n");
+}
+
 int status_execute(instance_runtime *rt, const status_options *opts) {
     status_report report;
     cfn_stack_list stacks;
@@ -1389,8 +1401,10 @@ int status_execute(instance_runtime *rt, const status_options *opts) {
         if (rc != 0) {
             ec2_instance_list_free(&instances);
             cfn_stack_list_free(&stacks);
-            return instance_fail(rt, CLI_EXIT_AWS,
-                                 "cannot read the DDNS A record");
+            (void)instance_fail(rt, CLI_EXIT_AWS,
+                                "cannot read the DDNS A record");
+            ddns_read_hint(rt);
+            return CLI_EXIT_AWS;
         }
         record_present = 1;
 
