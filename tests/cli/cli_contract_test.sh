@@ -69,7 +69,7 @@ OPERATOR_CIDR=
 INGRESS_TCP=443
 INGRESS_UDP=
 RELEASE_TARGETS=//app:deploy.tar.gz
-RELEASE_PREFIXES=releases/
+ENABLE_CI_USER=true
 TOTALLY_UNKNOWN=1
 EOF
 expect_exit 1 "$binary" --project "$root/deploy/aws" status

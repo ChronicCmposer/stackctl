@@ -243,6 +243,125 @@ those values into a bundle member (for example `provenance.env`) and render it
 from `STACKCTL_*`. The member is sha-verified end to end, so the entrypoint no
 longer trusts a mutable stack parameter.
 
+## Upgrading to v0.2.0
+
+v0.2.0 is a breaking release. It replaces the CI prefix list with an explicit
+boolean, removes the `ReleasePrefixes` CloudFormation parameter, and changes the
+S3 grant model for the operator and CI users. Review every change below before
+running `provision`.
+
+### `RELEASE_PREFIXES` is removed
+
+`RELEASE_PREFIXES` is no longer a config key. A config file that still contains
+it fails closed with exactly this message:
+
+```text
+RELEASE_PREFIXES was removed in v0.2.0; set ENABLE_CI_USER=true if it was non-empty, false if it was empty
+```
+
+`ENABLE_CI_USER` is now a required, boolean key (`true` or `false`). A
+non-boolean value is rejected. Whether the CI user exists is decided by the
+any-true union of `ENABLE_CI_USER` across all `.env.*` siblings, mirroring
+`ENABLE_IMAGE_BUILDER`.
+
+Before:
+
+```dotenv
+RELEASE_PREFIXES=releases/
+```
+
+After:
+
+```dotenv
+ENABLE_CI_USER=true
+```
+
+Set `ENABLE_CI_USER=false` where the old list was empty.
+
+### S3 grant model change
+
+The operator user now has bucket-wide access to the project artifacts bucket:
+`GetObject`, `PutObject` and `DeleteObject` on
+`arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/*`, plus an
+unconditioned `ListBucket` on the bucket ARN. The CI user is read-only:
+`s3:GetObject` on the same object wildcard and `s3:ListBucket` on the bucket
+ARN, with no `PutObject` or `DeleteObject`. `ListBucket` is no longer
+conditioned on an `s3:prefix`, because there is no prefix list any more.
+
+The template checker enforces this shape. Every S3 object resource in an
+operator-scope policy must be an `!Sub` literal beginning
+`arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-` and ending `/*`.
+Opaque resources (`!Ref`, `!GetAtt`, or other intrinsics) and wildcard buckets
+(such as `arn:aws:s3:::*/x/*`) are rejected. Policies attached through
+`Users`/`Roles`/`Groups` naming the operator user are also checked, and the CI
+`ArtifactReaderPolicy` may reference only its own bucket with `s3:GetObject` and
+`s3:ListBucket`.
+
+### Template checker: identity-name resolution
+
+The template checker is a fail-closed gate for `TEMPLATE_OVERRIDE` files as well
+as for the canonical templates. Any IAM User, Role, or Group name it cannot
+resolve statically must be rejected, because the name could be the CI identity
+and the checker therefore cannot prove that an over-broad policy does not reach
+it. The same fail-closed rule applies to membership and attachment sections,
+whose entries could carry policies the checker never inspects.
+
+An identity name or membership entry is accepted only in one of these forms:
+
+- a literal string;
+- `!Ref ProjectName`;
+- a `!Sub` template whose variables are all known pseudo-parameters
+  (`${ProjectName}`);
+- an exactly-resolvable `!Join`, such as
+  `!Join ['-', [!Ref ProjectName, 'ci']]`.
+
+Every other intrinsic is rejected: `!Ref SomeParam`, `!GetAtt`, `!ImportValue`,
+an `Fn::Sub` with a substitution map, and a scalar `!Sub` containing any unknown
+`${...}` variable. Parameterized identity names are rejected by design, even
+when the resource cannot be the CI identity. Rewrite such a name as one of the
+accepted forms, or deploy it outside the checker-gated template.
+
+Membership and attachment sections (`AWS::IAM::User.Properties.Groups`,
+`AWS::IAM::UserToGroupAddition.Properties.Users`, and a policy's
+`Users`/`Roles`/`Groups`) must be plain lists, and each entry must itself
+resolve statically:
+
+- a literal string;
+- a `!Ref` to an existing User/Role/Group logical id, written either in short
+  form (`!Ref CiUser`) or in long form (`Ref: CiUser`);
+- a `!Sub` template whose variables are all known pseudo-parameters
+  (`${ProjectName}`);
+- an exactly-resolvable `!Join`, as for identity names above.
+
+A long-form `Ref` entry that names an existing identity is accepted, just like
+the short form. An entry that is an `Fn::If`-wrapped value, any other intrinsic
+map, a substitution-map `!Sub`, a `!Ref` to a parameter (or to a logical id that
+does not exist), or a nested list does not reveal which principals attach, so it
+is a violation. The checker fails closed at the entry level and never silently
+skips such an entry, and the section shape itself must be a plain list rather
+than an intrinsic-map form.
+
+### Template parameter removal
+
+The `ReleasePrefixes` CloudFormation parameter is removed from both the
+operator and infra templates. Re-copy the canonical templates; `provision` no
+longer sends the parameter.
+
+### `--delete-ci-user`
+
+A true-to-false transition of `ENABLE_CI_USER` deletes the CI user and
+invalidates its access keys. `provision` now refuses that change before running
+the change set unless `--delete-ci-user` is given. With the flag it proceeds and
+prints a warning. Pass `--delete-ci-user` only after you have captured or
+rotated any CI credentials you still need.
+
+### Image-Builder parity
+
+The operator template now carries the upstream Image-Builder parameters and
+policies, matching the committed strimserver state. No new S3 object or
+`ListBucket` grants are introduced; the instance role's `releases/*` access is
+unchanged.
+
 ## Upgrading to v0.1.2
 
 v0.1.2 lets the instance role read project-scoped SSM SecureStrings so on-box

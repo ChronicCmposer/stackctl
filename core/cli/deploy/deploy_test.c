@@ -736,7 +736,7 @@ static const char *base_env =
     "INGRESS_TCP=443\n"
     "INGRESS_UDP=\n"
     "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-    "RELEASE_PREFIXES=releases/\n";
+    "ENABLE_CI_USER=true\n";
 
 typedef struct fixture {
     char root[PATH_MAX];
@@ -905,7 +905,7 @@ static void fixture_write_env_custom_builder(fixture *fx, const char *tcp,
              "INGRESS_TCP=%s\n"
              "INGRESS_UDP=%s\n"
              "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-             "RELEASE_PREFIXES=releases/\n"
+             "ENABLE_CI_USER=true\n"
              "%s",
              builder, tcp, udp, extra != NULL ? extra : "");
     fixture_write_env(fx, text);
@@ -2268,7 +2268,7 @@ static void test_ami_params_only_when_pinned(void) {
         "INGRESS_TCP=443\n"
         "INGRESS_UDP=\n"
         "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-        "RELEASE_PREFIXES=releases/\n";
+        "ENABLE_CI_USER=true\n";
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;

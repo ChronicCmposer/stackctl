@@ -844,7 +844,10 @@ static void check_resource_node(checker *c, const node *n, int star_allowed) {
             check_resource_text(c, fn_sub->text, star_allowed);
             return;
         }
-        if (fn_sub->kind == NODE_SEQ && fn_sub->nitems >= 1 &&
+        /* Only the scalar template-string form is trustworthy. A sequence form
+         * carries a substitution map that can rebind ${ProjectName} or
+         * ${AWS::AccountId}, so the visible template is not the final ARN. */
+        if (fn_sub->kind == NODE_SEQ && fn_sub->nitems == 1 &&
             fn_sub->items[0]->kind == NODE_SCALAR) {
             check_resource_text(c, fn_sub->items[0]->text, star_allowed);
             return;
@@ -868,6 +871,136 @@ static void check_resource_node(checker *c, const node *n, int star_allowed) {
         return;
     }
     violation(c, "IAM Resource uses an unsupported intrinsic");
+}
+
+/*
+ * The S3-scope and CI-reader rules reason about the concrete Action/Resource
+ * literals a policy grants.  Resolving an intrinsic node to that literal set
+ * lets those rules keep their scalar checks while still failing closed on the
+ * long-form shapes ({Fn::If}, {Ref}, {Fn::Sub}, {Fn::Join}) that a scalar-only
+ * walk silently drops.  Any shape that cannot be resolved records an
+ * unsupported_shape, which every caller treats as a violation.
+ */
+
+#define RESOLVED_MAX 64
+
+typedef struct {
+    const char *literal;
+    int from_sub;
+    const char *shape;
+} resolved_value;
+
+typedef struct {
+    resolved_value values[RESOLVED_MAX];
+    char storage[RESOLVED_MAX][1024];
+    size_t count;
+    const char *unsupported_shape;
+} resolution;
+
+static void resolved_add(resolution *r, const char *literal, int from_sub,
+                         const char *shape) {
+    if (r->count >= RESOLVED_MAX) {
+        if (r->unsupported_shape == NULL) {
+            r->unsupported_shape = "too many values";
+        }
+        return;
+    }
+    size_t index = r->count++;
+    snprintf(r->storage[index], sizeof(r->storage[index]), "%s", literal);
+    r->values[index].literal = r->storage[index];
+    r->values[index].from_sub = from_sub;
+    r->values[index].shape = shape;
+}
+
+static void resolved_add_sub(resolution *r, const node *value, const char *shape) {
+    char literal[1024];
+    raw_unquote(value->text, literal, sizeof(literal));
+    resolved_add(r, literal, 1, shape);
+}
+
+static void resolve_node(const node *n, resolution *r) {
+    if (n == NULL || r->unsupported_shape != NULL) {
+        return;
+    }
+    if (n->kind == NODE_SCALAR) {
+        const char *text = n->text != NULL ? n->text : "";
+        if (strncmp(text, "!Sub", 4) == 0 && (text[4] == '\0' || text[4] == ' ')) {
+            const char *source = text + 4;
+            while (*source == ' ') {
+                source++;
+            }
+            char literal[1024];
+            raw_unquote(source, literal, sizeof(literal));
+            resolved_add(r, literal, 1, "!Sub");
+            return;
+        }
+        if (text[0] == '!') {
+            r->unsupported_shape = text;
+            return;
+        }
+        char literal[1024];
+        raw_unquote(text, literal, sizeof(literal));
+        resolved_add(r, literal, 0, "literal");
+        return;
+    }
+    if (n->kind == NODE_SEQ) {
+        for (size_t i = 0; i < n->nitems; i++) {
+            resolve_node(n->items[i], r);
+        }
+        return;
+    }
+
+    const node *fn_if = map_get(n, "Fn::If");
+    if (fn_if != NULL) {
+        if (fn_if->kind != NODE_SEQ || fn_if->nitems != 3) {
+            r->unsupported_shape = "Fn::If";
+            return;
+        }
+        resolve_node(fn_if->items[1], r);
+        resolve_node(fn_if->items[2], r);
+        return;
+    }
+    const node *fn_sub = map_get(n, "Fn::Sub");
+    if (fn_sub != NULL) {
+        if (fn_sub->kind == NODE_SCALAR) {
+            resolved_add_sub(r, fn_sub, "Fn::Sub");
+            return;
+        }
+        /* The sequence form carries a substitution map that can rebind the
+         * contract placeholders; it must fail closed rather than trust the
+         * template string. Do not attempt to resolve substitution maps. */
+        if (fn_sub->kind == NODE_SEQ && fn_sub->nitems == 1 &&
+            fn_sub->items[0]->kind == NODE_SCALAR) {
+            resolved_add_sub(r, fn_sub->items[0], "Fn::Sub");
+            return;
+        }
+        r->unsupported_shape = "Fn::Sub";
+        return;
+    }
+    const node *fn_join = map_get(n, "Fn::Join");
+    if (fn_join != NULL) {
+        char joined[2048];
+        if (join_intrinsic_scalars(fn_join, joined, sizeof(joined))) {
+            resolved_add(r, joined, 0, "Fn::Join");
+        } else {
+            r->unsupported_shape = "Fn::Join";
+        }
+        return;
+    }
+    if (map_get(n, "Ref") != NULL) {
+        r->unsupported_shape = "Ref";
+        return;
+    }
+    r->unsupported_shape = "unsupported intrinsic map";
+}
+
+static int resolved_has(const resolution *r, const char *want) {
+    for (size_t i = 0; i < r->count; i++) {
+        if (strcmp(r->values[i].literal, want) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void check_iam_node(checker *c, const node *n) {
@@ -1074,12 +1207,6 @@ static const char *const OPERATOR_PARAMS[] = {
     "CertBucketEnabled",
 };
 
-/* ReleasePrefixes is a required, referenced parameter only when the template
- * creates the CI user (spec §6.3 "if CI user"). */
-static const char *const OPERATOR_CI_PARAMS[] = {
-    "ReleasePrefixes",
-};
-
 static const char *const OPERATOR_OUTPUTS[] = {
     "InstanceRoleArn",
     "InstanceProfileArn",
@@ -1155,7 +1282,14 @@ static int cert_policy_is_conditional(const node *role) {
 
 typedef struct {
     const node *items[OPERATOR_MAX_POLICIES];
+    /* NULL when the policy reaches the user through ManagedPolicyArns;
+     * otherwise the Users/Roles/Groups section that names the operator user.
+     * The label makes a gap-closing violation distinguishable in diagnostics. */
+    const char *attachments[OPERATOR_MAX_POLICIES];
     size_t count;
+    /* Policies discovered past the fixed inspection cap. The union is then
+     * only partially inspected, so the caller must fail closed. */
+    size_t overflowed;
 } operator_policies;
 
 static operator_policies collect_operator_policies(const node *root);
@@ -1241,13 +1375,23 @@ static void check_operator_role_resources(checker *c, const node *root) {
     }
 }
 
-static void check_operator_s3_scope(checker *c, const node *n) {
+/* CONTRACT grant model: every operator S3 resource is a !Sub literal on the
+ * project bucket, bucket ARN without the object suffix and objects with it. */
+#define OWN_ARTIFACT_BUCKET_PREFIX "arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-"
+#define OWN_ARTIFACT_BUCKET_ARN "arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*"
+#define OWN_ARTIFACT_OBJECT_ARN OWN_ARTIFACT_BUCKET_PREFIX "*/*"
+/* The certs bucket keeps its existing grants; the bucket handler may list it. */
+#define OWN_CERT_BUCKET_ARN "arn:aws:s3:::${ProjectName}-certs-${AWS::AccountId}-*"
+
+/* attachment is NULL for a policy reached through ManagedPolicyArns, else the
+ * Users/Roles/Groups section that named the operator user. */
+static void check_operator_s3_scope(checker *c, const node *n, const char *attachment) {
     if (n == NULL) {
         return;
     }
     if (n->kind == NODE_SEQ) {
         for (size_t i = 0; i < n->nitems; i++) {
-            check_operator_s3_scope(c, n->items[i]);
+            check_operator_s3_scope(c, n->items[i], attachment);
         }
         return;
     }
@@ -1255,48 +1399,906 @@ static void check_operator_s3_scope(checker *c, const node *n) {
         return;
     }
 
+    char via[48] = "";
+    if (attachment != NULL) {
+        snprintf(via, sizeof(via), " (attached via %s)", attachment);
+    }
+    if (map_get(n, "NotAction") != NULL) {
+        violation(c, "operator S3 policy uses an unsupported negated form "
+                     "(NotAction)%s", via);
+    }
+    if (map_get(n, "NotResource") != NULL) {
+        violation(c, "operator S3 policy uses an unsupported negated form "
+                     "(NotResource)%s", via);
+    }
+
     const node *action = map_get(n, "Action");
     const node *resource = map_get(n, "Resource");
-    /* The CloudFormation bucket handler needs an unscoped s3:ListBucket
-     * (HeadBucket) while it creates/deletes the bucket. That statement is
-     * identified by its co-located bucket lifecycle write grants; release
-     * readers still must prefix-condition their ListBucket. */
-    const int bucket_handler_statement =
-        action_list_contains(action, "s3:CreateBucket") &&
-        action_list_contains(action, "s3:DeleteBucket");
-    for (size_t i = 0; i < scalar_count(action); i++) {
-        const node *entry = scalar_at(action, i);
-        if (entry == NULL || !node_scalar_equals(entry, "s3:ListBucket")) {
-            continue;
-        }
-        if (bucket_handler_statement) {
-            continue;
-        }
-        const node *condition = map_get(n, "Condition");
-        if (condition == NULL || !node_contains(condition, "s3:prefix")) {
-            violation(c, "operator ListBucket must be s3:prefix-conditioned");
-        }
-    }
-    for (size_t i = 0; i < scalar_count(resource); i++) {
-        const node *entry = scalar_at(resource, i);
-        if (entry == NULL) {
-            continue;
-        }
-        char literal[1024];
-        int opaque = 0;
-        if (resource_literal(entry->text, literal, sizeof(literal), &opaque) == 0) {
-            continue;
-        }
-        int is_s3_object_action = action_list_contains(action, "s3:GetObject") ||
-                                  action_list_contains(action, "s3:PutObject") ||
-                                  action_list_contains(action, "s3:DeleteObject");
-        if (is_s3_object_action && strstr(literal, "/releases/") == NULL) {
-            violation(c, "operator S3 object access must be confined to releases/*: %s", literal);
+    if (action != NULL) {
+        resolution actions = {0};
+        resolve_node(action, &actions);
+        if (actions.unsupported_shape != NULL) {
+            violation(c, "operator S3 policy Action uses an unsupported intrinsic "
+                         "shape%s: %s",
+                      via, actions.unsupported_shape);
+        } else {
+            /* The CloudFormation bucket handler needs an unscoped s3:ListBucket
+             * (HeadBucket) while it creates/deletes the bucket. That statement
+             * is identified by its co-located bucket lifecycle write grants. */
+            const int bucket_handler_statement =
+                resolved_has(&actions, "s3:CreateBucket") &&
+                resolved_has(&actions, "s3:DeleteBucket");
+            const int list_bucket = resolved_has(&actions, "s3:ListBucket");
+            const int object_action = resolved_has(&actions, "s3:GetObject") ||
+                                      resolved_has(&actions, "s3:PutObject") ||
+                                      resolved_has(&actions, "s3:DeleteObject");
+            if (resource != NULL && (list_bucket || object_action)) {
+                resolution resources = {0};
+                resolve_node(resource, &resources);
+                if (resources.unsupported_shape != NULL) {
+                    /* Rule 2: ListBucket needs no s3:prefix condition, but its
+                     * resource must be exactly the own project bucket ARN (or
+                     * the certs bucket for the bucket-handler statement). An
+                     * unresolved shape cannot be proven to be either. */
+                    if (list_bucket) {
+                        violation(c, "operator ListBucket resource must be the own "
+                                     "project artifact bucket ARN%s: unsupported "
+                                     "intrinsic %s",
+                                  via, resources.unsupported_shape);
+                    }
+                    /* Rule 1: object grants must be an own-project !Sub literal
+                     * ending in the object wildcard. */
+                    if (object_action) {
+                        violation(c, "operator S3 object resource is not an "
+                                     "own-project !Sub literal%s: unsupported "
+                                     "intrinsic %s",
+                                  via, resources.unsupported_shape);
+                    }
+                } else {
+                    for (size_t i = 0; i < resources.count; i++) {
+                        const resolved_value *value = &resources.values[i];
+                        /* The bucket-handler exemption is not blanket: it may
+                         * list only the own project bucket or the certs bucket.
+                         * Any other bucket resource is still a rule-2 breach. */
+                        const int list_bucket_allowed =
+                            strcmp(value->literal, OWN_ARTIFACT_BUCKET_ARN) == 0 ||
+                            (bucket_handler_statement &&
+                             strcmp(value->literal, OWN_CERT_BUCKET_ARN) == 0);
+                        if (list_bucket && !list_bucket_allowed) {
+                            violation(c, "operator ListBucket resource must be the "
+                                         "own project artifact bucket ARN%s: %s (%s)",
+                                      via, value->literal, value->shape);
+                        }
+                        if (object_action &&
+                            (!value->from_sub ||
+                             strcmp(value->literal, OWN_ARTIFACT_OBJECT_ARN) != 0)) {
+                            violation(c, "operator S3 object resource is not an "
+                                         "own-project !Sub literal%s: %s (%s)",
+                                      via, value->literal, value->shape);
+                        }
+                    }
+                }
+            }
         }
     }
     for (size_t i = 0; i < n->npairs; i++) {
-        check_operator_s3_scope(c, n->pairs[i].value);
+        check_operator_s3_scope(c, n->pairs[i].value, attachment);
     }
+}
+
+/* Rule 4: the CI ArtifactReaderPolicy may only read. It grants GetObject on
+ * the own project's objects and ListBucket on the own project's bucket; any
+ * Put/Delete or other bucket is a violation. */
+static void check_reader_statement(checker *c, const node *n) {
+    if (n == NULL) {
+        return;
+    }
+    if (n->kind == NODE_SEQ) {
+        for (size_t i = 0; i < n->nitems; i++) {
+            check_reader_statement(c, n->items[i]);
+        }
+        return;
+    }
+    if (n->kind != NODE_MAP) {
+        return;
+    }
+    if (map_get(n, "NotAction") != NULL) {
+        violation(c, "ArtifactReaderPolicy uses an unsupported negated form "
+                     "(NotAction)");
+    }
+    if (map_get(n, "NotResource") != NULL) {
+        violation(c, "ArtifactReaderPolicy uses an unsupported negated form "
+                     "(NotResource)");
+    }
+    const node *action = map_get(n, "Action");
+    const node *resource = map_get(n, "Resource");
+    if (action != NULL) {
+        resolution actions = {0};
+        resolve_node(action, &actions);
+        if (actions.unsupported_shape != NULL) {
+            violation(c, "ArtifactReaderPolicy Action uses an unsupported "
+                         "intrinsic shape: %s",
+                      actions.unsupported_shape);
+        } else {
+            for (size_t i = 0; i < actions.count; i++) {
+                const resolved_value *value = &actions.values[i];
+                int get_object = strcmp(value->literal, "s3:GetObject") == 0;
+                int list_bucket = strcmp(value->literal, "s3:ListBucket") == 0;
+                if (!get_object && !list_bucket) {
+                    violation(c, "ArtifactReaderPolicy may grant only s3:GetObject "
+                                 "and s3:ListBucket, found %s",
+                              value->literal);
+                    continue;
+                }
+                if (resource == NULL) {
+                    continue;
+                }
+                resolution resources = {0};
+                resolve_node(resource, &resources);
+                if (resources.unsupported_shape != NULL) {
+                    violation(c, "ArtifactReaderPolicy %s resource must be an "
+                                 "own-project !Sub literal: unsupported intrinsic %s",
+                              get_object ? "GetObject" : "ListBucket",
+                              resources.unsupported_shape);
+                    continue;
+                }
+                for (size_t j = 0; j < resources.count; j++) {
+                    const resolved_value *target = &resources.values[j];
+                    if (get_object &&
+                        (!target->from_sub ||
+                         strcmp(target->literal, OWN_ARTIFACT_OBJECT_ARN) != 0)) {
+                        violation(c, "ArtifactReaderPolicy GetObject resource must "
+                                     "be an own-project !Sub literal: %s (%s)",
+                                  target->literal, target->shape);
+                    } else if (list_bucket &&
+                               strcmp(target->literal, OWN_ARTIFACT_BUCKET_ARN) != 0) {
+                        violation(c, "ArtifactReaderPolicy ListBucket resource must "
+                                     "be the own project artifact bucket ARN: %s (%s)",
+                                  target->literal, target->shape);
+                    }
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < n->npairs; i++) {
+        check_reader_statement(c, n->pairs[i].value);
+    }
+}
+
+/* Rule 4 keys on the project-scoped CI identity (CONTRACT: `<project>-ci`).
+ * The identity can be a User, Role, or Group; a policy reaches it through
+ * Users/Roles/Groups (by logical id or exact emitted name), through the
+ * identity's own ManagedPolicyArns, through its inline Policies, or through
+ * membership of a group the CI user joins (UserToGroupAddition). Every one of
+ * those paths is a CI-reader grant and is held to the read-only rule. */
+#define CI_IDENTITY_NAME "${ProjectName}-ci"
+#define CI_IDENTITY_MAX 16
+
+typedef struct {
+    const char *logical_id;
+    const char *name_field;
+    char name[256];
+    int has_name;
+} ci_identity;
+
+typedef struct {
+    ci_identity items[CI_IDENTITY_MAX];
+    size_t count;
+    int overflowed;
+    /* A User/Role/Group whose declared name cannot be resolved to an exact
+     * literal could be the CI identity; the caller fails closed and names the
+     * first such resource. */
+    int unresolved_names;
+    const char *unresolved_name_id;
+} ci_identities;
+
+static const char *ci_identity_name_field(const node *resource) {
+    if (resource_is_type(resource, "AWS::IAM::User")) {
+        return "UserName";
+    }
+    if (resource_is_type(resource, "AWS::IAM::Role")) {
+        return "RoleName";
+    }
+    if (resource_is_type(resource, "AWS::IAM::Group")) {
+        return "GroupName";
+    }
+    return NULL;
+}
+
+static const char *skip_name_spaces(const char *text) {
+    while (*text == ' ' || *text == '\t') {
+        text++;
+    }
+    return text;
+}
+
+/* Resolves one scalar piece of a name (a literal, a quoted string, or
+ * `!Ref ProjectName`). Resource refs are not names, so they stay unresolved. */
+static int resolve_name_piece(const char *text, char *out, size_t capacity) {
+    out[0] = '\0';
+    text = skip_name_spaces(text);
+    if (strncmp(text, "!Ref", 4) == 0 &&
+        (text[4] == ' ' || text[4] == '\t')) {
+        const char *target = skip_name_spaces(text + 4);
+        if (strcmp(target, "ProjectName") == 0) {
+            snprintf(out, capacity, "${ProjectName}");
+            return 1;
+        }
+        return 0;
+    }
+    if (text[0] == '!') {
+        return 0;
+    }
+    while (*text == ' ' || *text == '\t') {
+        text++;
+    }
+    raw_unquote(text, out, capacity);
+    size_t length = strlen(out);
+    while (length > 0 && (out[length - 1] == ' ' || out[length - 1] == '\t')) {
+        out[--length] = '\0';
+    }
+    return 1;
+}
+
+static int sub_variable_is_known(const char *name, size_t length) {
+    static const char project_name[] = "ProjectName";
+    return length == sizeof(project_name) - 1 &&
+           memcmp(name, project_name, length) == 0;
+}
+
+/* Resolves the value a scalar Fn::Sub template emits. Only the ${ProjectName}
+ * pseudo-parameter is knowable statically; any other ${...} variable makes the
+ * emitted name unknowable, so it is left unresolved and the caller's
+ * fail-closed path rejects it (D23). */
+static int resolve_scalar_sub(const char *text, char *out, size_t capacity) {
+    char template_text[512];
+    raw_unquote(text, template_text, sizeof(template_text));
+    static const char project_reference[] = "${ProjectName}";
+    size_t used = 0;
+    const char *cursor = template_text;
+    while (*cursor != '\0') {
+        if (cursor[0] == '$' && cursor[1] == '{') {
+            const char *close = strchr(cursor + 2, '}');
+            if (close == NULL ||
+                !sub_variable_is_known(cursor + 2,
+                                       (size_t)(close - (cursor + 2)))) {
+                return 0;
+            }
+            size_t reference_length = sizeof(project_reference) - 1;
+            if (used + reference_length + 1 > capacity) {
+                return 0;
+            }
+            memcpy(out + used, project_reference, reference_length);
+            used += reference_length;
+            cursor = close + 1;
+            continue;
+        }
+        if (used + 2 > capacity) {
+            return 0;
+        }
+        out[used++] = *cursor++;
+    }
+    while (used > 0 && (out[used - 1] == ' ' || out[used - 1] == '\t')) {
+        used--;
+    }
+    out[used] = '\0';
+    return 1;
+}
+
+/* `!Join ['-', [!Ref ProjectName, 'ci']]` written as a scalar token. Resolving
+ * it exactly keeps a short-form join from silently evading identity matching;
+ * any unexpected shape is left unresolved. */
+static int resolve_scalar_join(const char *text, char *out, size_t capacity) {
+    const char *cursor = skip_name_spaces(text);
+    if (*cursor != '[') {
+        return 0;
+    }
+    cursor = skip_name_spaces(cursor + 1);
+    const char *comma = strchr(cursor, ',');
+    if (comma == NULL) {
+        return 0;
+    }
+    char delimiter[32];
+    char raw_delimiter[32];
+    size_t delimiter_length = (size_t)(comma - cursor);
+    if (delimiter_length >= sizeof(raw_delimiter)) {
+        return 0;
+    }
+    memcpy(raw_delimiter, cursor, delimiter_length);
+    raw_delimiter[delimiter_length] = '\0';
+    if (!resolve_name_piece(raw_delimiter, delimiter, sizeof(delimiter))) {
+        return 0;
+    }
+    cursor = skip_name_spaces(comma + 1);
+    if (*cursor != '[') {
+        return 0;
+    }
+    cursor++;
+    size_t used = 0;
+    out[0] = '\0';
+    int first = 1;
+    for (;;) {
+        cursor = skip_name_spaces(cursor);
+        if (*cursor == ']') {
+            break;
+        }
+        const char *end = cursor;
+        int quote = 0;
+        while (*end != '\0') {
+            char c = *end;
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                }
+                end++;
+                continue;
+            }
+            if (c == '\'' || c == '"') {
+                quote = c;
+                end++;
+                continue;
+            }
+            if (c == ',' || c == ']') {
+                break;
+            }
+            end++;
+        }
+        if (*end == '\0') {
+            return 0;
+        }
+        char raw_piece[512];
+        size_t piece_length = (size_t)(end - cursor);
+        if (piece_length >= sizeof(raw_piece)) {
+            return 0;
+        }
+        memcpy(raw_piece, cursor, piece_length);
+        raw_piece[piece_length] = '\0';
+        char piece[512];
+        if (!resolve_name_piece(raw_piece, piece, sizeof(piece))) {
+            return 0;
+        }
+        size_t piece_size = strlen(piece);
+        size_t delim_size = first ? 0 : strlen(delimiter);
+        if (used + delim_size + piece_size + 1 > capacity) {
+            return 0;
+        }
+        if (delim_size > 0) {
+            memcpy(out + used, delimiter, delim_size);
+            used += delim_size;
+        }
+        memcpy(out + used, piece, piece_size);
+        used += piece_size;
+        out[used] = '\0';
+        first = 0;
+        cursor = end;
+        if (*cursor == ',') {
+            cursor++;
+        }
+    }
+    /* The scalar carries the items list close bracket and then the join
+     * argument-list close bracket; both must be consumed for the shape to be
+     * the well-formed `['-', [items]]` form. */
+    if (*cursor != ']') {
+        return 0;
+    }
+    cursor = skip_name_spaces(cursor + 1);
+    if (*cursor != ']') {
+        return 0;
+    }
+    cursor = skip_name_spaces(cursor + 1);
+    return *cursor == '\0';
+}
+
+/* Resolves a name node to the literal it emits. Returns 0 when the shape
+ * cannot be resolved (e.g. a Ref to a resource or a substitution map). */
+static int resolve_emitted_name(const node *name, char *out, size_t capacity) {
+    out[0] = '\0';
+    if (name == NULL) {
+        return 0;
+    }
+    if (name->kind == NODE_MAP) {
+        const node *fn_sub = map_get(name, "Fn::Sub");
+        if (fn_sub != NULL) {
+            if (fn_sub->kind == NODE_SCALAR) {
+                return resolve_scalar_sub(fn_sub->text, out, capacity);
+            }
+            if (fn_sub->kind == NODE_SEQ && fn_sub->nitems == 1 &&
+                fn_sub->items[0]->kind == NODE_SCALAR) {
+                return resolve_scalar_sub(fn_sub->items[0]->text, out, capacity);
+            }
+            return 0;
+        }
+        const node *fn_join = map_get(name, "Fn::Join");
+        if (fn_join != NULL) {
+            if (fn_join->kind != NODE_SEQ || fn_join->nitems != 2 ||
+                fn_join->items[0]->kind != NODE_SCALAR ||
+                fn_join->items[1]->kind != NODE_SEQ) {
+                return 0;
+            }
+            char delimiter[32];
+            if (!resolve_name_piece(fn_join->items[0]->text, delimiter,
+                                    sizeof(delimiter))) {
+                return 0;
+            }
+            const node *parts = fn_join->items[1];
+            size_t used = 0;
+            out[0] = '\0';
+            for (size_t i = 0; i < parts->nitems; i++) {
+                char piece[512];
+                if (!resolve_emitted_name(parts->items[i], piece, sizeof(piece))) {
+                    return 0;
+                }
+                size_t piece_size = strlen(piece);
+                size_t delim_size = i == 0 ? 0 : strlen(delimiter);
+                if (used + delim_size + piece_size + 1 > capacity) {
+                    return 0;
+                }
+                if (delim_size > 0) {
+                    memcpy(out + used, delimiter, delim_size);
+                    used += delim_size;
+                }
+                memcpy(out + used, piece, piece_size);
+                used += piece_size;
+                out[used] = '\0';
+            }
+            return 1;
+        }
+        const node *ref = map_get(name, "Ref");
+        if (ref != NULL && node_scalar_equals(ref, "ProjectName")) {
+            snprintf(out, capacity, "${ProjectName}");
+            return 1;
+        }
+        return 0;
+    }
+    if (name->kind != NODE_SCALAR || name->text == NULL) {
+        return 0;
+    }
+    const char *text = skip_name_spaces(name->text);
+    if (strncmp(text, "!Sub", 4) == 0 && (text[4] == ' ' || text[4] == '\t')) {
+        const char *body = skip_name_spaces(text + 4);
+        /* The sequence form `!Sub [template, {map}]` can rebind the variables
+         * that make up the name, so its emitted value is not knowable here. */
+        if (*body == '[') {
+            return 0;
+        }
+        return resolve_scalar_sub(body, out, capacity);
+    }
+    if (strncmp(text, "!Join", 5) == 0 && (text[5] == ' ' || text[5] == '\t')) {
+        return resolve_scalar_join(text + 5, out, capacity);
+    }
+    if (strncmp(text, "!Ref", 4) == 0 && (text[4] == ' ' || text[4] == '\t')) {
+        return resolve_name_piece(text, out, capacity);
+    }
+    if (text[0] == '!') {
+        return 0;
+    }
+    raw_unquote(text, out, capacity);
+    return 1;
+}
+
+static void ci_identities_add(ci_identities *set, const char *logical_id,
+                              const char *name_field, const char *emitted) {
+    if (set->count >= CI_IDENTITY_MAX) {
+        set->overflowed++;
+        return;
+    }
+    ci_identity *identity = &set->items[set->count++];
+    identity->logical_id = logical_id;
+    identity->name_field = name_field;
+    snprintf(identity->name, sizeof(identity->name), "%s", emitted);
+    identity->has_name = identity->name[0] != '\0';
+}
+
+static ci_identities find_ci_identities(const node *root) {
+    ci_identities set = {0};
+    const node *resources = template_resources(root);
+    if (resources == NULL || resources->kind != NODE_MAP) {
+        return set;
+    }
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const node *resource = resources->pairs[i].value;
+        const char *field = ci_identity_name_field(resource);
+        if (field == NULL) {
+            continue;
+        }
+        const node *name = map_get(map_get(resource, "Properties"), field);
+        char emitted[256];
+        if (!resolve_emitted_name(name, emitted, sizeof(emitted))) {
+            /* An unnamed identity is auto-generated and can never equal the
+             * project-scoped CI name; only a declared-but-unresolvable name
+             * could be the CI identity. */
+            if (name != NULL) {
+                if (set.unresolved_names == 0) {
+                    set.unresolved_name_id = resources->pairs[i].key;
+                }
+                set.unresolved_names++;
+            }
+            continue;
+        }
+        /* Exact normalized equality: a name that merely contains `-ci`
+         * (e.g. `${ProjectName}-ci-tools`) is a different identity. */
+        if (strcmp(emitted, CI_IDENTITY_NAME) != 0) {
+            continue;
+        }
+        ci_identities_add(&set, resources->pairs[i].key, field, emitted);
+    }
+    return set;
+}
+
+static int entry_ref_target(const node *entry, char *out, size_t capacity) {
+    if (entry == NULL) {
+        return 0;
+    }
+    if (entry->kind == NODE_MAP) {
+        const node *ref = map_get(entry, "Ref");
+        if (ref == NULL || ref->kind != NODE_SCALAR) {
+            return 0;
+        }
+        raw_unquote(ref->text, out, capacity);
+        return 1;
+    }
+    if (entry->kind != NODE_SCALAR || entry->text == NULL) {
+        return 0;
+    }
+    const char *text = skip_name_spaces(entry->text);
+    if (strncmp(text, "!Ref", 4) != 0 || (text[4] != ' ' && text[4] != '\t')) {
+        return 0;
+    }
+    text = skip_name_spaces(text + 4);
+    snprintf(out, capacity, "%s", text);
+    return 1;
+}
+
+static int entry_names_ci_identity(const node *entry, const ci_identities *set) {
+    char target[256];
+    if (entry_ref_target(entry, target, sizeof(target))) {
+        for (size_t i = 0; i < set->count; i++) {
+            if (set->items[i].logical_id != NULL &&
+                strcmp(set->items[i].logical_id, target) == 0) {
+                return 1;
+            }
+        }
+    }
+    char emitted[256];
+    if (!resolve_emitted_name(entry, emitted, sizeof(emitted))) {
+        return 0;
+    }
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->items[i].has_name && strcmp(set->items[i].name, emitted) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Membership and attachment sections must be plain lists. An intrinsic map
+ * (long-form `Ref`, `Fn::If`, `Fn::ImportValue`, ...) or a bare scalar
+ * intrinsic hides the principals or groups from the checker, so it fails
+ * closed instead of being silently skipped (D27). */
+static int section_is_plain_sequence(checker *c, const node *section,
+                                     const char *what) {
+    if (section == NULL || section->kind == NODE_SEQ) {
+        return 1;
+    }
+    violation(c, "%s must be a plain list of statically resolvable entries; "
+                 "intrinsic or mapping forms cannot be checked",
+              what);
+    return 0;
+}
+
+/* An entry is statically resolvable when it names a concrete principal: a
+ * literal, a short- or long-form Ref to an existing logical id, a known !Sub,
+ * or an exactly-resolvable !Join. An intrinsic map (Fn::If, Fn::ImportValue,
+ * a substitution-map !Sub) or a nested list hides the principal from the
+ * checker, so it fails closed instead of being treated as "not CI" (D29). */
+static int entry_is_statically_resolvable(const node *entry,
+                                          const node *resources) {
+    if (entry == NULL || entry->kind == NODE_SEQ) {
+        return 0;
+    }
+    char target[256];
+    if (entry_ref_target(entry, target, sizeof(target))) {
+        return resources == NULL || map_get(resources, target) != NULL;
+    }
+    /* The parser keeps a YAML flow collection written as a sequence item
+     * (`- [a, b]`) as a scalar token; it is a nested list, not a name. */
+    if (entry->kind == NODE_SCALAR && entry->text != NULL) {
+        const char *text = skip_name_spaces(entry->text);
+        if (*text == '[' || *text == '{') {
+            return 0;
+        }
+    }
+    char emitted[256];
+    return resolve_emitted_name(entry, emitted, sizeof(emitted));
+}
+
+static int section_entries_are_statically_resolvable(checker *c,
+                                                     const node *section,
+                                                     const node *resources,
+                                                     const char *what) {
+    if (section == NULL || section->kind != NODE_SEQ) {
+        return 1;
+    }
+    int all_resolvable = 1;
+    for (size_t i = 0; i < section->nitems; i++) {
+        if (entry_is_statically_resolvable(section->items[i], resources)) {
+            continue;
+        }
+        violation(c, "%s entry must be statically resolvable (literal, !Ref of "
+                     "an existing logical id, known-!Sub, or "
+                     "exactly-resolvable !Join); intrinsic or nested forms "
+                     "cannot be checked",
+                  what);
+        all_resolvable = 0;
+    }
+    return all_resolvable;
+}
+
+static int section_names_ci_identity(const node *section, const ci_identities *set) {
+    for (size_t i = 0; i < scalar_count(section); i++) {
+        if (entry_names_ci_identity(scalar_at(section, i), set)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Resolves a Groups/GroupName entry to the logical id of an existing Group
+ * resource. The entry may be `!Ref <logical id>` or a literal/emitted name
+ * that matches the Group's own GroupName. */
+static int resolve_group_logical_id(const node *resources, const node *entry,
+                                    char *out, size_t capacity) {
+    if (entry == NULL) {
+        return 0;
+    }
+    char ref[256];
+    if (entry_ref_target(entry, ref, sizeof(ref))) {
+        const node *group = map_get(resources, ref);
+        if (group == NULL || !resource_is_type(group, "AWS::IAM::Group")) {
+            return 0;
+        }
+        snprintf(out, capacity, "%s", ref);
+        return 1;
+    }
+    char emitted[256];
+    if (!resolve_emitted_name(entry, emitted, sizeof(emitted))) {
+        return 0;
+    }
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const node *group = resources->pairs[i].value;
+        if (!resource_is_type(group, "AWS::IAM::Group")) {
+            continue;
+        }
+        char group_name[256];
+        if (!resolve_emitted_name(map_get(map_get(group, "Properties"), "GroupName"),
+                                  group_name, sizeof(group_name))) {
+            continue;
+        }
+        if (strcmp(group_name, emitted) == 0) {
+            snprintf(out, capacity, "%s", resources->pairs[i].key);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void add_membership_group(ci_identities *set, const node *resources,
+                                 const char *logical_id) {
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->items[i].logical_id != NULL &&
+            strcmp(set->items[i].logical_id, logical_id) == 0) {
+            return;
+        }
+    }
+    const node *group = map_get(resources, logical_id);
+    char emitted[256];
+    if (!resolve_emitted_name(map_get(map_get(group, "Properties"), "GroupName"),
+                              emitted, sizeof(emitted))) {
+        emitted[0] = '\0';
+    }
+    ci_identities_add(set, logical_id, "GroupName", emitted);
+}
+
+/* A CI user added to a group inherits the group's policies, so that group is
+ * as much a CI-reader identity as a CI-named group. Membership is modelled
+ * from both `AWS::IAM::UserToGroupAddition` and the user's own Groups list. */
+static void add_ci_membership_groups(ci_identities *set, checker *c,
+                                     const node *root) {
+    const node *resources = template_resources(root);
+    if (resources == NULL || resources->kind != NODE_MAP) {
+        return;
+    }
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const node *addition = resources->pairs[i].value;
+        if (!resource_is_type(addition, "AWS::IAM::UserToGroupAddition")) {
+            continue;
+        }
+        const node *properties = map_get(addition, "Properties");
+        const node *users = map_get(properties, "Users");
+        if (!section_is_plain_sequence(
+                c, users, "UserToGroupAddition Properties.Users")) {
+            continue;
+        }
+        section_entries_are_statically_resolvable(
+            c, users, resources, "UserToGroupAddition Properties.Users");
+        if (!section_names_ci_identity(users, set)) {
+            continue;
+        }
+        char group_id[256];
+        if (!resolve_group_logical_id(resources, map_get(properties, "GroupName"),
+                                      group_id, sizeof(group_id))) {
+            violation(c, "IAM membership entry must be statically resolvable "
+                         "to a Group resource (literal name or !Ref of a "
+                         "Group); cannot prove which policies attach");
+            continue;
+        }
+        add_membership_group(set, resources, group_id);
+    }
+    /* Only memberships of a CI *user* make the joined group part of the CI
+     * identity set; capture the user count before groups are appended. */
+    const size_t ci_user_count = set->count;
+    for (size_t i = 0; i < ci_user_count; i++) {
+        const node *user = map_get(resources, set->items[i].logical_id);
+        if (user == NULL || !resource_is_type(user, "AWS::IAM::User")) {
+            continue;
+        }
+        const node *groups = map_get(map_get(user, "Properties"), "Groups");
+        if (!section_is_plain_sequence(
+                c, groups, "IAM membership Properties.Groups")) {
+            continue;
+        }
+        section_entries_are_statically_resolvable(
+            c, groups, resources, "IAM membership Properties.Groups");
+        for (size_t j = 0; j < scalar_count(groups); j++) {
+            char group_id[256];
+            if (!resolve_group_logical_id(resources, scalar_at(groups, j),
+                                          group_id, sizeof(group_id))) {
+                violation(c, "IAM membership entry must be statically "
+                             "resolvable to a Group resource (literal name or "
+                             "!Ref of a Group); cannot prove which policies "
+                             "attach");
+                continue;
+            }
+            add_membership_group(set, resources, group_id);
+        }
+    }
+}
+
+static int policy_names_ci_identity(const node *policy, const ci_identities *set) {
+    static const char *const sections[] = {"Users", "Roles", "Groups"};
+    const node *properties = map_get(policy, "Properties");
+    for (size_t i = 0; i < sizeof(sections) / sizeof(sections[0]); i++) {
+        if (section_names_ci_identity(map_get(properties, sections[i]), set)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int is_ci_reader_policy(const node *root, const node *policy,
+                               const char *logical_id, const ci_identities *set) {
+    if (!resource_is_type(policy, "AWS::IAM::ManagedPolicy") &&
+        !resource_is_type(policy, "AWS::IAM::Policy")) {
+        return 0;
+    }
+    const node *resources = template_resources(root);
+    for (size_t i = 0; i < set->count; i++) {
+        const node *identity = map_get(resources, set->items[i].logical_id);
+        const node *arns = map_get(map_get(identity, "Properties"),
+                                   "ManagedPolicyArns");
+        if (arns != NULL && node_references(arns, logical_id)) {
+            return 1;
+        }
+    }
+    return policy_names_ci_identity(policy, set);
+}
+
+/* CI identities carry inline Policies directly on the user/role/group. Those
+ * documents grant the same S3 access and are held to rule 4. A conditional or
+ * otherwise non-literal entry is rejected rather than skipped. */
+static void check_ci_inline_policies(checker *c, const node *resources,
+                                     const ci_identities *set) {
+    for (size_t i = 0; i < set->count; i++) {
+        const node *identity = map_get(resources, set->items[i].logical_id);
+        const node *policies =
+            map_get(map_get(identity, "Properties"), "Policies");
+        if (policies == NULL) {
+            continue;
+        }
+        if (policies->kind != NODE_SEQ) {
+            violation(c, "CI identity inline Policies must be a list of literal "
+                         "PolicyDocument entries");
+            continue;
+        }
+        for (size_t j = 0; j < policies->nitems; j++) {
+            const node *document =
+                map_get(policies->items[j], "PolicyDocument");
+            if (document == NULL) {
+                violation(c, "CI identity inline policy entry uses an unsupported "
+                             "intrinsic shape");
+                continue;
+            }
+            check_reader_statement(c, document);
+        }
+    }
+}
+
+/* A principal reference that cannot be tied to a User/Role/Group resource (a
+ * parameter, an attribute, or an unsupported intrinsic) could name the CI
+ * identity; failing closed keeps an unresolvable principal from escaping
+ * rule 4. */
+static void check_unresolved_policy_principals(checker *c, const node *root) {
+    const node *resources = template_resources(root);
+    static const char *const sections[] = {"Users", "Roles", "Groups"};
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const node *policy = resources->pairs[i].value;
+        if (!resource_is_type(policy, "AWS::IAM::ManagedPolicy") &&
+            !resource_is_type(policy, "AWS::IAM::Policy")) {
+            continue;
+        }
+        const node *properties = map_get(policy, "Properties");
+        for (size_t j = 0; j < sizeof(sections) / sizeof(sections[0]); j++) {
+            const node *section = map_get(properties, sections[j]);
+            char label[64];
+            snprintf(label, sizeof(label), "IAM policy %s section", sections[j]);
+            if (!section_is_plain_sequence(c, section, label)) {
+                continue;
+            }
+            section_entries_are_statically_resolvable(c, section, resources,
+                                                      label);
+            for (size_t k = 0; k < scalar_count(section); k++) {
+                const node *entry = scalar_at(section, k);
+                char target[256];
+                if (entry_ref_target(entry, target, sizeof(target))) {
+                    const node *referenced = map_get(resources, target);
+                    if (referenced != NULL &&
+                        ci_identity_name_field(referenced) != NULL) {
+                        continue;
+                    }
+                    violation(c, "IAM policy %s entry !Ref %s does not resolve "
+                                 "to a User/Role/Group resource",
+                              sections[j], target);
+                    continue;
+                }
+                char emitted[256];
+                if (!resolve_emitted_name(entry, emitted, sizeof(emitted))) {
+                    violation(c, "IAM policy %s entry cannot be resolved to a "
+                                 "principal name", sections[j]);
+                }
+            }
+        }
+    }
+}
+
+static void check_artifact_reader_policies(checker *c, const node *root) {
+    const node *resources = template_resources(root);
+    if (resources == NULL || resources->kind != NODE_MAP) {
+        return;
+    }
+    ci_identities identities = find_ci_identities(root);
+    add_ci_membership_groups(&identities, c, root);
+    if (identities.overflowed > 0) {
+        violation(c, "too many CI identities to inspect (%zu not inspected)",
+                  identities.overflowed);
+    }
+    if (identities.unresolved_names > 0) {
+        violation(c, "IAM identity %s name must be statically resolvable "
+                     "(literal or !Sub of known pseudo-parameters); cannot "
+                     "prove it is not the CI identity",
+                  identities.unresolved_name_id);
+    }
+    for (size_t i = 0; i < resources->npairs; i++) {
+        const char *logical_id = resources->pairs[i].key;
+        const node *policy = resources->pairs[i].value;
+        const int canonical = strcmp(logical_id, "ArtifactReaderPolicy") == 0;
+        if (!canonical && !is_ci_reader_policy(root, policy, logical_id, &identities)) {
+            continue;
+        }
+        const node *properties = map_get(policy, "Properties");
+        check_reader_statement(c, map_get(properties, "PolicyDocument"));
+    }
+    check_ci_inline_policies(c, resources, &identities);
+    check_unresolved_policy_principals(c, root);
 }
 
 static int name_is_project_driven(const node *name) {
@@ -1319,7 +2321,7 @@ static int operator_policy_attached(const node *root, const char *user_id, const
  * carries OperatorPolicy.  Locating it once keeps the user requirement and the
  * policy-union scans reading from the same definition.
  */
-static const node *find_operator_user(const node *root) {
+static const char *find_operator_user_name(const node *root) {
     const node *resources = template_resources(root);
     if (resources == NULL || resources->kind != NODE_MAP) {
         return NULL;
@@ -1339,9 +2341,17 @@ static const node *find_operator_user(const node *root) {
         if (!operator_policy_attached(root, resources->pairs[i].key, user)) {
             continue;
         }
-        return user;
+        return resources->pairs[i].key;
     }
     return NULL;
+}
+
+static const node *find_operator_user(const node *root) {
+    const char *name = find_operator_user_name(root);
+    if (name == NULL) {
+        return NULL;
+    }
+    return map_get(template_resources(root), name);
 }
 
 /*
@@ -1350,30 +2360,80 @@ static const node *find_operator_user(const node *root) {
  * about the union attached to OperatorUser, not one policy resource, or a
  * statement moved to a sibling policy would silently escape validation.
  */
+static void operator_policies_add(operator_policies *set, const node *policy,
+                                  const char *attachment) {
+    for (size_t i = 0; i < set->count; i++) {
+        if (set->items[i] == policy) {
+            return;
+        }
+    }
+    if (set->count < OPERATOR_MAX_POLICIES) {
+        set->items[set->count] = policy;
+        set->attachments[set->count] = attachment;
+        set->count++;
+    } else {
+        set->overflowed++;
+    }
+}
+
+/* A policy attached to the operator user must be inspected regardless of the
+ * resource type that carries it: ARM/IAM policy documents live on both
+ * AWS::IAM::ManagedPolicy and AWS::IAM::Policy. */
+static int is_operator_attach_policy(const node *resource) {
+    return resource_is_type(resource, "AWS::IAM::ManagedPolicy") ||
+           resource_is_type(resource, "AWS::IAM::Policy");
+}
+
+/* A ManagedPolicy may attach to the operator user without the user naming it
+ * in ManagedPolicyArns: the policy's own Users/Roles/Groups list names the
+ * user instead. Such a policy grants exactly the same permissions and must be
+ * scanned by the same scope rules (CONTRACT checker rule 3). */
+static const char *policy_attachment(const node *policy, const char *user_id) {
+    static const char *const attachment_sections[] = {"Users", "Roles", "Groups"};
+    const node *properties = map_get(policy, "Properties");
+    for (size_t i = 0;
+         i < sizeof(attachment_sections) / sizeof(attachment_sections[0]); i++) {
+        if (node_references(map_get(properties, attachment_sections[i]), user_id)) {
+            return attachment_sections[i];
+        }
+    }
+    return NULL;
+}
+
 static operator_policies collect_operator_policies(const node *root) {
     operator_policies set = {0};
     const node *resources = template_resources(root);
-    const node *user = find_operator_user(root);
-    if (resources == NULL || resources->kind != NODE_MAP || user == NULL) {
+    const char *user_id = find_operator_user_name(root);
+    if (resources == NULL || resources->kind != NODE_MAP || user_id == NULL) {
         return set;
     }
+    const node *user = map_get(resources, user_id);
     const node *arns = map_get(map_get(user, "Properties"), "ManagedPolicyArns");
-    if (arns == NULL) {
-        return set;
-    }
     for (size_t i = 0; i < resources->npairs; i++) {
         const node *candidate = resources->pairs[i].value;
-        if (!resource_is_type(candidate, "AWS::IAM::ManagedPolicy")) {
+        if (!is_operator_attach_policy(candidate)) {
             continue;
         }
-        if (!node_references(arns, resources->pairs[i].key)) {
+        if (resource_is_type(candidate, "AWS::IAM::ManagedPolicy") && arns != NULL &&
+            node_references(arns, resources->pairs[i].key)) {
+            operator_policies_add(&set, candidate, NULL);
             continue;
         }
-        if (set.count < OPERATOR_MAX_POLICIES) {
-            set.items[set.count++] = candidate;
+        const char *attachment = policy_attachment(candidate, user_id);
+        if (attachment != NULL) {
+            operator_policies_add(&set, candidate, attachment);
         }
     }
     return set;
+}
+
+static void check_operator_policy_overflow(checker *c, const operator_policies *set) {
+    if (set->overflowed == 0) {
+        return;
+    }
+    violation(c, "operator policy union exceeds the supported maximum of %d attached "
+                 "policies (%zu not inspected)",
+              OPERATOR_MAX_POLICIES, set->overflowed);
 }
 
 static const node *operator_policies_find_statement(const operator_policies *set,
@@ -1714,6 +2774,39 @@ static void check_operator_infra_handler_permissions(checker *c, const node *roo
     }
 }
 
+/* Operator INLINE policies live in the user's own Properties.Policies rather
+ * than in a resource-level policy document; they grant the same S3 access and
+ * are held to the same rule-1/rule-2 own-bucket scope. */
+static void check_operator_inline_policies(checker *c, const node *root) {
+    const node *user = find_operator_user(root);
+    if (user == NULL) {
+        return;
+    }
+    const node *policies = map_get(map_get(user, "Properties"), "Policies");
+    if (policies == NULL) {
+        return;
+    }
+    /* Inline policies are a literal list. A conditional element or an
+     * intrinsic standing in for the list cannot be proven to stay in scope, so
+     * it fails closed instead of being silently skipped. */
+    if (policies->kind != NODE_SEQ) {
+        violation(c, "operator inline Policies must be a literal list of "
+                     "PolicyDocument entries");
+        return;
+    }
+    for (size_t i = 0; i < policies->nitems; i++) {
+        const node *document = map_get(policies->items[i], "PolicyDocument");
+        if (document == NULL) {
+            const node *fn_if = map_get(policies->items[i], "Fn::If");
+            violation(c, "operator inline policy entry uses an unsupported "
+                         "intrinsic shape%s",
+                      fn_if != NULL ? " Fn::If" : "");
+            continue;
+        }
+        check_operator_s3_scope(c, document, "Policies");
+    }
+}
+
 static void check_operator(checker *c, const node *root) {
     check_required_params(c, root, OPERATOR_PARAMS,
                           sizeof(OPERATOR_PARAMS) / sizeof(OPERATOR_PARAMS[0]));
@@ -1724,10 +2817,6 @@ static void check_operator(checker *c, const node *root) {
 
     const node *resources = template_resources(root);
     check_iam_node(c, resources);
-    if (map_get(resources, "CiUser") != NULL) {
-        check_required_params(c, root, OPERATOR_CI_PARAMS,
-                              sizeof(OPERATOR_CI_PARAMS) / sizeof(OPERATOR_CI_PARAMS[0]));
-    }
     check_required_actions(c, root, OPERATOR_ACTIONS,
                            sizeof(OPERATOR_ACTIONS) / sizeof(OPERATOR_ACTIONS[0]));
 
@@ -1799,9 +2888,12 @@ static void check_operator(checker *c, const node *root) {
      * wildcard/action scan covers the managed-policy union attached to the
      * user. These scope checks reason about the same union explicitly. */
     const operator_policies operator = collect_operator_policies(root);
+    check_operator_policy_overflow(c, &operator);
     for (size_t i = 0; i < operator.count; i++) {
-        check_operator_s3_scope(c, operator.items[i]);
+        check_operator_s3_scope(c, operator.items[i], operator.attachments[i]);
     }
+    check_operator_inline_policies(c, root);
+    check_artifact_reader_policies(c, root);
 }
 
 /* ---------------------------------------------------------------- infra */

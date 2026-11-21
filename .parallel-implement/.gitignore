@@ -8,3 +8,9 @@ runs/*/state/waves/*
 !runs/*/state/waves/*.md
 runs/*/state/lanes/*
 !runs/*/state/lanes/*.md
+!runs/*/state/defects/
+runs/*/state/defects/*
+!runs/*/state/defects/*.md
+!runs/*/state/canary/
+runs/*/state/canary/*
+!runs/*/state/canary/*.md

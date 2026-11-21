@@ -72,7 +72,7 @@ static const char *const known_keys[] = {
     "SERVICE_UNIT",       "SSH_PORT",          "OPERATOR_CIDR",
     "IP_ECHO_URL",        "INGRESS_TCP",       "INGRESS_UDP",
     "DDNS_HOST",          "DDNS_DOMAIN",       "DDNS_ONBOX",
-    "RELEASE_TARGETS",    "BAZEL_COMMAND",     "RELEASE_PREFIXES",
+    "RELEASE_TARGETS",    "BAZEL_COMMAND",     "ENABLE_CI_USER",
     "TEMPLATE_OVERRIDE",  "IMAGE_BUILDER_PARENT_IMAGE",
     "PERMISSIONS_BOUNDARY_ARN", NULL,
 };
@@ -770,11 +770,10 @@ static int validate_config(const config_envfile *env, int region_explicit,
         "PROJECT",          "ARCH",        "SPOT_DEFAULT",
         "AMI_POLICY",       "INSTANCE_TYPES_AMD64", "ROOT_VOLUME_SIZE",
         "KEY_NAME",         "SSH_IDENTITY", "BUCKET_MODULES",
-        "ENABLE_IMAGE_BUILDER", "RELEASE_TARGETS", NULL,
+        "ENABLE_IMAGE_BUILDER", "RELEASE_TARGETS", "ENABLE_CI_USER", NULL,
     };
     static const char *const required_present[] = {
-        "OPERATOR_CIDR", "INGRESS_TCP", "INGRESS_UDP", "RELEASE_PREFIXES",
-        NULL,
+        "OPERATOR_CIDR", "INGRESS_TCP", "INGRESS_UDP", NULL,
     };
     const char *project;
     const char *arch;
@@ -782,6 +781,18 @@ static int validate_config(const config_envfile *env, int region_explicit,
     long number;
     size_t limit;
     int rc;
+
+    /* v0.2.0: RELEASE_PREFIXES is removed. A present key fails fast with the
+     * migration instruction rather than the generic unknown-key error. */
+    for (size_t i = 0; i < config_envfile_count(env); i++) {
+        if (strcmp(config_envfile_key_at(env, i), "RELEASE_PREFIXES") == 0) {
+            return cfg_error(
+                EINVAL,
+                "RELEASE_PREFIXES was removed in v0.2.0; set "
+                "ENABLE_CI_USER=true if it was non-empty, false if it was "
+                "empty");
+        }
+    }
 
     /* Unknown keys are errors, never warnings. */
     for (size_t i = 0; i < config_envfile_count(env); i++) {
@@ -844,6 +855,9 @@ static int validate_config(const config_envfile *env, int region_explicit,
     }
     if (!bool_is_valid(config_envfile_get(env, "ENABLE_IMAGE_BUILDER"))) {
         return cfg_error(EINVAL, "ENABLE_IMAGE_BUILDER must be true or false");
+    }
+    if (!bool_is_valid(config_envfile_get(env, "ENABLE_CI_USER"))) {
+        return cfg_error(EINVAL, "ENABLE_CI_USER must be true or false");
     }
     if (config_envfile_get(env, "ENABLE_SPOT_ALERTS") != NULL &&
         !bool_is_valid(config_envfile_get(env, "ENABLE_SPOT_ALERTS"))) {
@@ -928,17 +942,6 @@ static int validate_config(const config_envfile *env, int region_explicit,
         return cfg_error(EINVAL,
                          "RELEASE_TARGETS must be a non-empty comma list");
     }
-    /*
-     * F5: RELEASE_PREFIXES is a required-present key whose empty value means
-     * "no CI user". A non-empty value still has to be a valid comma list.
-     */
-    if (config_envfile_get(env, "RELEASE_PREFIXES")[0] != '\0' &&
-        !csv_each(config_envfile_get(env, "RELEASE_PREFIXES"),
-                  field_is_nonempty, NULL)) {
-        return cfg_error(EINVAL,
-                         "RELEASE_PREFIXES must be a non-empty comma list");
-    }
-
     if ((rc = validate_cross_keys(env, arch)) != 0) {
         return rc;
     }

@@ -94,7 +94,7 @@ static void write_env(const char *path) {
         "INGRESS_TCP=443",
         "INGRESS_UDP=",
         "RELEASE_TARGETS=//app:deploy.tar.gz",
-        "RELEASE_PREFIXES=releases/",
+        "ENABLE_CI_USER=true",
     };
     FILE *file = fopen(path, "w");
 

@@ -308,7 +308,7 @@ static const char *ENV_BODY =
     "INGRESS_TCP=443\n"
     "INGRESS_UDP=\n"
     "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-    "RELEASE_PREFIXES=releases/\n";
+    "ENABLE_CI_USER=true\n";
 
 static void locate_binary(char out[PATH_MAX]) {
     const char *srcdir = getenv("TEST_SRCDIR");

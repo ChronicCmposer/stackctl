@@ -86,6 +86,7 @@ typedef struct provision_env {
     int json;
     int rotate;
     int rotate_ci;
+    int delete_ci_user;
     FILE *out;
     FILE *err;
 

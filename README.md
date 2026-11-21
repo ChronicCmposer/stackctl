@@ -149,7 +149,7 @@ namespace or lock.
 **`provision` is primary-only.** It runs only from plain `.env`; `provision --region ...` exits 1.
 The account-global operator stack is built from the union of every sibling variant's
 operator-feeding keys (`INSTANCE_TYPES_*`, `BUCKET_MODULES`, `ENABLE_IMAGE_BUILDER`,
-`RELEASE_PREFIXES`). Adding a region or an instance type therefore requires re-running
+`ENABLE_CI_USER`). Adding a region or an instance type therefore requires re-running
 `provision` from the primary config.
 
 ### Path resolution and repository root
@@ -220,7 +220,7 @@ Validation is fail-closed at startup, before any AWS call:
 | `DDNS_ONBOX` | no | `true`/`false` (default false). When true, the DDNS password is delivered to the box. |
 | `RELEASE_TARGETS` | yes | Comma list of Bazel labels locating the deployment artifact(s). |
 | `BAZEL_COMMAND` | no | Bazel invocation; default `bazel`. Honors wrapper scripts. |
-| `RELEASE_PREFIXES` | yes | S3 prefixes the CI reader user may read. Required key; may be empty (no CI user). |
+| `ENABLE_CI_USER` | yes | `true`/`false`. When true, provision creates the CI reader user `<project>-ci`. |
 | `TEMPLATE_OVERRIDE` | no | Path to a local CFN template replacing the canonical one. |
 
 Because `stackctl`'s lifecycle is SSH-only, `launch`, `start` and `stop` fail closed (exit 1)
@@ -280,20 +280,21 @@ errors, and 3 for an identity-guard mismatch.
 ### provision
 
 ```text
-provision [--rotate] [--rotate-ci]
+provision [--rotate] [--rotate-ci] [--delete-ci-user]
 ```
 
 Deploys the account-global `<project>-operator` CFN stack in the primary region using the
 `[default]` admin profile and `CAPABILITY_NAMED_IAM`. It then ensures the operator user
-`<project>` (and, when `RELEASE_PREFIXES` is non-empty, the CI user `<project>-ci`) has one
+`<project>` (and, when `ENABLE_CI_USER=true`, the CI user `<project>-ci`) has one
 usable key in `~/.aws/credentials`.
 
-`RELEASE_PREFIXES` is a required key whose value may be empty. An empty value means no CI
-user: on an existing stack, `provision` passes `EnableCiUser=false`, which **deletes the CI
-user and invalidates its access keys** (irreversible from the operator's view). `provision`
-emits a one-line change-set-summary warning on that transition. When
-`PERMISSIONS_BOUNDARY_ARN` is set, it applies to the instance role only, not the CI user or
-the Image Builder roles.
+`ENABLE_CI_USER` is a required boolean. When it is false, no CI user exists: on an
+existing stack, `provision` passes `EnableCiUser=false`, which **deletes the CI
+user and invalidates its access keys** (irreversible from the operator's view).
+A true-to-false transition is refused before the change set runs unless
+`--delete-ci-user` is given; with the flag it proceeds and prints a warning.
+When `PERMISSIONS_BOUNDARY_ARN` is set, it applies to the instance role only, not
+the CI user or the Image Builder roles.
 
 Re-runs are create-or-update. An update is previewed with a change set and requires
 confirmation unless `--yes` is given; `--dry-run` prints the preview and exits. After a decline
@@ -304,6 +305,7 @@ removed.
 |---|---|
 | `--rotate` | Mint a new key for the operator user. |
 | `--rotate-ci` | Mint a new key for the CI user. |
+| `--delete-ci-user` | Allow `ENABLE_CI_USER` to go true-to-false; deletes the CI user. |
 
 Key lifecycle keeps a one-key invariant: stale keys are deleted before a new one is created.
 The previous local key is deleted only after the new key passes the identity check. A CI key is

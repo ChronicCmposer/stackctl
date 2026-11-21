@@ -182,7 +182,7 @@ static const char *base_env(void) {
            "INGRESS_TCP=443\n"
            "INGRESS_UDP=\n"
            "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-           "RELEASE_PREFIXES=releases/\n";
+           "ENABLE_CI_USER=true\n";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -599,7 +599,7 @@ static void provision_base(pfake *f) {
     snprintf(f->op_key_ids[0], sizeof f->op_key_ids[0], "%s", "AKIAOLD");
     f->have_local_op = 1;
     snprintf(f->local_op_key, sizeof f->local_op_key, "%s", "AKIAOLD");
-    /* The CI user is in scope (RELEASE_PREFIXES present): give it one key
+    /* The CI user is in scope (ENABLE_CI_USER=true): give it one key
      * both in IAM and locally so the baseline mints nothing. */
     f->ci_key_count = 1;
     snprintf(f->ci_key_ids[0], sizeof f->ci_key_ids[0], "%s", "AKIACI");
@@ -1289,7 +1289,7 @@ static void scenario_refresh_ami(void) {
                  "INGRESS_TCP=443\n"
                  "INGRESS_UDP=\n"
                  "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-                 "RELEASE_PREFIXES=releases/\n");
+                 "ENABLE_CI_USER=true\n");
     snprintf(path, sizeof path, "%s/.env.example", fx.config_dir);
     write_text(path,
                "# example config\n"
@@ -1341,7 +1341,7 @@ static void scenario_refresh_ami(void) {
                  "SETUP_ENTRYPOINT=deploy.sh\nSSH_PORT=22\n"
                  "SERVICE_UNIT=demo.service\nOPERATOR_CIDR=\n"
                  "INGRESS_TCP=443\nINGRESS_UDP=\n"
-                 "RELEASE_TARGETS=//a\nRELEASE_PREFIXES=releases/\n");
+                 "RELEASE_TARGETS=//a\nENABLE_CI_USER=true\n");
         snprintf(path, sizeof path, "%s/.env", fx.config_dir);
         write_text(path, text);
         cfg = NULL;

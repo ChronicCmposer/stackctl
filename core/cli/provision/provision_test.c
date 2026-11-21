@@ -591,7 +591,7 @@ static const char *base_env =
     "INGRESS_TCP=443\n"
     "INGRESS_UDP=\n"
     "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-    "RELEASE_PREFIXES=releases/\n";
+    "ENABLE_CI_USER=false\n";
 
 typedef struct fixture {
     char root[PATH_MAX];
@@ -1121,7 +1121,7 @@ static void test_union_of_region_variants(void) {
                "export INSTANCE_TYPES_AMD64=g6.xlarge\n"
                "BUCKET_MODULES=artifact\n"
                "ENABLE_IMAGE_BUILDER=true\n"
-               "RELEASE_PREFIXES=releases/\n");
+               "ENABLE_CI_USER=true\n");
     cfg = load_config(&fx);
     CHECK(cfg != NULL, "primary config loads beside a variant");
     f.stack_present = 0;
@@ -1145,28 +1145,32 @@ static void test_union_of_region_variants(void) {
 /* Operator parameters (F5 / F6 / F13)                                       */
 /* ------------------------------------------------------------------------- */
 
-static void test_ci_user_enabled_with_prefixes(void) {
+static void test_ci_user_enabled_by_any_true_union(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
     provision_env env;
+    char path[PATH_MAX];
     const char *ci;
-    const char *prefixes;
     const char *certs;
 
     fixture_init(&fx);
+    snprintf(path, sizeof(path), "%s/.env.eu-west-1", fx.config_dir);
+    write_text(path,
+               "REGION=eu-west-1\n"
+               "ENABLE_CI_USER=true\n");
     cfg = load_config(&fx);
+    CHECK(cfg != NULL, "primary false with a true variant loads");
     f.stack_present = 0;
     f.change_count = 1;
     env = make_env(&f, cfg, &fx);
-    CHECK(provision_run(&env) == CLI_EXIT_OK, "prefixes run succeeds");
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "any-true CI union run succeeds");
     ci = captured_param(&f, "EnableCiUser");
-    prefixes = captured_param(&f, "ReleasePrefixes");
-    certs = captured_param(&f, "CertBucketEnabled");
     CHECK(ci != NULL && strcmp(ci, "true") == 0,
-          "EnableCiUser=true with prefixes");
-    CHECK(prefixes != NULL && strcmp(prefixes, "releases/") == 0,
-          "ReleasePrefixes passed with prefixes");
+          "EnableCiUser=true when any sibling sets ENABLE_CI_USER=true");
+    CHECK(captured_param(&f, "ReleasePrefixes") == NULL,
+          "ReleasePrefixes is never emitted");
+    certs = captured_param(&f, "CertBucketEnabled");
     CHECK(certs != NULL && strcmp(certs, "true") == 0,
           "CertBucketEnabled=true when cert module present");
     CHECK(captured_param(&f, "PermissionsBoundaryArn") == NULL,
@@ -1174,7 +1178,7 @@ static void test_ci_user_enabled_with_prefixes(void) {
     config_free(cfg);
 }
 
-static void test_ci_user_disabled_without_prefixes(void) {
+static void test_ci_user_disabled_when_all_false(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
@@ -1182,22 +1186,21 @@ static void test_ci_user_disabled_without_prefixes(void) {
     const char *ci;
 
     fixture_init(&fx);
-    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
     cfg = load_config(&fx);
-    CHECK(cfg != NULL, "empty-prefix config loads");
+    CHECK(cfg != NULL, "all-false config loads");
     f.stack_present = 0;
     f.change_count = 1;
     env = make_env(&f, cfg, &fx);
-    CHECK(provision_run(&env) == CLI_EXIT_OK, "empty-prefix run succeeds");
+    CHECK(provision_run(&env) == CLI_EXIT_OK, "all-false run succeeds");
     ci = captured_param(&f, "EnableCiUser");
     CHECK(ci != NULL && strcmp(ci, "false") == 0,
-          "EnableCiUser=false when prefixes empty");
+          "EnableCiUser=false when every ENABLE_CI_USER is false");
     CHECK(captured_param(&f, "ReleasePrefixes") == NULL,
-          "ReleasePrefixes omitted when prefixes empty");
+          "ReleasePrefixes is never emitted");
     config_free(cfg);
 }
 
-static void test_ci_user_removal_warns(void) {
+static void test_ci_user_removal_warns_with_flag(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
@@ -1207,7 +1210,6 @@ static void test_ci_user_removal_warns(void) {
     size_t got;
 
     fixture_init(&fx);
-    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
     cfg = load_config(&fx);
     errors = tmpfile();
     CHECK(cfg != NULL && errors != NULL, "warning fixture opens");
@@ -1224,7 +1226,10 @@ static void test_ci_user_removal_warns(void) {
     f.change_count = 1;
     env = make_env(&f, cfg, &fx);
     env.err = errors;
-    CHECK(provision_run(&env) == CLI_EXIT_OK, "CI removal run succeeds");
+    env.delete_ci_user = 1;
+    CHECK(provision_run(&env) == CLI_EXIT_OK,
+          "CI removal with --delete-ci-user succeeds");
+    CHECK(f.executed == 1, "CI removal with the flag executes the change set");
     rewind(errors);
     got = fread(captured, 1, sizeof(captured) - 1, errors);
     captured[got] = '\0';
@@ -1233,6 +1238,43 @@ static void test_ci_user_removal_warns(void) {
           "removal warning names the CiUser deletion");
     CHECK(strstr(captured, "access keys") != NULL,
           "removal warning names key invalidation");
+    config_free(cfg);
+}
+
+static void test_ci_user_removal_refused_without_flag(void) {
+    fixture fx;
+    fake f = {0};
+    stackctl_config *cfg;
+    provision_env env;
+    FILE *errors;
+
+    fixture_init(&fx);
+    cfg = load_config(&fx);
+    errors = tmpfile();
+    CHECK(cfg != NULL && errors != NULL, "refusal fixture opens");
+    if (cfg == NULL || errors == NULL) {
+        config_free(cfg);
+        if (errors != NULL) {
+            fclose(errors);
+        }
+        return;
+    }
+    f.stack_present = 1;
+    f.status = CFN_STACK_STATUS_UPDATE_COMPLETE;
+    f.ci_output = "demo-ci";
+    f.change_count = 1;
+    env = make_env(&f, cfg, &fx);
+    env.err = errors;
+    CHECK(provision_run(&env) == CLI_EXIT_USAGE,
+          "CI removal without --delete-ci-user is refused");
+    CHECK(f.executed == 0, "refused transition never executes the change set");
+    CHECK(f.last_param_count == 0,
+          "refused transition never creates a change set");
+    CHECK(stream_contains(errors, "--delete-ci-user"),
+          "refusal names the --delete-ci-user flag");
+    CHECK(stream_contains(errors, "access keys"),
+          "refusal names the access-key invalidation");
+    fclose(errors);
     config_free(cfg);
 }
 
@@ -1266,8 +1308,8 @@ static void test_permissions_boundary_passed_when_set(void) {
     const char *arn;
 
     fixture_init(&fx);
-    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/",
-                     "RELEASE_PREFIXES=releases/\n"
+    fixture_env_with(&fx, "ENABLE_CI_USER=false",
+                     "ENABLE_CI_USER=false\n"
                      "PERMISSIONS_BOUNDARY_ARN=arn:aws:iam::123456789012:"
                      "policy/stackctl-boundary");
     cfg = load_config(&fx);
@@ -1677,7 +1719,6 @@ static void test_ci_placeholder_output_no_warning(void) {
     FILE *errors;
 
     fixture_init(&fx);
-    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
     cfg = load_config(&fx);
     errors = tmpfile();
     CHECK(cfg != NULL && errors != NULL, "placeholder fixture opens");
@@ -1702,7 +1743,7 @@ static void test_ci_placeholder_output_no_warning(void) {
     config_free(cfg);
 }
 
-static void test_ci_real_output_empty_prefixes_warns(void) {
+static void test_ci_real_output_disabled_warns(void) {
     fixture fx;
     fake f = {0};
     stackctl_config *cfg;
@@ -1710,7 +1751,6 @@ static void test_ci_real_output_empty_prefixes_warns(void) {
     FILE *errors;
 
     fixture_init(&fx);
-    fixture_env_with(&fx, "RELEASE_PREFIXES=releases/", "RELEASE_PREFIXES=");
     cfg = load_config(&fx);
     errors = tmpfile();
     CHECK(cfg != NULL && errors != NULL, "real-output fixture opens");
@@ -1727,9 +1767,10 @@ static void test_ci_real_output_empty_prefixes_warns(void) {
     f.change_count = 1;
     env = make_env(&f, cfg, &fx);
     env.err = errors;
+    env.delete_ci_user = 1;
     CHECK(provision_run(&env) == CLI_EXIT_OK, "real-output run succeeds");
     CHECK(stream_contains(errors, "deletes CiUser"),
-          "real CiUserName output with empty prefixes warns");
+          "real CiUserName output with ENABLE_CI_USER=false warns");
     fclose(errors);
     config_free(cfg);
 }
@@ -1752,12 +1793,13 @@ int main(void) {
     test_wait_stack_failure_is_aws();
     test_identity_mismatch_is_verify();
     test_union_of_region_variants();
-    test_ci_user_enabled_with_prefixes();
-    test_ci_user_disabled_without_prefixes();
-    test_ci_user_removal_warns();
+    test_ci_user_enabled_by_any_true_union();
+    test_ci_user_disabled_when_all_false();
+    test_ci_user_removal_warns_with_flag();
+    test_ci_user_removal_refused_without_flag();
     test_wait_stack_signal_diagnostic();
     test_ci_placeholder_output_no_warning();
-    test_ci_real_output_empty_prefixes_warns();
+    test_ci_real_output_disabled_warns();
     test_cert_bucket_disabled_without_cert_module();
     test_permissions_boundary_passed_when_set();
     test_keys_reuse_enforces_single();

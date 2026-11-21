@@ -164,7 +164,7 @@ INGRESS_UDP=
 DDNS_ONBOX=false
 
 RELEASE_TARGETS=//app:deploy.tar.gz
-RELEASE_PREFIXES=releases/
+ENABLE_CI_USER=false
 BAZEL_COMMAND=bazel
 ```
 
@@ -274,17 +274,19 @@ group contains the application rules you expect.
 `provision` is account-global and primary-region-only. It uses the `[default]`
 admin profile and deploys `<project>-operator` with `CAPABILITY_NAMED_IAM`. It
 also ensures the operator user `<project>` (and the CI user `<project>-ci` when
-`RELEASE_PREFIXES` is non-empty) has one usable key in `~/.aws/credentials`.
+`ENABLE_CI_USER=true`) has one usable key in `~/.aws/credentials`.
 
-`RELEASE_PREFIXES` is a required key whose value may be empty. An empty value
-means "no CI user": on an existing stack, `provision` passes
-`EnableCiUser=false`, which **deletes the CI user and invalidates its access
-keys**. This is irreversible from the operator's view; `provision` warns in the
-change-set summary when it happens.
+`ENABLE_CI_USER` is a required boolean. When it is false, there is no CI user: on
+an existing stack, `provision` passes `EnableCiUser=false`, which **deletes the
+CI user and invalidates its access keys**. This is irreversible from the
+operator's view. A true-to-false transition is refused before the change set runs
+unless `--delete-ci-user` is given; with the flag it proceeds and prints a
+warning.
 
-`RELEASE_PREFIXES` and `BUCKET_MODULES` are collected across **all** `.env.*`
-siblings (a union). Clearing a key in the active `.env` alone does not disable the
-CI user if a sibling still lists prefixes; clear it in every sibling.
+`ENABLE_CI_USER` and `BUCKET_MODULES` are collected across **all** `.env.*`
+siblings (an any-true union for the boolean). Setting `ENABLE_CI_USER=false` in
+the active `.env` alone does not disable the CI user if a sibling sets it true;
+clear it in every sibling.
 
 When set, `PERMISSIONS_BOUNDARY_ARN` applies the boundary to the instance role
 only. The Image Builder roles, and the infra stack, stay unbounded.
@@ -296,7 +298,7 @@ bazel run //deploy/aws:stackctl -- provision
 
 Re-run `provision` from plain `.env` after adding a region or changing an
 operator-feeding key (`INSTANCE_TYPES_*`, `BUCKET_MODULES`,
-`ENABLE_IMAGE_BUILDER`, `RELEASE_PREFIXES`). The operator stack is built from the
+`ENABLE_IMAGE_BUILDER`, `ENABLE_CI_USER`). The operator stack is built from the
 union of every sibling variant.
 
 Distributing the CI key to the CI system is a manual step. stackctl mints it; it

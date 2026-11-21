@@ -146,7 +146,7 @@ static void test_redaction(void) {
     "INGRESS_TCP=443\n"                                                        \
     "INGRESS_UDP=\n"                                                           \
     "RELEASE_TARGETS=//app:deploy.tar.gz\n"                                    \
-    "RELEASE_PREFIXES=releases/\n"
+    "ENABLE_CI_USER=true\n"
 
 #define BASE_ENV "PROJECT=demo\n" BASE_ENV_AFTER_PROJECT
 
@@ -295,7 +295,7 @@ static void test_config_validation(void) {
                  "ENABLE_IMAGE_BUILDER=false\nSETUP_ENTRYPOINT=deploy.sh\n"
                  "SSH_PORT=22\nOPERATOR_CIDR=\nINGRESS_TCP=443\n"
                  "INGRESS_UDP=\nRELEASE_TARGETS=//a\n"
-                 "RELEASE_PREFIXES=releases/\n");
+                 "ENABLE_CI_USER=true\n");
         write_env_file(&fx, ".env", body);
         cfg = NULL;
         CHECK(config_load(fx.config_dir, 0, NULL, &cfg) == EINVAL,

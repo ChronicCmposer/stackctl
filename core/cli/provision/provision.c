@@ -409,7 +409,6 @@ typedef struct operator_union {
     char types_amd64[512];
     char types_arm64[512];
     char buckets[128];
-    char prefixes[512];
     int image_builder;
     int has_ci;
 } operator_union;
@@ -457,9 +456,8 @@ static void union_merge_kv(operator_union *u, const char *key,
         (void)csv_append_unique(u->types_arm64, sizeof(u->types_arm64), value);
     } else if (strcmp(key, "BUCKET_MODULES") == 0) {
         (void)csv_append_unique(u->buckets, sizeof(u->buckets), value);
-    } else if (strcmp(key, "RELEASE_PREFIXES") == 0) {
-        (void)csv_append_unique(u->prefixes, sizeof(u->prefixes), value);
-        if (value[0] != '\0') {
+    } else if (strcmp(key, "ENABLE_CI_USER") == 0) {
+        if (strcmp(value, "true") == 0) {
             u->has_ci = 1;
         }
     } else if (strcmp(key, "ENABLE_IMAGE_BUILDER") == 0) {
@@ -477,7 +475,7 @@ static void collect_union(const provision_env *env, operator_union *u) {
         const char *amd64 = config_get(env->cfg, "INSTANCE_TYPES_AMD64");
         const char *arm64 = config_get(env->cfg, "INSTANCE_TYPES_ARM64");
         const char *buckets = config_get(env->cfg, "BUCKET_MODULES");
-        const char *prefixes = config_get(env->cfg, "RELEASE_PREFIXES");
+        const char *ci_user = config_get(env->cfg, "ENABLE_CI_USER");
         const char *builder = config_get(env->cfg, "ENABLE_IMAGE_BUILDER");
 
         if (amd64 != NULL)
@@ -488,10 +486,10 @@ static void collect_union(const provision_env *env, operator_union *u) {
                                     arm64);
         if (buckets != NULL)
             (void)csv_append_unique(u->buckets, sizeof(u->buckets), buckets);
-        if (prefixes != NULL) {
-            (void)csv_append_unique(u->prefixes, sizeof(u->prefixes), prefixes);
-            if (prefixes[0] != '\0')
-                u->has_ci = 1;
+        /* ENABLE_CI_USER is any-true across the primary `.env` and every
+         * `.env.*` sibling, mirroring the ENABLE_IMAGE_BUILDER OR-merge. */
+        if (ci_user != NULL && strcmp(ci_user, "true") == 0) {
+            u->has_ci = 1;
         }
         if (builder != NULL && strcmp(builder, "true") == 0) {
             u->image_builder = 1;
@@ -701,6 +699,15 @@ static int ensure_user_key(const provision_env *env, const provision_ops *ops,
                            const char *user, const char *profile,
                            int rotate, int is_operator,
                            int *identity_mismatch) {
+    /*
+     * PC-4 key-deletion hazard (CONTRACT.md Provision): when the local
+     * `[<project>]` profile is absent on this host, `rotate`/re-mint deletes
+     * every operator IAM key and mints exactly one replacement. That is safe
+     * by design — the new key is written back to this host's credentials file
+     * — but any other machine still holding the old key loses operator access.
+     * Do not "fix" this by preserving keys here; the caller warns and the
+     * one-key invariant is intentional.
+     */
     char *local_key = NULL;
     iam_key *keys = NULL;
     size_t count = 0;
@@ -995,9 +1002,9 @@ int provision_run(const provision_env *env) {
 
     collect_union(env, &union_cfg);
     /*
-     * F5: an existing CiUser output proves the stack had CI enabled. Clearing
-     * RELEASE_PREFIXES deletes that user and invalidates its access keys, so
-     * the change-set summary warns about the one-way transition.
+     * F5: an existing CiUser output proves the stack had CI enabled. Disabling
+     * ENABLE_CI_USER deletes that user and invalidates its access keys, so the
+     * true->false transition is refused unless --delete-ci-user is given.
      */
     if (stacks.count > 0) {
         const char *ci_output =
@@ -1009,6 +1016,20 @@ int provision_run(const provision_env *env) {
         ci_was_enabled =
             ci_output != NULL && strcmp(ci_output, "-") != 0;
     }
+    /*
+     * A true->false CI-user transition is destructive: CloudFormation deletes
+     * the CI user and its access keys. Refuse before any change-set execution
+     * unless the operator opted in with --delete-ci-user.
+     */
+    if (ci_was_enabled != 0 && union_cfg.has_ci == 0 &&
+        env->delete_ci_user == 0) {
+        fprintf(env->err,
+                "stackctl: refusing to disable the CI user: this deletes "
+                "CiUser and invalidates its access keys; pass "
+                "--delete-ci-user to proceed\n");
+        rc = CLI_EXIT_USAGE;
+        goto done;
+    }
 
     add_param(params, &param_count, "ProjectName", project);
     add_param(params, &param_count, "InstanceTypeAllowlist",
@@ -1018,9 +1039,6 @@ int provision_run(const provision_env *env) {
               union_cfg.image_builder != 0 ? "true" : "false");
     add_param(params, &param_count, "EnableCiUser",
               union_cfg.has_ci != 0 ? "true" : "false");
-    if (union_cfg.has_ci != 0) {
-        add_param(params, &param_count, "ReleasePrefixes", union_cfg.prefixes);
-    }
     /* F6: same membership test the infra stack uses (deploy.c). */
     add_param(params, &param_count, "CertBucketEnabled",
               strstr(union_cfg.buckets, "cert") != NULL ? "true" : "false");
@@ -1101,7 +1119,7 @@ int provision_run(const provision_env *env) {
     /* F5: warn on the one-way true->false CI-user transition. */
     if (ci_was_enabled != 0 && union_cfg.has_ci == 0) {
         fprintf(env->err,
-                "stackctl: warning: RELEASE_PREFIXES is empty; this change "
+                "stackctl: warning: ENABLE_CI_USER is false; this change "
                 "deletes CiUser and invalidates its access keys\n");
     }
 
@@ -1244,6 +1262,8 @@ int cli_cmd_provision(cli_ctx *ctx) {
     static const cli_option_spec specs[] = {
         {"rotate", 0, 0, 0, NULL, "rotate the operator key"},
         {"rotate-ci", 0, 0, 0, NULL, "rotate the CI key"},
+        {"delete-ci-user", 0, 0, 0, NULL,
+         "allow disabling ENABLE_CI_USER (deletes the CI user)"},
     };
     cli_args args = {0};
     provision_env env = {0};
@@ -1264,6 +1284,7 @@ int cli_cmd_provision(cli_ctx *ctx) {
     }
     env.rotate = cli_args_flag(&args, "rotate");
     env.rotate_ci = cli_args_flag(&args, "rotate-ci");
+    env.delete_ci_user = cli_args_flag(&args, "delete-ci-user");
     cli_args_free(&args);
 
     env.cfg = cli_ctx_config(ctx);

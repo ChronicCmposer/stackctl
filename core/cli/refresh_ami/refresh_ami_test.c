@@ -226,7 +226,7 @@ static const char *base_keys =
     "INGRESS_TCP=443\n"
     "INGRESS_UDP=\n"
     "RELEASE_TARGETS=//app:deploy.tar.gz\n"
-    "RELEASE_PREFIXES=releases/\n";
+    "ENABLE_CI_USER=true\n";
 
 static void fixture_init(fixture *fx, int region_variant, const char *policy,
                          int include_ssm_keys, int include_pin) {

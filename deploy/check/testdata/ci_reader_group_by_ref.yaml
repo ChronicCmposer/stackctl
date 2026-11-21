@@ -1,0 +1,659 @@
+# EXPECTED: PASS under the CONTRACT v0.2.0 checker rules.
+# Exercises CONTRACT checker rule 4: CI ArtifactReaderPolicy is GetObject+ListBucket only, bucket-wide on the own bucket.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: stackctl account-global operator stack - instance role, operator managed policy, optional CI user and Image Builder roles.
+Parameters:
+  ProjectName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9]+$"
+    Description: Project identifier - hyphen-free and equal to the stack name prefix. The per-REGION length bound (derived from the longest S3 bucket name) is enforced by stackctl config validation, the single source of truth.
+  InstanceTypeAllowlist:
+    Type: CommaDelimitedList
+    Description: Union of instance types allowed for this project across all region variants.
+  EnableImageBuilder:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: Create the baked-image Image Builder roles when true.
+  EnableCiUser:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: Create the project CI user and artifact reader policy when true.
+  CertBucketEnabled:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+    Description: Grant the instance role access to the cert bucket module (BUCKET_MODULES contains cert) when true.
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+    Description: Optional IAM permissions boundary applied to the instance role.
+Conditions:
+  EnableImageBuilderCondition: !Equals [!Ref EnableImageBuilder, "true"]
+  EnableCiUserCondition: !Equals [!Ref EnableCiUser, "true"]
+  CertBucketEnabledCondition: !Equals [!Ref CertBucketEnabled, "true"]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-instance-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref "AWS::NoValue"]
+      Policies:
+        - PolicyName: ArtifactReadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ArtifactList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - releases/*
+              - Sid: ArtifactRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/releases/*
+              - Sid: OnboxSecretRead
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+        - Fn::If:
+            - CertBucketEnabledCondition
+            - PolicyName: CertStorageAccess
+              PolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                  - Sid: CertList
+                    Effect: Allow
+                    Action: s3:ListBucket
+                    Resource: !Sub arn:aws:s3:::${ProjectName}-certs-${AWS::AccountId}-*
+                    Condition:
+                      StringLike:
+                        s3:prefix:
+                          - certs/*
+                  - Sid: CertObjects
+                    Effect: Allow
+                    Action:
+                      - s3:GetObject
+                      - s3:PutObject
+                      - s3:DeleteObject
+                    Resource: !Sub arn:aws:s3:::${ProjectName}-certs-${AWS::AccountId}-*/certs/*
+            - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: !Sub ${ProjectName}-instance-role
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-instance-profile
+      Roles:
+        - !Ref InstanceRole
+  # Core operator permissions: stack/change-set lifecycle, EC2 instance
+  # lifecycle, S3 release object access, SSM reads, and key self-rotation.
+  OperatorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-operator
+      Description: Project-scoped operator policy - all resources region-wildcarded.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # RunInstances must NOT be gated on ec2:CreateAction: that key only
+          # exists while CreateTags/DeleteTags run as part of resource creation,
+          # so a StringEquals on it is false when IAM evaluates RunInstances and
+          # the grant never matches. CreateAction belongs only on the
+          # CreateTagsOnLaunch tag-on-create statement below. ec2:CreateAction
+          # values are the bare API action name without the service prefix, so
+          # that statement tests for RunInstances, not ec2:RunInstances.
+          - Sid: RunInstancesTagged
+            Effect: Allow
+            Action: ec2:RunInstances
+            Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                aws:RequestTag/Project: !Ref ProjectName
+              ForAllValues:StringEquals:
+                ec2:InstanceType: !Ref InstanceTypeAllowlist
+                aws:TagKeys:
+                  - Project
+                  - Name
+                  - stackctl:launch-nonce
+          - Sid: RunInstancesDependencies
+            Effect: Allow
+            Action:
+              - ec2:RunInstances
+              - ec2:CreateVolume
+              - ec2:CreateNetworkInterface
+            Resource:
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:volume/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:network-interface/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:subnet/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:security-group/*
+              # Public AMIs (e.g. the DLAMI fallback) live in the empty-account
+              # partition namespace, so keep that image ARN alongside the
+              # account-scoped one.
+              - arn:aws:ec2:*::image/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:image/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:key-pair/*
+          - Sid: TerminateTagged
+            Effect: Allow
+            Action: ec2:TerminateInstances
+            Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ec2:ResourceTag/Project: !Ref ProjectName
+          - Sid: CreateTagsOnLaunch
+            Effect: Allow
+            Action: ec2:CreateTags
+            Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ec2:CreateAction: RunInstances
+              ForAllValues:StringEquals:
+                aws:TagKeys:
+                  - Project
+                  - Name
+                  - stackctl:launch-nonce
+          - Sid: PassInstanceRole
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-instance-role
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
+          - Sid: SelfKeyRotation
+            Effect: Allow
+            Action:
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:UpdateAccessKey
+              - iam:ListAccessKeys
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:user/${ProjectName}-ci
+          - Sid: TemplateSummary
+            Effect: Allow
+            Action: cloudformation:GetTemplateSummary
+            Resource: "*"
+          - Sid: ChangeSetLifecycle
+            Effect: Allow
+            Action:
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+            Resource: !Sub arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-*/*
+          - Sid: DeleteInfraStack
+            Effect: Allow
+            Action: cloudformation:DeleteStack
+            Resource: !Sub arn:aws:cloudformation:*:${AWS::AccountId}:stack/${ProjectName}-infra/*
+          - Sid: DdnsSecretRead
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/${ProjectName}/*
+          - Sid: ConsoleOutputTagged
+            Effect: Allow
+            Action: ec2:GetConsoleOutput
+            Resource: !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ec2:ResourceTag/Project: !Ref ProjectName
+          - Sid: ArtifactBucketList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*
+          - Sid: ArtifactReleases
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/*
+  # CloudFormation handler support for the infra stack: VPC/subnet/route-table
+  # lifecycle, bucket lifecycle, and read-only describe calls the handlers
+  # issue under the caller's identity.
+  OperatorInfraPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-operator-infra
+      Description: CloudFormation handler support for the project infra stack.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The infra stack creates the VPC, subnets, gateways, route tables
+          # and security groups through CloudFormation's EC2 resource handlers,
+          # which issue these calls under the caller's identity.
+          - Sid: VpcLifecycle
+            Effect: Allow
+            Action:
+              - ec2:CreateVpc
+              - ec2:DeleteVpc
+              - ec2:ModifyVpcAttribute
+              - ec2:CreateSubnet
+              - ec2:DeleteSubnet
+              - ec2:ModifySubnetAttribute
+              - ec2:CreateSecurityGroup
+              - ec2:DeleteSecurityGroup
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:AuthorizeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+              - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+              - ec2:CreateInternetGateway
+              - ec2:DeleteInternetGateway
+              - ec2:AttachInternetGateway
+              - ec2:DetachInternetGateway
+              - ec2:CreateRouteTable
+              - ec2:DeleteRouteTable
+              - ec2:CreateRoute
+              - ec2:DeleteRoute
+              - ec2:ReplaceRoute
+              - ec2:AssociateRouteTable
+              - ec2:DisassociateRouteTable
+              - ec2:ReplaceRouteTableAssociation
+              - ec2:CreateTags
+              - ec2:DeleteTags
+            Resource:
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:vpc/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:subnet/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:security-group/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:internet-gateway/*
+              - !Sub arn:aws:ec2:*:${AWS::AccountId}:route-table/*
+          # The infra stack creates and configures the artifact and cert
+          # buckets through CloudFormation's S3 resource handlers, which issue
+          # their bucket-level API calls under THIS (the caller's) identity.
+          # Object access above is not enough: creating the bucket, applying
+          # its public-access-block/encryption/versioning/lifecycle/tag
+          # configuration, and deleting a just-created bucket during a
+          # rollback (DeletionPolicy RetainExceptOnCreate) all need these
+          # bucket-lifecycle actions. Enumerated, never wildcarded.
+          - Sid: BucketLifecycle
+            Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:DeleteBucket
+              - s3:GetBucketLocation
+              - s3:GetBucketAcl
+              - s3:GetBucketVersioning
+              - s3:PutBucketVersioning
+              - s3:GetBucketTagging
+              - s3:PutBucketTagging
+              - s3:TagResource
+              - s3:UntagResource
+              # The IAM action names are not the S3 API names: the public
+              # access block is PutBucketPublicAccessBlock (DELETE reuses the
+              # PUT permission), encryption is *EncryptionConfiguration, and
+              # ownership controls are Put/GetBucketOwnershipControls.
+              - s3:GetBucketPublicAccessBlock
+              - s3:PutBucketPublicAccessBlock
+              - s3:GetEncryptionConfiguration
+              - s3:PutEncryptionConfiguration
+              - s3:DeleteBucketEncryption
+              - s3:GetBucketOwnershipControls
+              - s3:PutBucketOwnershipControls
+              - s3:GetLifecycleConfiguration
+              - s3:PutLifecycleConfiguration
+              - s3:DeleteBucketLifecycle
+              # ListBucket is HeadBucket's permission; the bucket handlers use
+              # it for existence checks. It is bucket-scoped and grants no
+              # object content access.
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*
+              - !Sub arn:aws:s3:::${ProjectName}-certs-${AWS::AccountId}-*
+          - Sid: ReadOnlyDescribe
+            Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeImages
+              - ec2:DescribeVpcs
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSecurityGroupRules
+              - ec2:DescribeKeyPairs
+              - ec2:DescribeVolumes
+              - ec2:DescribeInstanceStatus
+              - ec2:DescribeSpotPriceHistory
+              # VPC-lifecycle reads the CloudFormation resource handlers issue
+              # under the caller's identity (live failures during the
+              # strimserver pilot rollback: DescribeInternetGateways; the rest
+              # of the set is the complete handler read surface for the
+              # VPC/subnet/IGW/route-table/SG resources this template's infra
+              # stack creates).
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeRouteTables
+              - ec2:DescribeNetworkAcls
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeTags
+              - ec2:DescribeVpcAttribute
+              - ec2:DescribeSubnetAttribute
+            Resource: "*"
+          # The infra stack optionally creates a spot-interruption alert: an
+          # SNS topic + email subscription and an EventBridge rule targeting
+          # it. CloudFormation runs those handlers under the caller's identity,
+          # so the same identity needs the lifecycle and read calls. Resource
+          # ARNs are derived from the fixed template names, never wildcarded.
+          - Sid: SpotAlertTopicLifecycle
+            Effect: Allow
+            Action:
+              - sns:CreateTopic
+              - sns:DeleteTopic
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:Subscribe
+              - sns:Unsubscribe
+              - sns:GetSubscriptionAttributes
+              - sns:SetSubscriptionAttributes
+              - sns:ListSubscriptionsByTopic
+              - sns:ListTagsForResource
+              - sns:TagResource
+              - sns:UntagResource
+            Resource:
+              - !Sub arn:aws:sns:*:${AWS::AccountId}:${ProjectName}-spot-alerts
+              - !Sub arn:aws:sns:*:${AWS::AccountId}:${ProjectName}-spot-alerts:*
+          - Sid: SpotAlertRuleLifecycle
+            Effect: Allow
+            Action:
+              - events:PutRule
+              - events:DeleteRule
+              - events:DescribeRule
+              - events:EnableRule
+              - events:DisableRule
+              - events:PutTargets
+              - events:RemoveTargets
+              - events:ListTargetsByRule
+              - events:ListTagsForResource
+              - events:TagResource
+              - events:UntagResource
+            Resource: !Sub arn:aws:events:*:${AWS::AccountId}:rule/${ProjectName}-spot-interruption
+  # Image Builder lifecycle support, gated on EnableImageBuilder. CloudFormation
+  # creates the baked-image resources as this identity.
+  OperatorImageBuilderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableImageBuilderCondition
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-operator-imagebuilder
+      Description: Image Builder lifecycle support for the baked-image pipeline.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # The infra stack creates the baked-image Image Builder
+          # component/recipe/infrastructure/distribution/pipeline as this
+          # identity, so the lifecycle actions must exist only when image
+          # building is enabled. CloudFormation also issues TagResource after a
+          # tagged create and UntagResource on update; without them the first
+          # tagged create is denied. Account-scoped and region-wild like the
+          # rest of this account-global operator policy.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: ImageBuilderLifecycle
+                Effect: Allow
+                Action:
+                  - imagebuilder:CreateComponent
+                  - imagebuilder:DeleteComponent
+                  - imagebuilder:CreateImageRecipe
+                  - imagebuilder:DeleteImageRecipe
+                  - imagebuilder:CreateInfrastructureConfiguration
+                  - imagebuilder:UpdateInfrastructureConfiguration
+                  - imagebuilder:DeleteInfrastructureConfiguration
+                  - imagebuilder:CreateDistributionConfiguration
+                  - imagebuilder:UpdateDistributionConfiguration
+                  - imagebuilder:DeleteDistributionConfiguration
+                  - imagebuilder:CreateImagePipeline
+                  - imagebuilder:UpdateImagePipeline
+                  - imagebuilder:DeleteImagePipeline
+                  - imagebuilder:TagResource
+                  - imagebuilder:UntagResource
+                Resource: !Sub arn:aws:imagebuilder:*:${AWS::AccountId}:*
+              - !Ref "AWS::NoValue"
+          # CloudFormation's ImageBuilder resource handlers issue Get*/List*
+          # reads under the CALLER's identity while creating and deleting each
+          # resource; without them a create fails with AccessDenied. Enumerate
+          # the read surface for the same resource families the lifecycle
+          # statement manages (plus tag reads), never a wildcard.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: ImageBuilderRead
+                Effect: Allow
+                Action:
+                  - imagebuilder:GetComponent
+                  - imagebuilder:GetImageRecipe
+                  - imagebuilder:GetInfrastructureConfiguration
+                  - imagebuilder:GetDistributionConfiguration
+                  - imagebuilder:GetImagePipeline
+                  - imagebuilder:GetImage
+                  - imagebuilder:ListComponents
+                  - imagebuilder:ListImageRecipes
+                  - imagebuilder:ListInfrastructureConfigurations
+                  - imagebuilder:ListDistributionConfigurations
+                  - imagebuilder:ListImagePipelines
+                  - imagebuilder:ListImages
+                  - imagebuilder:ListTagsForResource
+                Resource: !Sub arn:aws:imagebuilder:*:${AWS::AccountId}:*
+              - !Ref "AWS::NoValue"
+          # CloudFormation wires these roles into Image Builder and the instance
+          # profile, so it must pass exactly those roles (never an arbitrary
+          # role) to their services. The ARNs are constructed from the fixed
+          # names defined in this template, so there is no cross-stack cycle.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: PassImageBuilderRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-baked-imagebuilder-instance-role
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-imagebuilder-execution-role
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ec2.amazonaws.com
+                      - imagebuilder.amazonaws.com
+                      # The distribution handler may pass the role to VM
+                      # Import/Export during AMI distribution.
+                      - vmie.amazonaws.com
+              - !Ref "AWS::NoValue"
+          # Creating/updating the infrastructure configuration reads the
+          # referenced instance profile under the caller's identity, so scope
+          # iam:GetInstanceProfile to the one baked Image Builder profile.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: GetImageBuilderInstanceProfile
+                Effect: Allow
+                Action: iam:GetInstanceProfile
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:instance-profile/${ProjectName}-baked-imagebuilder-instance-profile
+              - !Ref "AWS::NoValue"
+          # The Image Builder handlers validate the roles referenced by the
+          # pipeline and infrastructure configuration with iam:GetRole, and the
+          # distribution handler reads the baked AMI SSM parameter. Scope both
+          # to the fixed project names.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: GetImageBuilderRoles
+                Effect: Allow
+                Action: iam:GetRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-baked-imagebuilder-instance-role
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-imagebuilder-execution-role
+              - !Ref "AWS::NoValue"
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: ReadBakedAmiParameter
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/${ProjectName}/ami/baked/*
+              - !Ref "AWS::NoValue"
+          # Image Builder creates this service-linked role on first-ever use in
+          # the account; scope the grant to exactly that ARN so the operator can
+          # never create arbitrary service-linked roles.
+          - Fn::If:
+              - EnableImageBuilderCondition
+              - Sid: ImageBuilderServiceLinkedRole
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/imagebuilder.amazonaws.com/AWSServiceRoleForImageBuilder
+              - !Ref "AWS::NoValue"
+  OperatorUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref ProjectName
+      ManagedPolicyArns:
+        - !Ref OperatorPolicy
+        - !Ref OperatorInfraPolicy
+        - !If [EnableImageBuilderCondition, !Ref OperatorImageBuilderPolicy, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+  CiUser:
+    Type: AWS::IAM::User
+    Condition: EnableCiUserCondition
+    Properties:
+      UserName: !Sub ${ProjectName}-ci
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+  CiAccessKey:
+    Type: AWS::IAM::AccessKey
+    Condition: EnableCiUserCondition
+    Properties:
+      UserName: !Ref CiUser
+  ArtifactReaderPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableCiUserCondition
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-artifact-reader
+      Description: CI reader scoped to the project artifact bucket.
+      Users:
+        - !Ref CiUser
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReleaseList
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*
+          - Sid: ReleaseRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/*
+  CiGroup:
+    Type: AWS::IAM::Group
+    Condition: EnableCiUserCondition
+    Properties:
+      GroupName: !Sub ${ProjectName}-ci
+  CiGroupPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableCiUserCondition
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-ci-group-policy
+      Groups:
+        - !Ref CiGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GroupInlinePut
+            Effect: Allow
+            Action: s3:PutObject
+            Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/*
+  CiGroupMembership:
+    Type: AWS::IAM::UserToGroupAddition
+    Condition: EnableCiUserCondition
+    Properties:
+      GroupName: !Ref CiGroup
+      Users:
+        - !Ref CiUser
+  BakedImageBuilderInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: EnableImageBuilderCondition
+    Properties:
+      RoleName: !Sub ${ProjectName}-baked-imagebuilder-instance-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BakedImageArtifactRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadReleases
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/releases/*
+  BakedImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: EnableImageBuilderCondition
+    Properties:
+      InstanceProfileName: !Sub ${ProjectName}-baked-imagebuilder-instance-profile
+      Roles:
+        - !Ref BakedImageBuilderInstanceRole
+  ImageBuilderExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableImageBuilderCondition
+    Properties:
+      RoleName: !Sub ${ProjectName}-imagebuilder-execution-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ImageBuilderExecution
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BuildArtifactsRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ProjectName}-artifacts-${AWS::AccountId}-*/releases/*
+              - Sid: BakedAmiPublish
+                Effect: Allow
+                # Native distribution-phase publish writes the AMI id here.
+                # GetParameter backs the aws:ec2:image DataType validation.
+                # Region-wild because distribution may run cross-region.
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/${ProjectName}/ami/baked/*
+Outputs:
+  InstanceRoleArn:
+    Value: !GetAtt InstanceRole.Arn
+  InstanceProfileArn:
+    Value: !GetAtt InstanceProfile.Arn
+  OperatorPolicyArn:
+    Value: !Ref OperatorPolicy
+  CiUserName:
+    Value: !If [EnableCiUserCondition, !Ref CiUser, "-"]

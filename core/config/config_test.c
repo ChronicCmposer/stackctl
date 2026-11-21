@@ -55,7 +55,7 @@ static const kv base[] = {
     {"INGRESS_TCP", "443"},
     {"INGRESS_UDP", ""},
     {"RELEASE_TARGETS", "//app:deploy.tar.gz"},
-    {"RELEASE_PREFIXES", "releases/"},
+    {"ENABLE_CI_USER", "false"},
 };
 
 /* ------------------------------------------------------------------------- */
@@ -965,13 +965,10 @@ static void test_ingress_rules(void) {
 }
 
 /* ------------------------------------------------------------------------- */
-/* Optional keys: F5 empty prefixes, F11 builder parent, F13 boundary        */
+/* Optional keys: F11 builder parent, F13 boundary                           */
 /* ------------------------------------------------------------------------- */
 
 static void test_optional_keys(void) {
-    static const kv empty_prefixes[] = {{"RELEASE_PREFIXES", ""}};
-    static const kv bad_prefixes[] = {{"RELEASE_PREFIXES", "releases/,"}};
-    static const kv missing_prefixes[] = {{"RELEASE_PREFIXES", NULL}};
     static const kv parent_on[] = {
         {"ENABLE_IMAGE_BUILDER", "true"},
         {"IMAGE_BUILDER_PARENT_IMAGE", "ami-0198b63ccfac121e8"}};
@@ -1001,29 +998,6 @@ static void test_optional_keys(void) {
         {"PERMISSIONS_BOUNDARY_ARN", "not-an-arn"}};
     static const kv boundary_empty[] = {
         {"PERMISSIONS_BOUNDARY_ARN", ""}};
-
-    /* F5: RELEASE_PREFIXES stays required but an empty value is permitted. */
-    {
-        char *root = NULL;
-        char *dir = NULL;
-        stackctl_config *cfg =
-            load_valid_repo("empty RELEASE_PREFIXES loads", empty_prefixes,
-                            ARRAY_LEN(empty_prefixes), &root, &dir);
-
-        CHECK(cfg != NULL, "empty RELEASE_PREFIXES loads");
-        if (cfg != NULL) {
-            CHECK(strcmp(config_get(cfg, "RELEASE_PREFIXES"), "") == 0,
-                  "empty RELEASE_PREFIXES preserved");
-        }
-        config_free(cfg);
-        free(root);
-        free(dir);
-    }
-    expect_invalid_msg("non-empty RELEASE_PREFIXES keeps comma validation",
-                       bad_prefixes, ARRAY_LEN(bad_prefixes),
-                       "RELEASE_PREFIXES");
-    expect_invalid("missing RELEASE_PREFIXES rejected", missing_prefixes,
-                   ARRAY_LEN(missing_prefixes));
 
     /* F11: IMAGE_BUILDER_PARENT_IMAGE is valid only with the builder on. */
     {
@@ -1113,6 +1087,68 @@ static void test_optional_keys(void) {
                        ARRAY_LEN(boundary_bad), "ARN");
     expect_invalid_msg("empty boundary rejected", boundary_empty,
                        ARRAY_LEN(boundary_empty), "PERMISSIONS_BOUNDARY_ARN");
+}
+
+/* ------------------------------------------------------------------------- */
+/* v0.2.0: RELEASE_PREFIXES removed, ENABLE_CI_USER required boolean         */
+/* ------------------------------------------------------------------------- */
+
+static void test_v020_ci_user(void) {
+    static const char removed_error[] =
+        "RELEASE_PREFIXES was removed in v0.2.0; set ENABLE_CI_USER=true if it "
+        "was non-empty, false if it was empty";
+    static const kv removed_prefixes[] = {{"RELEASE_PREFIXES", "releases/"}};
+    static const kv removed_empty[] = {{"RELEASE_PREFIXES", ""}};
+    static const kv missing_ci[] = {{"ENABLE_CI_USER", NULL}};
+    static const kv true_ci[] = {{"ENABLE_CI_USER", "true"}};
+    static const kv false_ci[] = {{"ENABLE_CI_USER", "false"}};
+    static const kv bad_ci[] = {{"ENABLE_CI_USER", "yes"}};
+    static const kv empty_ci[] = {{"ENABLE_CI_USER", ""}};
+
+    expect_invalid_msg("present RELEASE_PREFIXES is a hard removal error",
+                       removed_prefixes, ARRAY_LEN(removed_prefixes),
+                       removed_error);
+    expect_invalid_msg("empty RELEASE_PREFIXES is a hard removal error",
+                       removed_empty, ARRAY_LEN(removed_empty), removed_error);
+    expect_invalid_msg("missing ENABLE_CI_USER rejected", missing_ci,
+                       ARRAY_LEN(missing_ci), "ENABLE_CI_USER");
+    expect_invalid_msg("non-boolean ENABLE_CI_USER rejected", bad_ci,
+                       ARRAY_LEN(bad_ci), "ENABLE_CI_USER");
+    expect_invalid_msg("empty ENABLE_CI_USER rejected", empty_ci,
+                       ARRAY_LEN(empty_ci), "ENABLE_CI_USER");
+
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg = load_valid_repo(
+            "ENABLE_CI_USER=true loads", true_ci, ARRAY_LEN(true_ci), &root,
+            &dir);
+
+        CHECK(cfg != NULL, "ENABLE_CI_USER=true loads");
+        if (cfg != NULL) {
+            CHECK(strcmp(config_get(cfg, "ENABLE_CI_USER"), "true") == 0,
+                  "ENABLE_CI_USER=true preserved");
+        }
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
+    {
+        char *root = NULL;
+        char *dir = NULL;
+        stackctl_config *cfg = load_valid_repo(
+            "ENABLE_CI_USER=false loads", false_ci, ARRAY_LEN(false_ci), &root,
+            &dir);
+
+        CHECK(cfg != NULL, "ENABLE_CI_USER=false loads");
+        if (cfg != NULL) {
+            CHECK(strcmp(config_get(cfg, "ENABLE_CI_USER"), "false") == 0,
+                  "ENABLE_CI_USER=false preserved");
+        }
+        config_free(cfg);
+        free(root);
+        free(dir);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1257,6 +1293,7 @@ int main(void) {
     test_cross_keys();
     test_ingress_rules();
     test_optional_keys();
+    test_v020_ci_user();
     test_arch_list_variants();
     test_build_working_directory();
     test_config_dir_accessor();
