@@ -532,8 +532,19 @@ static int visit_setup_env(instance_runtime *rt, const cfn_stack *stack,
     if (rc == 0 && rt->cfg.ddns_onbox) {
         char path[INST_PATH_MAX];
 
-        snprintf(path, sizeof path, "/etc/%s-ddns/password", rt->cfg.project);
-        rc = visit(ctx, "STACKCTL_DDNS_PASSWORD_FILE", path);
+        /* The on-box updater needs the host/domain pair as well as the password
+         * file: the entrypoint arms movienight-ddns.timer with them, while
+         * stackctl owns the password delivery. Config validation guarantees the
+         * pair is set when DDNS_ONBOX=true. */
+        rc = visit(ctx, "STACKCTL_DDNS_HOST", rt->cfg.ddns_host);
+        if (rc == 0) {
+            rc = visit(ctx, "STACKCTL_DDNS_DOMAIN", rt->cfg.ddns_domain);
+        }
+        if (rc == 0) {
+            snprintf(path, sizeof path, "/etc/%s-ddns/password",
+                     rt->cfg.project);
+            rc = visit(ctx, "STACKCTL_DDNS_PASSWORD_FILE", path);
+        }
     }
     return rc;
 }

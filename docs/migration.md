@@ -236,6 +236,8 @@ The setup entrypoint receives the provenance through the on-box contract:
 | `STACKCTL_STAGE_DIR` | Staging directory under `/run/`. |
 | `STACKCTL_BUCKET_ARTIFACT` | Artifact bucket name. |
 | `STACKCTL_BUCKET_CERT` | Certificate bucket name; present only when configured. |
+| `STACKCTL_DDNS_HOST` | DDNS host label; present only when `DDNS_ONBOX=true`. |
+| `STACKCTL_DDNS_DOMAIN` | DDNS base domain; present only when `DDNS_ONBOX=true`. |
 | `STACKCTL_DDNS_PASSWORD_FILE` | `0600` password file; present only when `DDNS_ONBOX=true`. |
 
 If the old entrypoint read `BashVersion`/`SourceSha256`/`PatchSet` directly, move

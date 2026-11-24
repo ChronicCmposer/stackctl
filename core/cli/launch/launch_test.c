@@ -1731,6 +1731,10 @@ static void test_ddns_onbox_delivers_password(void) {
           "remote install moves the password to the on-box 0600 path");
     CHECK(any_ssh_contains("/etc/demo-ddns/password"),
           "install targets STACKCTL_DDNS_PASSWORD_FILE");
+    CHECK(any_ssh_contains("STACKCTL_DDNS_HOST='box'"),
+          "setup env exports STACKCTL_DDNS_HOST when DDNS_ONBOX is enabled");
+    CHECK(any_ssh_contains("STACKCTL_DDNS_DOMAIN='example.com'"),
+          "setup env exports STACKCTL_DDNS_DOMAIN when DDNS_ONBOX is enabled");
     free_runtime(&rt);
 }
 
@@ -1769,6 +1773,15 @@ static void test_no_ddns_delivery_when_off(void) {
 
     CHECK(rc == CLI_EXIT_OK, "default (DDNS_ONBOX=false) launch exits 0");
     CHECK(last_scp_argc == 0, "no scp when DDNS_ONBOX is disabled");
+    CHECK(!any_ssh_contains("STACKCTL_DDNS_HOST"),
+          "setup env omits STACKCTL_DDNS_HOST when DDNS_ONBOX is "
+          "disabled");
+    CHECK(!any_ssh_contains("STACKCTL_DDNS_DOMAIN"),
+          "setup env omits STACKCTL_DDNS_DOMAIN when DDNS_ONBOX is "
+          "disabled");
+    CHECK(!any_ssh_contains("STACKCTL_DDNS_PASSWORD_FILE"),
+          "setup env omits STACKCTL_DDNS_PASSWORD_FILE when DDNS_ONBOX is "
+          "disabled");
     free_runtime(&rt);
 }
 
